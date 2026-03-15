@@ -1,0 +1,48 @@
+[audio]
+sample_rate = 16000
+frame_duration_ms = 30
+vad_aggressiveness = 2
+silence_ms = 800
+min_segment_ms = 2000
+max_segment_ms = 8000
+queue_size = 256
+save_session_wav = true
+
+[import]
+ffmpeg_binary = "ffmpeg"
+chunk_seconds = 45
+keep_normalized_audio = false
+
+[refine]
+enabled = true
+auto_after_live = true
+
+[whisper]
+binary = "~/whisper.cpp/build/bin/whisper-server"
+model = "~/whisper.cpp/models/ggml-large-v3-turbo.bin"
+host = "127.0.0.1"
+port = 8178
+threads = 4
+language = "auto"
+translate = false
+request_timeout_seconds = 120
+startup_timeout_seconds = 45
+
+[obsidian]
+enabled = true
+base_url = "https://127.0.0.1:27124"
+transcript_dir = "Sessions/Transcripts"
+structured_dir = "Sessions/Summaries"
+verify_ssl = false
+timeout_seconds = 10
+retry_attempts = 3
+retry_backoff_seconds = 0.5
+
+[llm]
+enabled = false
+base_url = "https://api.openai.com/v1"
+model = "gpt-4.1-mini"
+stream = false
+wire_api = "chat_completions"
+requires_openai_auth = false
+timeout_seconds = 45
