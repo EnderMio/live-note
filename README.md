@@ -46,6 +46,7 @@
 - 离线精修失败时，不会覆盖 live 草稿；最终原文和整理稿会明确标注当前仍基于实时草稿
 - 历史会话和 CLI 都支持手动执行一次 `refine`
 - 历史会话和 CLI 都支持把多条会话合并为一条新会话，适合应对录音中断、程序退出后重开导致的一次课程被拆成两条记录
+- 如果多条 live 会话的整场录音采样率不一致，系统会继续完成文本合并，但跳过 `session.live.wav` 拼接；此时新会话不能直接再做整场离线精修
 
 ## LLM 配置
 
@@ -96,7 +97,7 @@ requires_openai_auth = true
 - `kind` 当前支持 `generic`、`meeting`、`lecture`
 - `input_mode` 会记录为 `live` 或 `file`
 - `transcript.md` 会标注 `transcript_source`、`refine_status`，并在末尾列出“待复核段落”
-- 合并会话会生成一个新的会话目录；如果原始会话都有 `session.live.wav`，还会自动拼出新的整场录音，便于后续再做一次统一精修
+- 合并会话会生成一个新的会话目录；如果原始会话都有 `session.live.wav` 且采样率兼容，还会自动拼出新的整场录音，便于后续再做一次统一精修
 - 即使关闭 Obsidian 或同步失败，也会先把 `transcript.md` 和 `structured.md` 保存在本地会话目录
 
 如果暂时没有启用 LLM，系统会生成一个可手动补写的整理模板；后续补上配置后，可以再用 `finalize` 或 GUI 历史动作重新生成整理稿。

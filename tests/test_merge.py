@@ -55,6 +55,7 @@ def _create_live_session(
     started_at: str,
     segment_samples: list[int],
     text: str,
+    sample_rate: int = 16000,
 ) -> None:
     session_dir = root / ".live-note" / "sessions" / session_id
     workspace = SessionWorkspace.create(
@@ -67,9 +68,9 @@ def _create_live_session(
         ),
     )
     segment_wav = workspace.next_wav_path("seg-00001")
-    _write_wav(segment_wav, 16000, segment_samples)
-    _write_wav(workspace.session_live_wav, 16000, segment_samples)
-    duration_ms = round(len(segment_samples) * 1000 / 16000)
+    _write_wav(segment_wav, sample_rate, segment_samples)
+    _write_wav(workspace.session_live_wav, sample_rate, segment_samples)
+    duration_ms = round(len(segment_samples) * 1000 / sample_rate)
     workspace.record_segment_created("seg-00001", 0, duration_ms, segment_wav)
     workspace.record_segment_text("seg-00001", 0, duration_ms, text)
 
@@ -144,3 +145,62 @@ class MergeSessionTests(unittest.TestCase):
             with wave.open(str(workspace.session_live_wav), "rb") as handle:
                 self.assertEqual(16000, handle.getframerate())
                 self.assertEqual(40000, handle.getnframes())
+
+    def test_merge_sessions_keeps_text_when_live_audio_cannot_be_concatenated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_path = root / "ggml-large-v3.bin"
+            model_path.write_bytes(b"fake-model")
+            service = AppService(root / "config.toml")
+            service.save_settings(
+                SettingsDraft(
+                    ffmpeg_binary="/opt/homebrew/bin/ffmpeg",
+                    whisper_binary="/Users/demo/whisper-server",
+                    whisper_model=str(model_path),
+                    obsidian_enabled=False,
+                    llm_enabled=False,
+                )
+            )
+            _create_live_session(
+                root,
+                session_id="20260315-210500-课程上半场",
+                title="宏观经济学",
+                started_at="2026-03-15T13:05:00+00:00",
+                segment_samples=[1000, -1000] * 8000,
+                text="第一部分讨论供给。",
+                sample_rate=16000,
+            )
+            _create_live_session(
+                root,
+                session_id="20260315-213500-课程下半场",
+                title="宏观经济学",
+                started_at="2026-03-15T13:35:00+00:00",
+                segment_samples=[2000, -2000] * 22050,
+                text="第二部分讨论需求。",
+                sample_rate=44100,
+            )
+
+            merge_sessions(
+                service.load_config(),
+                ["20260315-210500-课程上半场", "20260315-213500-课程下半场"],
+            )
+
+            session_roots = list(list_sessions(root))
+            self.assertEqual(3, len(session_roots))
+            merged_root = next(
+                path
+                for path in session_roots
+                if path.name not in {"20260315-210500-课程上半场", "20260315-213500-课程下半场"}
+            )
+            workspace = SessionWorkspace.load(merged_root)
+            metadata = workspace.read_session()
+            entries = workspace.transcript_entries()
+
+            self.assertEqual("宏观经济学（合并）", metadata.title)
+            self.assertEqual("disabled", metadata.refine_status)
+            self.assertFalse(workspace.session_live_wav.exists())
+            self.assertEqual(2, len(entries))
+            self.assertEqual("第一部分讨论供给。", entries[0].text)
+            self.assertEqual("第二部分讨论需求。", entries[1].text)
+            self.assertTrue(workspace.transcript_md.exists())
+            self.assertTrue(workspace.structured_md.exists())
