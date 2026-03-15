@@ -55,6 +55,7 @@
 - `llm.wire_api = "responses"` 时，请求 `/responses`，并支持 SSE 流式聚合
 - `llm.stream = true` 时，会聚合流式响应后再写入整理笔记；`false` 时走普通 JSON 返回
 - `llm.requires_openai_auth = true` 时，优先读取 `OPENAI_API_KEY`，未设置时再回退到 `LLM_API_KEY`
+- GUI 里的单个 “LLM API Key” 输入框会始终写入 `LLM_API_KEY`；启用 OpenAI 鉴权时也会同步写入 `OPENAI_API_KEY`，避免旧值覆盖新值
 - 首启向导和“设置与诊断”页都可以直接配置 `Base URL`、模型名、协议和 `Stream` 开关
 
 示例：
@@ -77,6 +78,7 @@ requires_openai_auth = true
 - 实时录音支持“暂停录音 / 继续录音”；暂停期间不会继续累计转写时间轴
 - 点击“停止录音”后，界面会尽快回到可再次开始的状态；上一场会话会在后台继续转写、精修和生成整理稿
 - “历史会话”支持多选；可直接把多条会话合并为一条新会话，也可打开本地原文/整理稿、离线精修并重写、重转写并重写、重新生成整理、重新同步 Obsidian
+- 如果某条旧会话的 `session.toml` 或 `segments.jsonl` 损坏，历史页会把它隔离显示为 `broken`，不会拖垮整个列表
 - “设置与诊断”可以保存配置、重新检测依赖、打开 `config.toml` / `.env`，并查看每项检查结果
 - 如果关闭窗口时仍有后台任务，进程会继续运行直到这些任务完成
 
@@ -88,7 +90,8 @@ requires_openai_auth = true
 - 主体是中文、只是夹少量英文术语时，可直接用 `zh`
 - 会话级“语言覆盖”选择“沿用默认设置”时，会继承设置页里的默认语言
 - 不要填写 `zh,en`、`en+zh` 这类组合值；当前 `whisper.cpp` 接受的是单个语言代码或 `auto`
-- 转写时会自动带上最近几段的上下文提示；中文场景会优先输出简体中文
+- 转写时会自动带上最近几段的上下文提示；仅在 `zh`/`zh-*` 模式下会额外要求简体中文
+- `auto` 不会再强制中文提示或简体转换；中英混合、多语言内容会尽量保留原始语言与书写系统
 - 对静音、背景噪声段里常见的“谢谢观看 / 欢迎订阅 / 谢谢大家”这类片尾幻觉，会做一层保守抑制
 - 如果旧会话是在较小模型或旧参数下生成的，可在历史会话里使用“重转写并重写”，或运行 `make retranscribe ARGS='--session ...'`
 
@@ -101,6 +104,7 @@ requires_openai_auth = true
 - `input_mode` 会记录为 `live` 或 `file`
 - `transcript.md` 会标注 `transcript_source`、`refine_status`，并在末尾列出“待复核段落”
 - 合并会话会生成一个新的会话目录；如果原始会话都有 `session.live.wav` 且采样率兼容，还会自动拼出新的整场录音，便于后续再做一次统一精修
+- 如果某条原始 `session.live.wav` 已损坏，系统会继续完成文本合并，但跳过整场录音拼接
 - 即使关闭 Obsidian 或同步失败，也会先把 `transcript.md` 和 `structured.md` 保存在本地会话目录
 
 如果暂时没有启用 LLM，系统会生成一个可手动补写的整理模板；后续补上配置后，可以再用 `finalize` 或 GUI 历史动作重新生成整理稿。

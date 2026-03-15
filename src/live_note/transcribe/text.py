@@ -28,6 +28,14 @@ _EN_PROMPT_GUARD = (
     "return an empty string. "
     "Do not invent outro phrases such as 'thanks for watching' or 'please subscribe'."
 )
+_AUTO_PROMPT_GUARD = (
+    "Transcribe only audible speech. "
+    "If the audio contains only silence, noise, music, applause, or ambient sound, "
+    "return an empty string. "
+    "Preserve the original spoken languages and scripts. "
+    "If speakers switch languages, keep the mixed output instead of translating or rewriting. "
+    "Do not invent outro phrases such as 'thanks for watching' or 'please subscribe'."
+)
 _SUSPICIOUS_OUTRO_PHRASES = (
     "谢谢观看",
     "感谢观看",
@@ -50,7 +58,7 @@ def build_transcription_prompt(language: str, entries: Sequence[TranscriptEntry]
     context = _build_context(entries)
     if not context:
         return guard
-    if _normalize_language(language) in {"zh", "auto"}:
+    if _is_chinese_language(language):
         return f"{guard}\n最近上下文：{context}"
     return f"{guard}\nRecent context: {context}"
 
@@ -87,16 +95,27 @@ def _build_context(entries: Sequence[TranscriptEntry]) -> str:
 
 
 def _normalize_language(language: str) -> str:
-    return language.strip().lower() or "auto"
+    return language.strip().lower().replace("_", "-") or "auto"
+
+
+def _is_auto_language(language: str) -> bool:
+    return _normalize_language(language) == "auto"
+
+
+def _is_chinese_language(language: str) -> bool:
+    normalized = _normalize_language(language)
+    return normalized == "zh" or normalized.startswith("zh-")
 
 
 def _should_simplify(language: str) -> bool:
-    return _normalize_language(language) in {"zh", "auto"}
+    return _is_chinese_language(language)
 
 
 def _build_guard_prompt(language: str) -> str:
-    if _normalize_language(language) in {"zh", "auto"}:
+    if _is_chinese_language(language):
         return _CN_PROMPT_GUARD
+    if _is_auto_language(language):
+        return _AUTO_PROMPT_GUARD
     return _EN_PROMPT_GUARD
 
 

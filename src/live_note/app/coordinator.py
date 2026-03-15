@@ -195,142 +195,155 @@ class SessionCoordinator:
         self.session_id = metadata.session_id
         workspace = SessionWorkspace.create(Path(metadata.session_dir), metadata)
         logger = workspace.session_logger()
-        _attach_console_logging()
-        _emit_progress(
-            self.on_progress,
-            "starting",
-            f"已创建会话：{metadata.title}",
-            session_id=metadata.session_id,
-        )
+        try:
+            _attach_console_logging()
+            _emit_progress(
+                self.on_progress,
+                "starting",
+                f"已创建会话：{metadata.title}",
+                session_id=metadata.session_id,
+            )
 
-        obsidian = ObsidianClient(self.config.obsidian)
-        llm_client = OpenAiCompatibleClient(self.config.llm)
-        whisper_config = _runtime_whisper_config(self.config.whisper, self.language)
-        whisper_client = WhisperInferenceClient(whisper_config)
-        whisper_server = WhisperServerProcess(whisper_config, workspace.logs_txt)
+            obsidian = ObsidianClient(self.config.obsidian)
+            llm_client = OpenAiCompatibleClient(self.config.llm)
+            whisper_config = _runtime_whisper_config(self.config.whisper, self.language)
+            whisper_client = WhisperInferenceClient(whisper_config)
+            whisper_server = WhisperServerProcess(whisper_config, workspace.logs_txt)
 
-        _write_initial_transcript(workspace, metadata, obsidian, logger, status="live")
-        metadata = workspace.update_status("live")
-        _emit_progress(
-            self.on_progress,
-            "listening",
-            f"正在监听输入设备：{device.name}",
-            session_id=metadata.session_id,
-        )
+            _write_initial_transcript(workspace, metadata, obsidian, logger, status="live")
+            metadata = workspace.update_status("live")
+            _emit_progress(
+                self.on_progress,
+                "listening",
+                f"正在监听输入设备：{device.name}",
+                session_id=metadata.session_id,
+            )
 
-        frame_queue: queue.Queue[AudioFrame | object] = queue.Queue(
-            maxsize=self.config.audio.queue_size
-        )
-        segment_queue: queue.Queue[PendingSegment | object] = queue.Queue(maxsize=32)
-        segmenter = SpeechSegmenter(self.config.audio)
-        capture = AudioCaptureService(self.config.audio, device, frame_queue)
+            frame_queue: queue.Queue[AudioFrame | object] = queue.Queue(
+                maxsize=self.config.audio.queue_size
+            )
+            segment_queue: queue.Queue[PendingSegment | object] = queue.Queue(maxsize=32)
+            segmenter = SpeechSegmenter(self.config.audio)
+            capture = AudioCaptureService(self.config.audio, device, frame_queue)
 
-        segment_thread = threading.Thread(
-            target=self._segment_loop,
-            name="segmenter",
-            daemon=True,
-            args=(frame_queue, segment_queue, segmenter, workspace),
-        )
-        transcribe_thread = threading.Thread(
-            target=self._transcribe_loop,
-            name="transcriber",
-            daemon=True,
-            args=(segment_queue, workspace, metadata, obsidian, whisper_client),
-        )
-        capture_finished = False
+            segment_thread = threading.Thread(
+                target=self._segment_loop,
+                name="segmenter",
+                daemon=True,
+                args=(frame_queue, segment_queue, segmenter, workspace),
+            )
+            transcribe_thread = threading.Thread(
+                target=self._transcribe_loop,
+                name="transcriber",
+                daemon=True,
+                args=(segment_queue, workspace, metadata, obsidian, whisper_client),
+            )
+            capture_finished = False
 
-        with whisper_server:
-            segment_thread.start()
-            transcribe_thread.start()
-            capture.start()
-            try:
-                while True:
-                    self._drain_control_commands(
-                        capture=capture,
-                        frame_queue=frame_queue,
-                        workspace=workspace,
-                        metadata=metadata,
-                        logger=logger,
-                    )
-                    if self._stop_event.is_set():
-                        logger.info("收到停止请求，开始收尾。")
-                        _emit_progress(
-                            self.on_progress,
-                            "stopping",
-                            "正在停止录音并收尾。",
-                            session_id=metadata.session_id,
+            with whisper_server:
+                segment_thread.start()
+                transcribe_thread.start()
+                capture.start()
+                try:
+                    while True:
+                        self._drain_control_commands(
+                            capture=capture,
+                            frame_queue=frame_queue,
+                            workspace=workspace,
+                            metadata=metadata,
+                            logger=logger,
                         )
-                        capture_finished = True
-                        break
-                    if capture.error:
-                        raise AudioCaptureError(str(capture.error))
-                    if not capture.is_alive:
-                        raise AudioCaptureError("音频采集线程已停止。")
-                    self._raise_thread_error_if_any()
-                    time.sleep(0.25)
-            except KeyboardInterrupt:
-                logger.info("收到停止信号，开始收尾。")
-                capture_finished = True
-                _emit_progress(
-                    self.on_progress,
-                    "stopping",
-                    "正在停止录音并收尾。",
-                    session_id=metadata.session_id,
-                )
-            finally:
-                capture.stop()
-                capture.join(timeout=5)
-                _enqueue_with_retry(frame_queue, FRAME_STOP)
-                segment_thread.join()
-                if capture_finished:
-                    metadata = workspace.update_status("finalizing")
+                        if self._stop_event.is_set():
+                            logger.info("收到停止请求，开始收尾。")
+                            _emit_progress(
+                                self.on_progress,
+                                "stopping",
+                                "正在停止录音并收尾。",
+                                session_id=metadata.session_id,
+                            )
+                            capture_finished = True
+                            break
+                        if capture.error:
+                            raise AudioCaptureError(str(capture.error))
+                        if not capture.is_alive:
+                            raise AudioCaptureError("音频采集线程已停止。")
+                        self._raise_thread_error_if_any()
+                        time.sleep(0.25)
+                except KeyboardInterrupt:
+                    logger.info("收到停止信号，开始收尾。")
+                    capture_finished = True
                     _emit_progress(
                         self.on_progress,
-                        "capture_finished",
-                        "录音已停止，后台继续转写、精修和整理。",
+                        "stopping",
+                        "正在停止录音并收尾。",
                         session_id=metadata.session_id,
                     )
-                transcribe_thread.join()
+                finally:
+                    capture.stop()
+                    capture.join(timeout=5)
+                    _enqueue_with_retry(frame_queue, FRAME_STOP)
+                    segment_thread.join()
+                    if capture_finished:
+                        metadata = workspace.update_status("finalizing")
+                        _emit_progress(
+                            self.on_progress,
+                            "capture_finished",
+                            "录音已停止，后台继续转写、精修和整理。",
+                            session_id=metadata.session_id,
+                        )
+                    transcribe_thread.join()
 
-        self._raise_thread_error_if_any()
-        if self.config.refine.enabled and self.config.refine.auto_after_live:
-            previous_source = metadata.transcript_source
-            try:
-                metadata = _run_live_refinement(
-                    config=self.config,
-                    workspace=workspace,
-                    metadata=workspace.update_session(status="refining", refine_status="refining"),
-                    logger=logger,
-                    on_progress=self.on_progress,
-                )
-            except Exception as exc:
-                logger.error("自动离线精修失败，将保留实时草稿: %s", exc)
-                _emit_progress(
-                    self.on_progress,
-                    "error",
-                    f"自动离线精修失败：{exc}",
-                    session_id=metadata.session_id,
-                    error=str(exc),
-                )
-                metadata = workspace.update_session(
-                    transcript_source=previous_source,
-                    refine_status="failed",
-                )
-        _publish_final_outputs(
-            workspace,
-            metadata,
-            obsidian,
-            llm_client,
-            logger,
-            on_progress=self.on_progress,
-        )
-        _emit_progress(
-            self.on_progress,
-            "done",
-            "会话已完成。",
-            session_id=metadata.session_id,
-        )
-        return 0
+            self._raise_thread_error_if_any()
+            if self.config.refine.enabled and self.config.refine.auto_after_live:
+                previous_source = metadata.transcript_source
+                try:
+                    metadata = _run_live_refinement(
+                        config=self.config,
+                        workspace=workspace,
+                        metadata=workspace.update_session(
+                            status="refining",
+                            refine_status="refining",
+                        ),
+                        logger=logger,
+                        on_progress=self.on_progress,
+                    )
+                except Exception as exc:
+                    logger.error("自动离线精修失败，将保留实时草稿: %s", exc)
+                    _emit_progress(
+                        self.on_progress,
+                        "error",
+                        f"自动离线精修失败：{exc}",
+                        session_id=metadata.session_id,
+                        error=str(exc),
+                    )
+                    metadata = workspace.update_session(
+                        transcript_source=previous_source,
+                        refine_status="failed",
+                    )
+            _publish_final_outputs(
+                workspace,
+                metadata,
+                obsidian,
+                llm_client,
+                logger,
+                on_progress=self.on_progress,
+            )
+            _emit_progress(
+                self.on_progress,
+                "done",
+                "会话已完成。",
+                session_id=metadata.session_id,
+            )
+            return 0
+        except BaseException as exc:
+            _mark_session_failed(
+                workspace=workspace,
+                logger=logger,
+                label="实时会话",
+                exc=exc,
+                on_progress=self.on_progress,
+            )
+            raise
 
     def _drain_control_commands(
         self,
@@ -523,112 +536,122 @@ class FileImportCoordinator:
         )
         workspace = SessionWorkspace.create(Path(metadata.session_dir), metadata)
         logger = workspace.session_logger()
-        _attach_console_logging()
-        _emit_progress(
-            self.on_progress,
-            "starting",
-            f"已创建导入会话：{metadata.title}",
-            session_id=metadata.session_id,
-        )
-
-        obsidian = ObsidianClient(self.config.obsidian)
-        llm_client = OpenAiCompatibleClient(self.config.llm)
-        whisper_config = _runtime_whisper_config(self.config.whisper, self.language)
-        whisper_client = WhisperInferenceClient(whisper_config)
-
-        _write_initial_transcript(workspace, metadata, obsidian, logger, status="importing")
-        metadata = workspace.update_status("importing")
-        _emit_progress(
-            self.on_progress,
-            "normalizing",
-            f"正在转换媒体文件：{self.file_path.name}",
-            session_id=metadata.session_id,
-        )
-
-        normalized_path = workspace.root / "source.normalized.wav"
         try:
-            convert_audio_to_wav(
-                input_path=self.file_path,
-                output_path=normalized_path,
-                sample_rate=self.config.audio.sample_rate,
-                ffmpeg_binary=self.config.importer.ffmpeg_binary,
-            )
+            _attach_console_logging()
             _emit_progress(
                 self.on_progress,
-                "chunking",
-                "正在切分音频片段。",
+                "starting",
+                f"已创建导入会话：{metadata.title}",
                 session_id=metadata.session_id,
             )
-            chunks = split_wav_file(
-                input_path=normalized_path,
-                output_dir=workspace.segments_dir,
-                chunk_seconds=self.config.importer.chunk_seconds,
-            )
-            if not chunks:
-                raise AudioImportError("转换后的音频为空，无法转写。")
-            for chunk in chunks:
-                workspace.record_segment_created(
-                    chunk.segment_id,
-                    chunk.started_ms,
-                    chunk.ended_ms,
-                    chunk.wav_path,
-                )
 
-            with WhisperServerProcess(whisper_config, workspace.logs_txt):
-                for index, chunk in enumerate(chunks, start=1):
-                    _emit_progress(
-                        self.on_progress,
-                        "transcribing",
-                        f"正在转写片段 {index}/{len(chunks)}",
-                        session_id=metadata.session_id,
-                        current=index,
-                        total=len(chunks),
+            obsidian = ObsidianClient(self.config.obsidian)
+            llm_client = OpenAiCompatibleClient(self.config.llm)
+            whisper_config = _runtime_whisper_config(self.config.whisper, self.language)
+            whisper_client = WhisperInferenceClient(whisper_config)
+
+            _write_initial_transcript(workspace, metadata, obsidian, logger, status="importing")
+            metadata = workspace.update_status("importing")
+            _emit_progress(
+                self.on_progress,
+                "normalizing",
+                f"正在转换媒体文件：{self.file_path.name}",
+                session_id=metadata.session_id,
+            )
+
+            normalized_path = workspace.root / "source.normalized.wav"
+            try:
+                convert_audio_to_wav(
+                    input_path=self.file_path,
+                    output_path=normalized_path,
+                    sample_rate=self.config.audio.sample_rate,
+                    ffmpeg_binary=self.config.importer.ffmpeg_binary,
+                )
+                _emit_progress(
+                    self.on_progress,
+                    "chunking",
+                    "正在切分音频片段。",
+                    session_id=metadata.session_id,
+                )
+                chunks = split_wav_file(
+                    input_path=normalized_path,
+                    output_dir=workspace.segments_dir,
+                    chunk_seconds=self.config.importer.chunk_seconds,
+                )
+                if not chunks:
+                    raise AudioImportError("转换后的音频为空，无法转写。")
+                for chunk in chunks:
+                    workspace.record_segment_created(
+                        chunk.segment_id,
+                        chunk.started_ms,
+                        chunk.ended_ms,
+                        chunk.wav_path,
                     )
-                    success = _process_segment(
-                        pending=PendingSegment(
-                            segment_id=chunk.segment_id,
-                            started_ms=chunk.started_ms,
-                            ended_ms=chunk.ended_ms,
-                            pcm16=None,
-                            wav_path=chunk.wav_path,
-                        ),
-                        workspace=workspace,
-                        metadata=metadata,
-                        obsidian=obsidian,
-                        whisper_client=whisper_client,
-                        logger=logger,
-                        entries=self.entries,
-                        live_status="importing",
-                        sample_rate=self.config.audio.sample_rate,
-                    )
-                    if not success:
+
+                with WhisperServerProcess(whisper_config, workspace.logs_txt):
+                    for index, chunk in enumerate(chunks, start=1):
                         _emit_progress(
                             self.on_progress,
-                            "segment_failed",
-                            f"片段 {chunk.segment_id} 处理失败",
+                            "transcribing",
+                            f"正在转写片段 {index}/{len(chunks)}",
                             session_id=metadata.session_id,
                             current=index,
                             total=len(chunks),
                         )
-        finally:
-            if normalized_path.exists() and not self.config.importer.keep_normalized_audio:
-                normalized_path.unlink()
+                        success = _process_segment(
+                            pending=PendingSegment(
+                                segment_id=chunk.segment_id,
+                                started_ms=chunk.started_ms,
+                                ended_ms=chunk.ended_ms,
+                                pcm16=None,
+                                wav_path=chunk.wav_path,
+                            ),
+                            workspace=workspace,
+                            metadata=metadata,
+                            obsidian=obsidian,
+                            whisper_client=whisper_client,
+                            logger=logger,
+                            entries=self.entries,
+                            live_status="importing",
+                            sample_rate=self.config.audio.sample_rate,
+                        )
+                        if not success:
+                            _emit_progress(
+                                self.on_progress,
+                                "segment_failed",
+                                f"片段 {chunk.segment_id} 处理失败",
+                                session_id=metadata.session_id,
+                                current=index,
+                                total=len(chunks),
+                            )
+            finally:
+                if normalized_path.exists() and not self.config.importer.keep_normalized_audio:
+                    normalized_path.unlink()
 
-        _publish_final_outputs(
-            workspace,
-            metadata,
-            obsidian,
-            llm_client,
-            logger,
-            on_progress=self.on_progress,
-        )
-        _emit_progress(
-            self.on_progress,
-            "done",
-            "导入会话已完成。",
-            session_id=metadata.session_id,
-        )
-        return 0
+            _publish_final_outputs(
+                workspace,
+                metadata,
+                obsidian,
+                llm_client,
+                logger,
+                on_progress=self.on_progress,
+            )
+            _emit_progress(
+                self.on_progress,
+                "done",
+                "导入会话已完成。",
+                session_id=metadata.session_id,
+            )
+            return 0
+        except BaseException as exc:
+            _mark_session_failed(
+                workspace=workspace,
+                logger=logger,
+                label="导入会话",
+                exc=exc,
+                on_progress=self.on_progress,
+            )
+            raise
 
 
 def finalize_session(
@@ -956,6 +979,28 @@ def _write_initial_transcript(
     _try_sync_note(obsidian, metadata.transcript_note_path, initial_note, logger, "原文初始笔记")
 
 
+def _mark_session_failed(
+    *,
+    workspace: SessionWorkspace,
+    logger: logging.Logger,
+    label: str,
+    exc: BaseException,
+    on_progress: ProgressCallback | None,
+) -> None:
+    try:
+        metadata = workspace.update_session(status="failed")
+    except Exception:
+        metadata = workspace.read_session()
+    logger.exception("%s失败: %s", label, exc)
+    _emit_progress(
+        on_progress,
+        "error",
+        f"{label}失败：{exc}",
+        session_id=metadata.session_id,
+        error=str(exc),
+    )
+
+
 def _publish_final_outputs(
     workspace: SessionWorkspace,
     metadata: SessionMetadata,
@@ -1219,22 +1264,31 @@ def _session_duration_ms(workspace: SessionWorkspace, states: list[SegmentState]
     if states:
         return max(state.ended_ms for state in states)
     if workspace.session_live_wav.exists():
-        return _wav_duration_ms(workspace.session_live_wav)
+        try:
+            return _wav_duration_ms(workspace.session_live_wav)
+        except AudioImportError:
+            return 0
     return 0
 
 
 def _wav_duration_ms(path: Path) -> int:
-    with wave.open(str(path), "rb") as handle:
-        sample_rate = handle.getframerate()
-        frame_count = handle.getnframes()
+    try:
+        with wave.open(str(path), "rb") as handle:
+            sample_rate = handle.getframerate()
+            frame_count = handle.getnframes()
+    except (EOFError, OSError, wave.Error) as exc:
+        raise AudioImportError(f"WAV 文件损坏或不可读: {path}") from exc
     if sample_rate <= 0:
         return 0
     return round(frame_count * 1000 / sample_rate)
 
 
 def _wav_sample_rate(path: Path) -> int:
-    with wave.open(str(path), "rb") as handle:
-        sample_rate = handle.getframerate()
+    try:
+        with wave.open(str(path), "rb") as handle:
+            sample_rate = handle.getframerate()
+    except (EOFError, OSError, wave.Error) as exc:
+        raise AudioImportError(f"WAV 文件损坏或不可读: {path}") from exc
     if sample_rate <= 0:
         raise AudioImportError(f"WAV 采样率不合法: {path}")
     return sample_rate
@@ -1248,7 +1302,10 @@ def _can_merge_live_audio(sources: list[MergeSourceSession]) -> bool:
         wav_path = item.workspace.session_live_wav
         if item.metadata.input_mode != "live" or not wav_path.exists():
             return False
-        current_rate = _wav_sample_rate(wav_path)
+        try:
+            current_rate = _wav_sample_rate(wav_path)
+        except AudioImportError:
+            return False
         if sample_rate is None:
             sample_rate = current_rate
         elif current_rate != sample_rate:
@@ -1542,13 +1599,18 @@ def _transcribe_segment_text(
 
 
 def _read_wav_pcm16(path: Path) -> tuple[bytes, int]:
-    with wave.open(str(path), "rb") as handle:
-        channels = handle.getnchannels()
-        sample_width = handle.getsampwidth()
-        sample_rate = handle.getframerate()
-        if channels != 1 or sample_width != 2:
-            raise AudioImportError(f"WAV 格式不受支持: {path}")
-        return handle.readframes(handle.getnframes()), sample_rate
+    try:
+        with wave.open(str(path), "rb") as handle:
+            channels = handle.getnchannels()
+            sample_width = handle.getsampwidth()
+            sample_rate = handle.getframerate()
+            if channels != 1 or sample_width != 2:
+                raise AudioImportError(f"WAV 格式不受支持: {path}")
+            return handle.readframes(handle.getnframes()), sample_rate
+    except AudioImportError:
+        raise
+    except (EOFError, OSError, wave.Error) as exc:
+        raise AudioImportError(f"WAV 文件损坏或不可读: {path}") from exc
 
 
 def _write_wav(path: Path, sample_rate: int, pcm16: bytes) -> None:

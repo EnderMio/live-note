@@ -267,6 +267,8 @@ def save_config(
     env_values = load_env_file(resolved_env)
     env_values["OBSIDIAN_API_KEY"] = config.obsidian.api_key or ""
     env_values["LLM_API_KEY"] = config.llm.api_key or ""
+    if config.llm.requires_openai_auth:
+        env_values["OPENAI_API_KEY"] = config.llm.api_key or ""
     resolved_env.write_text(
         "\n".join(f"{key}={value}" for key, value in env_values.items()) + "\n",
         encoding="utf-8",

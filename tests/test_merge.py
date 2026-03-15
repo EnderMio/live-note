@@ -204,3 +204,55 @@ class MergeSessionTests(unittest.TestCase):
             self.assertEqual("第二部分讨论需求。", entries[1].text)
             self.assertTrue(workspace.transcript_md.exists())
             self.assertTrue(workspace.structured_md.exists())
+
+    def test_merge_sessions_keeps_text_when_session_live_wav_is_corrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_path = root / "ggml-large-v3.bin"
+            model_path.write_bytes(b"fake-model")
+            service = AppService(root / "config.toml")
+            service.save_settings(
+                SettingsDraft(
+                    ffmpeg_binary="/opt/homebrew/bin/ffmpeg",
+                    whisper_binary="/Users/demo/whisper-server",
+                    whisper_model=str(model_path),
+                    obsidian_enabled=False,
+                    llm_enabled=False,
+                )
+            )
+            first_id = "20260315-210500-课程上半场"
+            second_id = "20260315-213500-课程下半场"
+            _create_live_session(
+                root,
+                session_id=first_id,
+                title="国际政治",
+                started_at="2026-03-15T13:05:00+00:00",
+                segment_samples=[1000, -1000] * 8000,
+                text="第一部分讨论联盟。",
+            )
+            _create_live_session(
+                root,
+                session_id=second_id,
+                title="国际政治",
+                started_at="2026-03-15T13:35:00+00:00",
+                segment_samples=[2000, -2000] * 8000,
+                text="第二部分讨论关税。",
+            )
+            broken_wav = root / ".live-note" / "sessions" / second_id / "session.live.wav"
+            broken_wav.write_bytes(b"not-a-valid-wav")
+
+            merge_sessions(service.load_config(), [first_id, second_id])
+
+            session_roots = list(list_sessions(root))
+            self.assertEqual(3, len(session_roots))
+            merged_root = next(
+                path for path in session_roots if path.name not in {first_id, second_id}
+            )
+            workspace = SessionWorkspace.load(merged_root)
+            metadata = workspace.read_session()
+            entries = workspace.transcript_entries()
+
+        self.assertEqual("国际政治（合并）", metadata.title)
+        self.assertEqual("disabled", metadata.refine_status)
+        self.assertFalse(workspace.session_live_wav.exists())
+        self.assertEqual(["第一部分讨论联盟。", "第二部分讨论关税。"], [e.text for e in entries])

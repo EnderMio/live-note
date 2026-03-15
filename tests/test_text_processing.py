@@ -30,6 +30,18 @@ class TextProcessingTests(unittest.TestCase):
         self.assertIn("只转写实际听到的语音", prompt)
         self.assertNotIn("最近上下文", prompt)
 
+    def test_build_transcription_prompt_for_auto_preserves_multilingual_output(self) -> None:
+        prompt = build_transcription_prompt(
+            "auto",
+            [
+                TranscriptEntry("seg-00001", 0, 2000, "今天我们先看 NVIDIA earnings。"),
+            ],
+        )
+
+        self.assertIn("Preserve the original spoken languages and scripts", prompt)
+        self.assertIn("Recent context:", prompt)
+        self.assertNotIn("简体中文", prompt)
+
     def test_normalize_transcript_text_collapses_lines(self) -> None:
         text = normalize_transcript_text(" 第一行 \n\n 第二行 ", "en")
         self.assertEqual("第一行 第二行", text)
@@ -58,3 +70,8 @@ class TextProcessingTests(unittest.TestCase):
     def test_normalize_transcript_text_simplifies_chinese_when_opencc_available(self) -> None:
         text = normalize_transcript_text("對於這個目前來講", "zh")
         self.assertEqual("对于这个目前来讲", text)
+
+    @unittest.skipUnless(_SIMPLIFIER is not None, "opencc 未安装")
+    def test_normalize_transcript_text_keeps_original_script_in_auto_mode(self) -> None:
+        text = normalize_transcript_text("對於這個 AI topic 目前來講", "auto")
+        self.assertEqual("對於這個 AI topic 目前來講", text)

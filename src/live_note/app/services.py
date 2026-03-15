@@ -367,9 +367,14 @@ class AppService:
 
         items: list[SessionSummary] = []
         for root in iter_session_roots(config.root_dir):
-            workspace = SessionWorkspace.load(root)
-            metadata = workspace.read_session()
-            states = workspace.rebuild_segment_states()
+            try:
+                workspace = SessionWorkspace.load(root)
+                metadata = workspace.read_session()
+                states = workspace.rebuild_segment_states()
+            except Exception as exc:
+                items.append(_build_broken_session_summary(root, exc))
+                continue
+
             latest_error = next((state.error for state in reversed(states) if state.error), None)
             items.append(
                 SessionSummary(
@@ -578,4 +583,24 @@ def _default_config(root_dir: Path) -> AppConfig:
             api_key=None,
         ),
         root_dir=root_dir.resolve(),
+    )
+
+
+def _build_broken_session_summary(root: Path, exc: Exception) -> SessionSummary:
+    return SessionSummary(
+        session_id=root.name,
+        title=f"{root.name}（损坏会话）",
+        kind="broken",
+        input_mode="broken",
+        started_at="",
+        status="broken",
+        segment_count=0,
+        transcribed_count=0,
+        failed_count=1,
+        latest_error=str(exc),
+        transcript_source="unknown",
+        refine_status="unknown",
+        session_dir=root,
+        transcript_file=root / "transcript.md",
+        structured_file=root / "structured.md",
     )

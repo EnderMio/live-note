@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from live_note.app.journal import SessionWorkspace
@@ -79,7 +80,7 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual("obsidian-token", reloaded.obsidian.api_key)
             self.assertEqual("llm-token", reloaded.llm.api_key)
 
-    def test_save_settings_preserves_existing_env_keys(self) -> None:
+    def test_save_settings_updates_openai_key_when_openai_auth_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             model_path = root / "ggml-base.bin"
@@ -105,10 +106,10 @@ class AppServiceTests(unittest.TestCase):
             env_text = env_path.read_text(encoding="utf-8")
             reloaded = service.load_config()
 
-        self.assertIn("OPENAI_API_KEY=openai-token", env_text)
         self.assertIn("EXTRA_SETTING=keep-me", env_text)
         self.assertIn("LLM_API_KEY=fallback-token", env_text)
-        self.assertEqual("openai-token", reloaded.llm.api_key)
+        self.assertIn("OPENAI_API_KEY=fallback-token", env_text)
+        self.assertEqual("fallback-token", reloaded.llm.api_key)
 
     def test_list_session_summaries_reads_workspace_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -150,6 +151,49 @@ class AppServiceTests(unittest.TestCase):
         self.assertEqual("timeout", summaries[0].latest_error)
         self.assertEqual("refined", summaries[0].transcript_source)
         self.assertEqual("done", summaries[0].refine_status)
+
+    def test_list_session_summaries_keeps_broken_sessions_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_path = root / "ggml-base.bin"
+            model_path.write_bytes(b"fake-model")
+            service = AppService(root / "config.toml")
+            service.save_settings(
+                SettingsDraft(
+                    ffmpeg_binary="/opt/homebrew/bin/ffmpeg",
+                    whisper_binary="/Users/demo/whisper-server",
+                    whisper_model=str(model_path),
+                )
+            )
+
+            good_dir = root / ".live-note" / "sessions" / "20260315-210500-机器学习"
+            SessionWorkspace.create(good_dir, sample_metadata(str(good_dir)))
+
+            broken_meta_dir = root / ".live-note" / "sessions" / "20260315-220000-坏会话元数据"
+            broken_meta_dir.mkdir(parents=True, exist_ok=True)
+            (broken_meta_dir / "session.toml").write_text("not = [valid", encoding="utf-8")
+
+            broken_segments_dir = root / ".live-note" / "sessions" / "20260315-223000-坏会话分段"
+            broken_workspace = SessionWorkspace.create(
+                broken_segments_dir,
+                replace(
+                    sample_metadata(str(broken_segments_dir)),
+                    session_id="20260315-223000-坏会话分段",
+                    session_dir=str(broken_segments_dir),
+                ),
+            )
+            broken_workspace.segments_jsonl.write_text("{bad json}\n", encoding="utf-8")
+
+            summaries = service.list_session_summaries()
+
+        self.assertEqual(3, len(summaries))
+        broken = {
+            summary.session_id: summary for summary in summaries if summary.status == "broken"
+        }
+        self.assertEqual(2, len(broken))
+        self.assertIn("20260315-220000-坏会话元数据", broken)
+        self.assertIn("20260315-223000-坏会话分段", broken)
+        self.assertTrue(any(summary.status != "broken" for summary in summaries))
 
     def test_doctor_checks_mark_disabled_integrations_as_skip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
