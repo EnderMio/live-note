@@ -47,6 +47,7 @@ from live_note.transcribe.whisper import (
     WhisperInferenceClient,
     WhisperServerProcess,
     with_language_override,
+    with_runtime_port,
 )
 from live_note.utils import iso_now, slugify_filename
 
@@ -54,6 +55,8 @@ from .events import ProgressCallback, ProgressEvent
 from .journal import SessionWorkspace, build_workspace, session_root
 
 FRAME_STOP = object()
+FRAME_PAUSE = object()
+FRAME_RESUME = object()
 SEGMENT_STOP = object()
 
 
@@ -155,9 +158,28 @@ class SessionCoordinator:
         self.entries: list[TranscriptEntry] = []
         self._thread_errors: queue.Queue[BaseException] = queue.Queue()
         self._stop_event = threading.Event()
+        self._control_commands: queue.Queue[str] = queue.Queue()
+        self._pause_requested = False
+        self.session_id: str | None = None
 
     def request_stop(self) -> None:
         self._stop_event.set()
+
+    def request_pause(self) -> None:
+        if self._pause_requested:
+            return
+        self._pause_requested = True
+        self._control_commands.put("pause")
+
+    def request_resume(self) -> None:
+        if not self._pause_requested:
+            return
+        self._pause_requested = False
+        self._control_commands.put("resume")
+
+    @property
+    def is_paused(self) -> bool:
+        return self._pause_requested
 
     def run(self) -> int:
         device = resolve_input_device(self.source)
@@ -170,6 +192,7 @@ class SessionCoordinator:
             source_label=device.name,
             source_ref=str(device.index),
         )
+        self.session_id = metadata.session_id
         workspace = SessionWorkspace.create(Path(metadata.session_dir), metadata)
         logger = workspace.session_logger()
         _attach_console_logging()
@@ -182,7 +205,7 @@ class SessionCoordinator:
 
         obsidian = ObsidianClient(self.config.obsidian)
         llm_client = OpenAiCompatibleClient(self.config.llm)
-        whisper_config = with_language_override(self.config.whisper, self.language)
+        whisper_config = _runtime_whisper_config(self.config.whisper, self.language)
         whisper_client = WhisperInferenceClient(whisper_config)
         whisper_server = WhisperServerProcess(whisper_config, workspace.logs_txt)
 
@@ -214,6 +237,7 @@ class SessionCoordinator:
             daemon=True,
             args=(segment_queue, workspace, metadata, obsidian, whisper_client),
         )
+        capture_finished = False
 
         with whisper_server:
             segment_thread.start()
@@ -221,6 +245,13 @@ class SessionCoordinator:
             capture.start()
             try:
                 while True:
+                    self._drain_control_commands(
+                        capture=capture,
+                        frame_queue=frame_queue,
+                        workspace=workspace,
+                        metadata=metadata,
+                        logger=logger,
+                    )
                     if self._stop_event.is_set():
                         logger.info("收到停止请求，开始收尾。")
                         _emit_progress(
@@ -229,6 +260,7 @@ class SessionCoordinator:
                             "正在停止录音并收尾。",
                             session_id=metadata.session_id,
                         )
+                        capture_finished = True
                         break
                     if capture.error:
                         raise AudioCaptureError(str(capture.error))
@@ -238,11 +270,26 @@ class SessionCoordinator:
                     time.sleep(0.25)
             except KeyboardInterrupt:
                 logger.info("收到停止信号，开始收尾。")
+                capture_finished = True
+                _emit_progress(
+                    self.on_progress,
+                    "stopping",
+                    "正在停止录音并收尾。",
+                    session_id=metadata.session_id,
+                )
             finally:
                 capture.stop()
                 capture.join(timeout=5)
                 _enqueue_with_retry(frame_queue, FRAME_STOP)
                 segment_thread.join()
+                if capture_finished:
+                    metadata = workspace.update_status("finalizing")
+                    _emit_progress(
+                        self.on_progress,
+                        "capture_finished",
+                        "录音已停止，后台继续转写、精修和整理。",
+                        session_id=metadata.session_id,
+                    )
                 transcribe_thread.join()
 
         self._raise_thread_error_if_any()
@@ -285,6 +332,50 @@ class SessionCoordinator:
         )
         return 0
 
+    def _drain_control_commands(
+        self,
+        *,
+        capture: AudioCaptureService,
+        frame_queue: queue.Queue[AudioFrame | object],
+        workspace: SessionWorkspace,
+        metadata: SessionMetadata,
+        logger: logging.Logger,
+    ) -> None:
+        while True:
+            try:
+                command = self._control_commands.get_nowait()
+            except queue.Empty:
+                return
+
+            if command == "pause":
+                if capture.is_paused:
+                    continue
+                capture.pause()
+                _enqueue_with_retry(frame_queue, FRAME_PAUSE)
+                workspace.update_status("paused")
+                logger.info("录音已暂停。")
+                _emit_progress(
+                    self.on_progress,
+                    "paused",
+                    "录音已暂停。",
+                    session_id=metadata.session_id,
+                )
+                continue
+
+            if command == "resume":
+                if not capture.is_paused:
+                    continue
+                _enqueue_with_retry(frame_queue, FRAME_RESUME)
+                capture.resume()
+                workspace.update_status("live")
+                logger.info("录音已继续。")
+                _emit_progress(
+                    self.on_progress,
+                    "listening",
+                    "已继续录音。",
+                    session_id=metadata.session_id,
+                )
+
     def _segment_loop(
         self,
         frame_queue: queue.Queue[AudioFrame | object],
@@ -299,14 +390,10 @@ class SessionCoordinator:
                 enabled=self.config.audio.save_session_wav,
             ) as session_audio:
                 counter = 0
-                while True:
-                    item = frame_queue.get()
-                    if item is FRAME_STOP:
-                        break
-                    assert isinstance(item, AudioFrame)
-                    if session_audio is not None:
-                        session_audio.write(item.pcm16)
-                    for segment in segmenter.feed(item):
+
+                def emit_segments(segments: Iterable[SegmentWindow]) -> None:
+                    nonlocal counter
+                    for segment in segments:
                         counter += 1
                         pending = _persist_live_segment(
                             counter=counter,
@@ -321,21 +408,21 @@ class SessionCoordinator:
                             current=counter,
                         )
                         _enqueue_with_retry(segment_queue, pending)
-                for segment in segmenter.flush():
-                    counter += 1
-                    pending = _persist_live_segment(
-                        counter=counter,
-                        segment=segment,
-                        workspace=workspace,
-                        sample_rate=self.config.audio.sample_rate,
-                    )
-                    _emit_progress(
-                        self.on_progress,
-                        "segment_created",
-                        f"已切出片段 {pending.segment_id}",
-                        current=counter,
-                    )
-                    _enqueue_with_retry(segment_queue, pending)
+
+                while True:
+                    item = frame_queue.get()
+                    if item is FRAME_STOP:
+                        break
+                    if item is FRAME_PAUSE:
+                        emit_segments(segmenter.flush())
+                        continue
+                    if item is FRAME_RESUME:
+                        continue
+                    assert isinstance(item, AudioFrame)
+                    if session_audio is not None:
+                        session_audio.write(item.pcm16)
+                    emit_segments(segmenter.feed(item))
+                emit_segments(segmenter.flush())
         except BaseException as exc:
             self._thread_errors.put(exc)
             _emit_progress(
@@ -446,7 +533,7 @@ class FileImportCoordinator:
 
         obsidian = ObsidianClient(self.config.obsidian)
         llm_client = OpenAiCompatibleClient(self.config.llm)
-        whisper_config = with_language_override(self.config.whisper, self.language)
+        whisper_config = _runtime_whisper_config(self.config.whisper, self.language)
         whisper_client = WhisperInferenceClient(whisper_config)
 
         _write_initial_transcript(workspace, metadata, obsidian, logger, status="importing")
@@ -562,7 +649,8 @@ def finalize_session(
 
     obsidian = ObsidianClient(config.obsidian)
     llm_client = OpenAiCompatibleClient(config.llm)
-    whisper_config = with_language_override(config.whisper, metadata.language)
+    whisper_config = _runtime_whisper_config(config.whisper, metadata.language)
+    metadata = workspace.update_status("finalizing")
 
     missing = [
         state for state in workspace.rebuild_segment_states() if state.wav_path and not state.text
@@ -614,7 +702,8 @@ def retranscribe_session(
 
     obsidian = ObsidianClient(config.obsidian)
     llm_client = OpenAiCompatibleClient(config.llm)
-    whisper_config = with_language_override(config.whisper, metadata.language)
+    whisper_config = _runtime_whisper_config(config.whisper, metadata.language)
+    metadata = workspace.update_status("retranscribing")
     states = [state for state in workspace.rebuild_segment_states() if state.wav_path]
     _recover_session_segments(
         workspace=workspace,
@@ -1216,7 +1305,7 @@ def _run_live_refinement(
     if not workspace.session_live_wav.exists():
         raise FileNotFoundError("找不到 session.live.wav，无法离线精修。")
 
-    whisper_config = with_language_override(config.whisper, metadata.language)
+    whisper_config = _runtime_whisper_config(config.whisper, metadata.language)
     whisper_client = WhisperInferenceClient(whisper_config)
 
     if workspace.refined_dir.exists():
@@ -1469,6 +1558,10 @@ def _write_wav(path: Path, sample_rate: int, pcm16: bytes) -> None:
         handle.setsampwidth(2)
         handle.setframerate(sample_rate)
         handle.writeframes(pcm16)
+
+
+def _runtime_whisper_config(config: Any, language: str | None) -> Any:
+    return with_runtime_port(with_language_override(config, language))
 
 
 def _open_session_audio_writer(

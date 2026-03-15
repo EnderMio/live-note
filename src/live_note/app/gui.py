@@ -49,9 +49,16 @@ class LiveNoteGui:
     def __init__(self, root: Tk, service: AppService):
         self.root = root
         self.service = service
-        self.event_queue: queue.Queue[ProgressEvent | tuple[str, str, object]] = queue.Queue()
+        self.event_queue: queue.Queue[object] = queue.Queue()
+        self.task_sequence = 0
         self.current_worker: threading.Thread | None = None
+        self.current_task_id: str | None = None
+        self.current_task_label: str | None = None
+        self.current_task_session_id: str | None = None
+        self.current_live_task_id: str | None = None
         self.current_live_runner = None
+        self.background_tasks: dict[str, str] = {}
+        self.background_task_sessions: dict[str, str | None] = {}
         self.busy = False
         self.live_devices: list[InputDevice] = []
         self.history_rows: dict[str, SessionSummary] = {}
@@ -226,6 +233,13 @@ class LiveNoteGui:
             state="disabled",
         )
         self.stop_live_button.grid(row=0, column=1, padx=(8, 0))
+        self.pause_live_button = ttk.Button(
+            actions,
+            text="暂停录音",
+            command=self._toggle_live_pause,
+            state="disabled",
+        )
+        self.pause_live_button.grid(row=0, column=2, padx=(8, 0))
 
     def _build_import_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
@@ -612,14 +626,29 @@ class LiveNoteGui:
             messagebox.showerror("启动失败", str(exc))
             return
         self.current_live_runner = runner
-        self._run_background("实时录音", runner.run)
+        self._run_background("实时录音", runner.run, detachable_live=True)
         self.stop_live_button.configure(state="normal")
+        self.pause_live_button.configure(state="normal", text="暂停录音")
 
     def _stop_live_session(self) -> None:
         if self.current_live_runner is None:
             return
         self.current_live_runner.request_stop()
+        self.stop_live_button.configure(state="disabled")
+        self.pause_live_button.configure(state="disabled")
         self._append_log("已请求停止录音，等待当前片段收尾。")
+
+    def _toggle_live_pause(self) -> None:
+        if self.current_live_runner is None:
+            return
+        if self.current_live_runner.is_paused:
+            self.current_live_runner.request_resume()
+            self.pause_live_button.configure(text="暂停录音")
+            self._append_log("已请求继续录音。")
+        else:
+            self.current_live_runner.request_pause()
+            self.pause_live_button.configure(text="继续录音")
+            self._append_log("已请求暂停录音。")
 
     def _start_import(self) -> None:
         if not self._ensure_ready_for_run():
@@ -697,11 +726,22 @@ class LiveNoteGui:
             lambda: self.service.resync_notes(summary.session_id, on_progress=self.event_queue.put),
         )
 
-    def _run_background(self, label: str, action: Callable[[], int]) -> None:
+    def _run_background(
+        self,
+        label: str,
+        action: Callable[[], int],
+        *,
+        detachable_live: bool = False,
+    ) -> None:
         if self.busy:
             messagebox.showinfo("任务进行中", "请等待当前任务完成，或先停止录音。")
             return
         self.busy = True
+        task_id = self._next_task_id()
+        self.current_task_id = task_id
+        self.current_task_label = label
+        self.current_task_session_id = None
+        self.current_live_task_id = task_id if detachable_live else None
         self.start_live_button.configure(state="disabled")
         self.status_var.set(f"{label}：准备中")
         self.progress.configure(mode="indeterminate", value=0)
@@ -711,11 +751,11 @@ class LiveNoteGui:
             try:
                 result = action()
             except Exception as exc:
-                self.event_queue.put(("task_error", label, str(exc)))
+                self.event_queue.put(("task_error", task_id, label, str(exc)))
             else:
-                self.event_queue.put(("task_done", label, result))
+                self.event_queue.put(("task_done", task_id, label, result))
 
-        self.current_worker = threading.Thread(target=worker, daemon=True)
+        self.current_worker = threading.Thread(target=worker, daemon=False)
         self.current_worker.start()
 
     def _refresh_history(self) -> None:
@@ -983,19 +1023,43 @@ class LiveNoteGui:
                 self._handle_progress(item)
                 continue
 
-            event_type, label, payload = item
+            event_type, task_id, label, payload = item
             if event_type == "task_error":
-                self._finish_task()
-                self._append_log(f"{label}失败：{payload}")
-                messagebox.showerror(f"{label}失败", str(payload))
+                if task_id == self.current_task_id:
+                    self._finish_task()
+                    self._append_log(f"{label}失败：{payload}")
+                    messagebox.showerror(f"{label}失败", str(payload))
+                else:
+                    self._finish_background_task(task_id)
+                    self._append_log(f"{label}后台失败：{payload}")
+                    self._refresh_history()
+                    self._refresh_doctor_checks()
             elif event_type == "task_done":
-                self._finish_task()
-                self._append_log(f"{label}完成。")
-                self._refresh_history()
-                self._refresh_doctor_checks()
+                if task_id == self.current_task_id:
+                    self._finish_task()
+                    self._append_log(f"{label}完成。")
+                    self._refresh_history()
+                    self._refresh_doctor_checks()
+                else:
+                    self._finish_background_task(task_id)
+                    self._append_log(f"{label}后台完成。")
+                    self._refresh_history()
+                    self._refresh_doctor_checks()
         self.root.after(150, self._poll_events)
 
     def _handle_progress(self, event: ProgressEvent) -> None:
+        is_foreground = self._is_foreground_event(event)
+        if is_foreground and event.stage == "capture_finished" and self.current_live_task_id:
+            self._append_log(event.message)
+            self._detach_live_task(event.session_id)
+            self._refresh_history()
+            return
+
+        if not is_foreground:
+            prefix = f"[后台 {event.session_id}] " if event.session_id else "[后台] "
+            self._append_log(f"{prefix}{event.message}")
+            return
+
         self.status_var.set(event.message)
         self._append_log(event.message)
         if event.total:
@@ -1012,11 +1076,85 @@ class LiveNoteGui:
     def _finish_task(self) -> None:
         self.busy = False
         self.current_worker = None
+        self.current_task_id = None
+        self.current_task_label = None
+        self.current_task_session_id = None
+        self.current_live_task_id = None
         self.current_live_runner = None
         self.start_live_button.configure(state="normal")
-        self.stop_live_button.configure(state="disabled")
+        self._reset_live_controls()
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
+        self._update_idle_status()
+
+    def _finish_background_task(self, task_id: str) -> None:
+        self.background_tasks.pop(task_id, None)
+        self.background_task_sessions.pop(task_id, None)
+        self._update_idle_status()
+
+    def _detach_live_task(self, session_id: str | None) -> None:
+        task_id = self.current_task_id
+        if task_id is None:
+            return
+        resolved_session_id = session_id or self.current_task_session_id
+        self.background_tasks[task_id] = self.current_task_label or "实时录音"
+        self.background_task_sessions[task_id] = resolved_session_id
+        self.busy = False
+        self.current_worker = None
+        self.current_task_id = None
+        self.current_task_label = None
+        self.current_task_session_id = None
+        self.current_live_task_id = None
+        self.current_live_runner = None
+        self.start_live_button.configure(state="normal")
+        self._reset_live_controls()
+        self.progress.stop()
+        self.progress.configure(mode="determinate", value=0)
+        self._update_idle_status()
+
+    def _is_foreground_event(self, event: ProgressEvent) -> bool:
+        if self.current_task_id is None:
+            return False
+        if event.session_id:
+            if self.current_task_session_id is None:
+                background_task_id = self._find_background_task_by_session(event.session_id)
+                if background_task_id is None:
+                    self.current_task_session_id = event.session_id
+            if self.current_task_session_id == event.session_id:
+                return True
+            background_task_id = self._find_background_task_by_session(event.session_id)
+            if (
+                background_task_id is not None
+                and self.background_task_sessions[background_task_id] is None
+            ):
+                self.background_task_sessions[background_task_id] = event.session_id
+            return False
+        return True
+
+    def _find_background_task_by_session(self, session_id: str) -> str | None:
+        for task_id, task_session_id in self.background_task_sessions.items():
+            if task_session_id == session_id:
+                return task_id
+        for task_id, task_session_id in self.background_task_sessions.items():
+            if task_session_id is None:
+                return task_id
+        return None
+
+    def _next_task_id(self) -> str:
+        self.task_sequence += 1
+        return f"task-{self.task_sequence:04d}"
+
+    def _reset_live_controls(self) -> None:
+        self.stop_live_button.configure(state="disabled")
+        self.pause_live_button.configure(state="disabled", text="暂停录音")
+
+    def _update_idle_status(self) -> None:
+        if self.busy:
+            return
+        pending = len(self.background_tasks)
+        if pending:
+            self.status_var.set(f"准备就绪（后台处理中 {pending} 项）")
+            return
         self.status_var.set("准备就绪")
 
     def _append_log(self, line: str) -> None:
@@ -1034,6 +1172,15 @@ class LiveNoteGui:
                 return
         if self.busy:
             if not messagebox.askyesno("退出", "当前任务仍在进行，确定直接关闭窗口吗？"):
+                return
+        elif self.background_tasks:
+            if not messagebox.askyesno(
+                "退出",
+                (
+                    f"仍有 {len(self.background_tasks)} 个后台任务在继续处理。"
+                    "关闭窗口后进程会继续运行直到这些任务完成。是否继续关闭窗口？"
+                ),
+            ):
                 return
         self.root.destroy()
 

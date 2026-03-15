@@ -85,6 +85,7 @@ class AudioCaptureService:
         self.device = device
         self.frame_queue = frame_queue
         self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._error: Exception | None = None
 
@@ -103,9 +104,19 @@ class AudioCaptureService:
     def stop(self) -> None:
         self._stop_event.set()
 
+    def pause(self) -> None:
+        self._pause_event.set()
+
+    def resume(self) -> None:
+        self._pause_event.clear()
+
     def join(self, timeout: float | None = None) -> None:
         if self._thread:
             self._thread.join(timeout=timeout)
+
+    @property
+    def is_paused(self) -> bool:
+        return self._pause_event.is_set()
 
     def _run(self) -> None:
         sd = _load_sounddevice()
@@ -117,6 +128,10 @@ class AudioCaptureService:
             nonlocal next_started_ms
             if status:
                 self._error = AudioCaptureError(str(status))
+            if self._pause_event.is_set():
+                if self._stop_event.is_set():
+                    raise sd.CallbackStop()
+                return
             mono_pcm16 = downmix_pcm16(bytes(indata), channels)
             duration_ms = int(frames * 1000 / self.config.sample_rate)
             frame = AudioFrame(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from live_note.transcribe.whisper import (
     WhisperInferenceClient,
     WhisperServerProcess,
     with_language_override,
+    with_runtime_port,
 )
 
 
@@ -314,3 +316,45 @@ class WhisperInferenceClientTests(unittest.TestCase):
 
         self.assertEqual("zh", overridden.language)
         self.assertEqual("auto", config.language)
+
+    def test_with_runtime_port_keeps_configured_port_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                preferred_port = int(probe.getsockname()[1])
+            config = WhisperConfig(
+                binary="whisper-server",
+                model=Path(temp_dir) / "model.bin",
+                host="127.0.0.1",
+                port=preferred_port,
+                threads=4,
+                language="auto",
+                translate=False,
+                request_timeout_seconds=5,
+                startup_timeout_seconds=5,
+            )
+
+            runtime_config = with_runtime_port(config)
+
+        self.assertEqual(preferred_port, runtime_config.port)
+
+    def test_with_runtime_port_picks_new_port_when_configured_port_is_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+                occupied.bind(("127.0.0.1", 0))
+                occupied.listen()
+                config = WhisperConfig(
+                    binary="whisper-server",
+                    model=Path(temp_dir) / "model.bin",
+                    host="127.0.0.1",
+                    port=int(occupied.getsockname()[1]),
+                    threads=4,
+                    language="auto",
+                    translate=False,
+                    request_timeout_seconds=5,
+                    startup_timeout_seconds=5,
+                )
+
+                runtime_config = with_runtime_port(config)
+
+        self.assertNotEqual(config.port, runtime_config.port)

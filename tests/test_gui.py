@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from live_note.app.events import ProgressEvent
 from live_note.app.gui import (
     LiveNoteGui,
     _language_code_to_display,
@@ -70,3 +71,37 @@ class GuiHistoryTests(unittest.TestCase):
         summaries = gui._selected_summaries(prompt=False, min_count=2)
 
         self.assertEqual([first, second], summaries)
+
+
+class GuiTaskTests(unittest.TestCase):
+    def test_handle_progress_detaches_live_task_after_capture_finished(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.current_task_id = "task-0001"
+        gui.current_task_session_id = "session-1"
+        gui.current_live_task_id = "task-0001"
+        gui.background_task_sessions = {}
+        gui._append_log = Mock()
+        gui._detach_live_task = Mock()
+        gui._refresh_history = Mock()
+
+        gui._handle_progress(
+            ProgressEvent(
+                stage="capture_finished",
+                message="录音已停止，后台继续转写、精修和整理。",
+                session_id="session-1",
+            )
+        )
+
+        gui._append_log.assert_called_once_with("录音已停止，后台继续转写、精修和整理。")
+        gui._detach_live_task.assert_called_once_with("session-1")
+        gui._refresh_history.assert_called_once()
+
+    def test_find_background_task_by_session_falls_back_to_unknown_slot(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.background_task_sessions = {
+            "task-0001": "session-1",
+            "task-0002": None,
+        }
+
+        self.assertEqual("task-0001", gui._find_background_task_by_session("session-1"))
+        self.assertEqual("task-0002", gui._find_background_task_by_session("session-2"))

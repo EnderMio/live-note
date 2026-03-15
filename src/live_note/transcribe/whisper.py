@@ -31,6 +31,31 @@ def with_language_override(config: WhisperConfig, language: str | None) -> Whisp
     return replace(config, language=resolved)
 
 
+def with_runtime_port(config: WhisperConfig) -> WhisperConfig:
+    resolved_port = _pick_runtime_port(config.host, config.port)
+    if resolved_port == config.port:
+        return config
+    return replace(config, port=resolved_port)
+
+
+def _pick_runtime_port(host: str, preferred_port: int) -> int:
+    if preferred_port > 0 and _can_bind_port(host, preferred_port):
+        return preferred_port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+
+
+def _can_bind_port(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
 def _encode_multipart(
     fields: dict[str, str], file_field: str, file_path: Path
 ) -> tuple[bytes, str]:
