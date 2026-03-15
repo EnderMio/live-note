@@ -746,7 +746,7 @@ def merge_sessions(
     if _can_merge_live_audio(sources):
         try:
             _merge_session_live_audio(sources, workspace.session_live_wav)
-        except Exception as exc:
+        except AudioImportError as exc:
             logger.warning("跳过合并后的 session.live.wav: %s", exc)
             if metadata.refine_status == "pending":
                 metadata = workspace.update_session(refine_status="disabled")
@@ -1143,11 +1143,28 @@ def _wav_duration_ms(path: Path) -> int:
     return round(frame_count * 1000 / sample_rate)
 
 
+def _wav_sample_rate(path: Path) -> int:
+    with wave.open(str(path), "rb") as handle:
+        sample_rate = handle.getframerate()
+    if sample_rate <= 0:
+        raise AudioImportError(f"WAV 采样率不合法: {path}")
+    return sample_rate
+
+
 def _can_merge_live_audio(sources: list[MergeSourceSession]) -> bool:
-    return bool(sources) and all(
-        item.metadata.input_mode == "live" and item.workspace.session_live_wav.exists()
-        for item in sources
-    )
+    if not sources:
+        return False
+    sample_rate: int | None = None
+    for item in sources:
+        wav_path = item.workspace.session_live_wav
+        if item.metadata.input_mode != "live" or not wav_path.exists():
+            return False
+        current_rate = _wav_sample_rate(wav_path)
+        if sample_rate is None:
+            sample_rate = current_rate
+        elif current_rate != sample_rate:
+            return False
+    return True
 
 
 def _merge_session_live_audio(
