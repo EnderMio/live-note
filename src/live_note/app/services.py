@@ -125,6 +125,9 @@ class AppService:
         self.config_path = (config_path or Path("config.toml")).resolve()
         self.env_path = (self.config_path.parent / ".env").resolve()
 
+    def task_queue_path(self) -> Path:
+        return (self.config_path.parent / ".live-note" / "task_queue.json").resolve()
+
     def config_exists(self) -> bool:
         return self.config_path.exists()
 

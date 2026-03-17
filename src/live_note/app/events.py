@@ -12,6 +12,8 @@ class ProgressEvent:
     current: int | None = None
     total: int | None = None
     error: str | None = None
+    source: str | None = None
+    task_id: str | None = None
 
 
 ProgressCallback = Callable[[ProgressEvent], None]

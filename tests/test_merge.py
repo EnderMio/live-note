@@ -5,8 +5,9 @@ import unittest
 import wave
 from array import array
 from pathlib import Path
+from unittest.mock import patch
 
-from live_note.app.coordinator import merge_sessions
+from live_note.app.coordinator import merge_sessions, refine_session
 from live_note.app.journal import SessionWorkspace, list_sessions
 from live_note.app.services import AppService, SettingsDraft
 from live_note.domain import SessionMetadata
@@ -76,6 +77,57 @@ def _create_live_session(
 
 
 class MergeSessionTests(unittest.TestCase):
+    def test_refine_session_reconstructs_missing_session_live_audio_from_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_path = root / "ggml-large-v3.bin"
+            model_path.write_bytes(b"fake-model")
+            service = AppService(root / "config.toml")
+            service.save_settings(
+                SettingsDraft(
+                    ffmpeg_binary="/opt/homebrew/bin/ffmpeg",
+                    whisper_binary="/Users/demo/whisper-server",
+                    whisper_model=str(model_path),
+                    obsidian_enabled=False,
+                    llm_enabled=False,
+                )
+            )
+            session_id = "20260315-210500-课程片段回拼"
+            session_dir = root / ".live-note" / "sessions" / session_id
+            workspace = SessionWorkspace.create(
+                session_dir,
+                _build_metadata(
+                    session_dir,
+                    session_id=session_id,
+                    title="课程片段回拼",
+                    started_at="2026-03-15T13:05:00+00:00",
+                ),
+            )
+            first = workspace.next_wav_path("seg-00001")
+            second = workspace.next_wav_path("seg-00002")
+            _write_wav(first, 16000, [1000, -1000] * 8000)
+            _write_wav(second, 16000, [2000, -2000] * 8000)
+            workspace.record_segment_created("seg-00001", 0, 1000, first)
+            workspace.record_segment_created("seg-00002", 1500, 2500, second)
+            self.assertFalse(workspace.session_live_wav.exists())
+
+            with (
+                patch("live_note.app.coordinator._attach_console_logging"),
+                patch("live_note.app.coordinator.ObsidianClient"),
+                patch("live_note.app.coordinator.OpenAiCompatibleClient"),
+                patch("live_note.app.coordinator._publish_final_outputs"),
+                patch(
+                    "live_note.app.coordinator._run_live_refinement",
+                    side_effect=lambda **kwargs: kwargs["metadata"],
+                ),
+            ):
+                refine_session(service.load_config(), session_id)
+
+            self.assertTrue(workspace.session_live_wav.exists())
+            with wave.open(str(workspace.session_live_wav), "rb") as handle:
+                self.assertEqual(16000, handle.getframerate())
+                self.assertEqual(40000, handle.getnframes())
+
     def test_merge_sessions_creates_new_combined_session_and_audio(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

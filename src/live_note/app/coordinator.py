@@ -766,10 +766,20 @@ def refine_session(
     metadata = workspace.read_session()
     if metadata.input_mode != "live":
         raise RuntimeError("只有实时录音会话支持离线精修。")
-    if not workspace.session_live_wav.exists():
-        raise RuntimeError("当前会话没有 session.live.wav，无法执行离线精修。")
-
     logger = workspace.session_logger()
+    if not workspace.session_live_wav.exists():
+        _emit_progress(
+            on_progress,
+            "refining",
+            "未找到整场录音，正在尝试用分段音频回拼。",
+            session_id=metadata.session_id,
+        )
+        if not reconstruct_session_live_audio(workspace):
+            raise RuntimeError(
+                "当前会话没有 session.live.wav，且无法从分段音频回拼整场录音，无法执行离线精修。"
+            )
+        logger.info("已从分段音频回拼 session.live.wav。")
+
     _attach_console_logging()
     _emit_progress(
         on_progress,
@@ -1310,6 +1320,67 @@ def _can_merge_live_audio(sources: list[MergeSourceSession]) -> bool:
             sample_rate = current_rate
         elif current_rate != sample_rate:
             return False
+    return True
+
+
+def can_reconstruct_session_live_audio(workspace: SessionWorkspace) -> bool:
+    try:
+        states = workspace.rebuild_segment_states()
+    except Exception:
+        return False
+    if not states:
+        return False
+    sample_rate: int | None = None
+    for state in states:
+        if state.wav_path is None or not state.wav_path.exists():
+            return False
+        try:
+            current_rate = _wav_sample_rate(state.wav_path)
+        except AudioImportError:
+            return False
+        if sample_rate is None:
+            sample_rate = current_rate
+        elif current_rate != sample_rate:
+            return False
+    return True
+
+
+def reconstruct_session_live_audio(workspace: SessionWorkspace) -> bool:
+    if workspace.session_live_wav.exists():
+        return True
+    if not can_reconstruct_session_live_audio(workspace):
+        return False
+
+    states = workspace.rebuild_segment_states()
+    parts: list[bytes] = []
+    sample_rate: int | None = None
+    current_frame = 0
+    final_frame = 0
+
+    for state in states:
+        if state.wav_path is None:
+            return False
+        pcm16, current_rate = _read_wav_pcm16(state.wav_path)
+        if sample_rate is None:
+            sample_rate = current_rate
+        elif current_rate != sample_rate:
+            return False
+
+        start_frame = round(state.started_ms * current_rate / 1000)
+        end_frame = round(state.ended_ms * current_rate / 1000)
+        if start_frame > current_frame:
+            parts.append(b"\x00\x00" * (start_frame - current_frame))
+            current_frame = start_frame
+        parts.append(pcm16)
+        current_frame += len(pcm16) // 2
+        final_frame = max(final_frame, end_frame)
+
+    if sample_rate is None:
+        return False
+    if final_frame > current_frame:
+        parts.append(b"\x00\x00" * (final_frame - current_frame))
+
+    _write_wav(workspace.session_live_wav, sample_rate, b"".join(parts))
     return True
 
 

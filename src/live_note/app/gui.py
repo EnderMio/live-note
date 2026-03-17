@@ -4,13 +4,19 @@ import queue
 import threading
 import tkinter as tk
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from tkinter import Tk, filedialog, messagebox, ttk
 
 from live_note.audio.capture import InputDevice
+from live_note.branding import brand_logo_png_path
+from live_note.utils import iso_now
 
+from .coordinator import can_reconstruct_session_live_audio
 from .events import ProgressEvent
+from .journal import SessionWorkspace
 from .services import AppService, SessionSummary, SettingsDraft
+from .task_queue import QueuedTaskRecord, TaskQueueStore, build_task_record
 
 KIND_CHOICES = ["generic", "meeting", "lecture"]
 LLM_WIRE_API_CHOICES = ["chat_completions", "responses"]
@@ -50,6 +56,7 @@ class LiveNoteGui:
         self.root = root
         self.service = service
         self.event_queue: queue.Queue[object] = queue.Queue()
+        self.queue_lock = threading.Lock()
         self.task_sequence = 0
         self.current_worker: threading.Thread | None = None
         self.current_task_id: str | None = None
@@ -60,11 +67,17 @@ class LiveNoteGui:
         self.background_tasks: dict[str, str] = {}
         self.background_task_sessions: dict[str, str | None] = {}
         self.busy = False
+        self.queue_store = TaskQueueStore(self.service.task_queue_path())
+        self.queue_records: list[QueuedTaskRecord] = []
+        self.queue_worker: threading.Thread | None = None
+        self.queue_current_task_id: str | None = None
+        self.queue_current_task_label: str | None = None
         self.live_devices: list[InputDevice] = []
         self.history_rows: dict[str, SessionSummary] = {}
 
         self.status_var = tk.StringVar(value="准备就绪")
         self.history_detail_var = tk.StringVar(value="选择一条历史会话查看详情。")
+        self.task_progress_var = tk.StringVar(value="当前没有任务。")
 
         self.live_title_var = tk.StringVar()
         self.live_kind_var = tk.StringVar(value="generic")
@@ -105,9 +118,11 @@ class LiveNoteGui:
         self.root.geometry("1100x760")
         self.root.minsize(980, 680)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._apply_branding()
 
         self._build_ui()
         self._load_settings(self.service.load_settings_draft())
+        self._load_task_queue_state()
         self._refresh_devices()
         self._refresh_history()
         self._refresh_doctor_checks()
@@ -118,6 +133,20 @@ class LiveNoteGui:
     def run(self) -> None:
         self.root.mainloop()
 
+    def _apply_branding(self) -> None:
+        self.window_logo_image: tk.PhotoImage | None = None
+        self.header_logo_image: tk.PhotoImage | None = None
+        logo_path = brand_logo_png_path()
+        if not logo_path.exists():
+            return
+        try:
+            self.window_logo_image = tk.PhotoImage(file=str(logo_path))
+            self.root.iconphoto(True, self.window_logo_image)
+            self.header_logo_image = self.window_logo_image.subsample(8, 8)
+        except tk.TclError:
+            self.window_logo_image = None
+            self.header_logo_image = None
+
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
@@ -125,15 +154,23 @@ class LiveNoteGui:
         header = ttk.Frame(self.root, padding=(18, 14))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)
+
+        brand_frame = ttk.Frame(header)
+        brand_frame.grid(row=0, column=0, rowspan=2, sticky="w")
+        brand_frame.columnconfigure(1, weight=1)
+        if self.header_logo_image is not None:
+            ttk.Label(brand_frame, image=self.header_logo_image).grid(
+                row=0, column=0, rowspan=2, sticky="w", padx=(0, 12)
+            )
         ttk.Label(
-            header,
+            brand_frame,
             text="live-note",
             font=("SF Pro Text", 22, "bold"),
-        ).grid(row=0, column=0, sticky="w")
+        ).grid(row=0, column=1, sticky="w")
         ttk.Label(
-            header,
+            brand_frame,
             text="本地优先的课程 / 会议 / 音频内容记录器",
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=1, column=1, sticky="w", pady=(4, 0))
         ttk.Label(
             header,
             textvariable=self.status_var,
@@ -285,10 +322,50 @@ class LiveNoteGui:
 
     def _build_history_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        task_frame = ttk.LabelFrame(parent, text="任务队列", padding=12)
+        task_frame.grid(row=0, column=0, sticky="ew")
+        task_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            task_frame,
+            textvariable=self.task_progress_var,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        self.history_progress = ttk.Progressbar(task_frame, mode="determinate")
+        self.history_progress.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+
+        self.queue_tree = ttk.Treeview(
+            task_frame,
+            columns=("status", "task", "target", "created"),
+            show="headings",
+            height=4,
+            selectmode="browse",
+        )
+        self.queue_tree.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        for key, label, width in [
+            ("status", "状态", 90),
+            ("task", "任务", 170),
+            ("target", "目标", 280),
+            ("created", "加入时间", 180),
+        ]:
+            self.queue_tree.heading(key, text=label)
+            self.queue_tree.column(key, width=width, anchor="w")
+        self.queue_tree.bind("<<TreeviewSelect>>", self._on_queue_select)
+
+        queue_actions = ttk.Frame(task_frame)
+        queue_actions.grid(row=3, column=0, sticky="w", pady=(10, 0))
+        self.cancel_queue_button = ttk.Button(
+            queue_actions,
+            text="取消所选",
+            command=self._cancel_selected_queue_task,
+            state="disabled",
+        )
+        self.cancel_queue_button.grid(row=0, column=0)
 
         table = ttk.Frame(parent)
-        table.grid(row=0, column=0, sticky="nsew")
+        table.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
         table.columnconfigure(0, weight=1)
         table.rowconfigure(0, weight=1)
 
@@ -314,44 +391,56 @@ class LiveNoteGui:
         self.history_tree.bind("<<TreeviewSelect>>", self._on_history_select)
 
         actions = ttk.Frame(parent)
-        actions.grid(row=1, column=0, sticky="ew", pady=(16, 0))
-        ttk.Button(actions, text="刷新列表", command=self._refresh_history).grid(row=0, column=0)
-        ttk.Button(actions, text="打开原文", command=self._open_transcript).grid(
-            row=0, column=1, padx=(8, 0)
+        actions.grid(row=2, column=0, sticky="ew", pady=(16, 0))
+        self.history_actions_frame = actions
+        self.history_action_buttons: list[ttk.Button] = []
+
+        self.history_action_buttons.append(
+            ttk.Button(actions, text="刷新列表", command=self._refresh_history)
         )
-        ttk.Button(actions, text="打开整理", command=self._open_structured).grid(
-            row=0, column=2, padx=(8, 0)
+        self.history_action_buttons.append(
+            ttk.Button(actions, text="打开原文", command=self._open_transcript)
         )
-        ttk.Button(actions, text="打开目录", command=self._open_session_dir).grid(
-            row=0, column=3, padx=(8, 0)
+        self.history_action_buttons.append(
+            ttk.Button(actions, text="打开整理", command=self._open_structured)
         )
-        ttk.Button(actions, text="合并所选会话", command=self._merge_selected_sessions).grid(
-            row=0, column=4, padx=(16, 0)
+        self.history_action_buttons.append(
+            ttk.Button(actions, text="打开目录", command=self._open_session_dir)
         )
-        ttk.Button(actions, text="重转写并重写", command=self._retry_retranscribe).grid(
-            row=0, column=5, padx=(8, 0)
+        self.history_action_buttons.append(
+            ttk.Button(actions, text="合并所选会话", command=self._merge_selected_sessions)
         )
-        ttk.Button(actions, text="离线精修并重写", command=self._retry_refine).grid(
-            row=0, column=6, padx=(8, 0)
+        self.history_action_buttons.append(
+            ttk.Button(actions, text="重转写并重写", command=self._retry_retranscribe)
         )
-        ttk.Button(actions, text="重新生成整理", command=self._retry_republish).grid(
-            row=0, column=7, padx=(8, 0)
+        self.retry_refine_button = ttk.Button(
+            actions,
+            text="离线精修并重写",
+            command=self._retry_refine,
+            state="disabled",
         )
-        ttk.Button(actions, text="重新同步 Obsidian", command=self._retry_resync).grid(
-            row=0, column=8, padx=(8, 0)
+        self.history_action_buttons.append(self.retry_refine_button)
+        self.history_action_buttons.append(
+            ttk.Button(actions, text="重新生成整理", command=self._retry_republish)
         )
+        self.history_action_buttons.append(
+            ttk.Button(actions, text="重新同步 Obsidian", command=self._retry_resync)
+        )
+        actions.bind("<Configure>", self._on_history_actions_resize)
+        self.root.after_idle(self._relayout_history_actions)
 
         ttk.Label(
             parent,
             textvariable=self.history_detail_var,
             wraplength=980,
             justify="left",
-        ).grid(row=2, column=0, sticky="w", pady=(14, 0))
+        ).grid(row=3, column=0, sticky="w", pady=(14, 0))
 
     def _build_settings_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
+        content = _build_vertical_scroller(parent)
+        content.columnconfigure(0, weight=1)
 
-        toolbar = ttk.Frame(parent)
+        toolbar = ttk.Frame(content)
         toolbar.grid(row=0, column=0, sticky="w")
         ttk.Button(
             toolbar,
@@ -379,7 +468,7 @@ class LiveNoteGui:
             padx=(8, 0),
         )
 
-        whisper_frame = ttk.LabelFrame(parent, text="Whisper / FFmpeg", padding=12)
+        whisper_frame = ttk.LabelFrame(content, text="Whisper / FFmpeg", padding=12)
         whisper_frame.grid(row=1, column=0, sticky="ew", pady=(16, 0))
         whisper_frame.columnconfigure(1, weight=1)
         _entry_row_with_button(
@@ -437,7 +526,7 @@ class LiveNoteGui:
             variable=self.refine_auto_after_live_var,
         ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
-        obsidian_frame = ttk.LabelFrame(parent, text="Obsidian", padding=12)
+        obsidian_frame = ttk.LabelFrame(content, text="Obsidian", padding=12)
         obsidian_frame.grid(row=2, column=0, sticky="ew", pady=(16, 0))
         obsidian_frame.columnconfigure(1, weight=1)
         ttk.Checkbutton(
@@ -459,7 +548,7 @@ class LiveNoteGui:
             text="关闭后仍会把 transcript.md 和 structured.md 写入本地会话目录。",
         ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
-        llm_frame = ttk.LabelFrame(parent, text="LLM", padding=12)
+        llm_frame = ttk.LabelFrame(content, text="LLM", padding=12)
         llm_frame.grid(row=3, column=0, sticky="ew", pady=(16, 0))
         llm_frame.columnconfigure(1, weight=1)
         ttk.Checkbutton(
@@ -486,8 +575,8 @@ class LiveNoteGui:
             text="`responses` 协议会请求 /responses；开启 Stream 时会聚合 SSE 流式事件。",
         ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
-        doctor_frame = ttk.LabelFrame(parent, text="诊断结果", padding=12)
-        doctor_frame.grid(row=4, column=0, sticky="nsew", pady=(16, 0))
+        doctor_frame = ttk.LabelFrame(content, text="诊断结果", padding=12)
+        doctor_frame.grid(row=4, column=0, sticky="ew", pady=(16, 16))
         doctor_frame.columnconfigure(0, weight=1)
         self.doctor_tree = ttk.Treeview(
             doctor_frame,
@@ -599,6 +688,232 @@ class LiveNoteGui:
     def _browse_binary(self, target_var: tk.StringVar) -> None:
         self._browse_file(target_var, "选择可执行文件")
 
+    def _progress_callback(self, source: str, task_id: str) -> Callable[[ProgressEvent], None]:
+        def callback(event: ProgressEvent) -> None:
+            self.event_queue.put(replace(event, source=source, task_id=task_id))
+
+        return callback
+
+    def _load_task_queue_state(self) -> None:
+        loaded = self.queue_store.load()
+        with self.queue_lock:
+            self.queue_records = list(loaded.active_records)
+        self._sync_task_sequence(self.queue_records)
+        if loaded.interrupted_records:
+            self.queue_store.save(self.queue_records)
+        self._refresh_queue_tree()
+        for warning in loaded.warnings:
+            self._append_log(warning)
+        for record in loaded.interrupted_records:
+            self._append_log(f"上次未完成的任务已标记为中断：{record.label}")
+        self._maybe_start_next_queue_task()
+
+    def _ensure_queue_ready(self) -> bool:
+        if not self.service.config_exists():
+            messagebox.showinfo("需要先配置", "请先完成首次启动向导或在设置页保存配置。")
+            self._show_first_run_wizard()
+            return False
+        return True
+
+    def _enqueue_queue_task(self, *, label: str, action: str, payload: dict[str, object]) -> None:
+        record = build_task_record(
+            task_id=self._next_task_id(),
+            action=action,
+            label=label,
+            payload=payload,
+            created_at=iso_now(),
+        )
+        with self.queue_lock:
+            duplicate = any(item.fingerprint == record.fingerprint for item in self.queue_records)
+            if not duplicate:
+                self.queue_records.append(record)
+                self.queue_store.save(self.queue_records)
+        if duplicate:
+            self._append_log(f"{label} 已在队列中，跳过重复入队。")
+            self._update_idle_status()
+            return
+        self._append_log(f"已加入队列：{label}")
+        self._refresh_queue_tree()
+        self._maybe_start_next_queue_task()
+
+    def _maybe_start_next_queue_task(self) -> None:
+        service = getattr(self, "service", None)
+        if (
+            self.queue_worker is not None
+            or self.busy
+            or self.background_tasks
+            or (service is not None and not service.config_exists())
+        ):
+            self._update_idle_status()
+            return
+        with self.queue_lock:
+            next_record = next(
+                (record for record in self.queue_records if record.status == "queued"),
+                None,
+            )
+        if next_record is None:
+            self._update_idle_status()
+            return
+        self._start_queue_task(next_record)
+
+    def _start_queue_task(self, record: QueuedTaskRecord) -> None:
+        started_record = replace(record, status="running", started_at=iso_now())
+        with self.queue_lock:
+            self.queue_records = [
+                started_record if item.task_id == record.task_id else item
+                for item in self.queue_records
+            ]
+            self.queue_store.save(self.queue_records)
+        self.queue_current_task_id = started_record.task_id
+        self.queue_current_task_label = started_record.label
+        self._refresh_queue_tree()
+        self._set_queue_progress_state(f"{started_record.label}：准备中")
+        if not self.busy:
+            self.status_var.set(f"{started_record.label}：准备中")
+
+        def worker() -> None:
+            try:
+                result = self._run_queue_action(started_record)
+            except Exception as exc:
+                self._remove_queue_record(started_record.task_id)
+                self.event_queue.put(
+                    ("task_error", "queue", started_record.task_id, started_record.label, str(exc))
+                )
+            else:
+                self._remove_queue_record(started_record.task_id)
+                self.event_queue.put(
+                    ("task_done", "queue", started_record.task_id, started_record.label, result)
+                )
+
+        self.queue_worker = threading.Thread(target=worker, daemon=False)
+        self.queue_worker.start()
+
+    def _run_queue_action(self, record: QueuedTaskRecord) -> int:
+        callback = self._progress_callback("queue", record.task_id)
+        payload = record.payload
+        if record.action == "import":
+            language = payload.get("language")
+            runner = self.service.create_import_coordinator(
+                file_path=str(payload["file_path"]),
+                title=payload.get("title") or None,
+                kind=str(payload.get("kind") or "generic"),
+                language=language if isinstance(language, str) else None,
+                on_progress=callback,
+            )
+            return runner.run()
+        if record.action == "merge":
+            return self.service.merge(
+                [str(item) for item in payload.get("session_ids", [])],
+                title=payload.get("title") if isinstance(payload.get("title"), str) else None,
+                on_progress=callback,
+            )
+        if record.action == "session_action":
+            operation = payload.get("action") or payload.get("operation")
+            session_id = str(payload["session_id"])
+            if operation == "retranscribe":
+                return self.service.retranscribe(session_id, on_progress=callback)
+            if operation == "refine":
+                return self.service.refine(session_id, on_progress=callback)
+            if operation == "republish":
+                return self.service.republish(session_id, on_progress=callback)
+            if operation == "resync":
+                return self.service.resync_notes(session_id, on_progress=callback)
+        raise RuntimeError(f"不支持的队列任务：{record.action}")
+
+    def _remove_queue_record(self, task_id: str) -> None:
+        with self.queue_lock:
+            remaining = [record for record in self.queue_records if record.task_id != task_id]
+            if len(remaining) == len(self.queue_records):
+                return
+            self.queue_records = remaining
+            self.queue_store.save(self.queue_records)
+
+    def _refresh_queue_tree(self) -> None:
+        tree = getattr(self, "queue_tree", None)
+        if tree is None:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        with self.queue_lock:
+            records = list(self.queue_records)
+        for record in records:
+            tree.insert(
+                "",
+                "end",
+                iid=record.task_id,
+                values=(
+                    "运行中" if record.status == "running" else "排队中",
+                    record.label,
+                    _queue_target_text(record),
+                    record.created_at.replace("T", " ").split("+")[0],
+                ),
+            )
+        self._on_queue_select(None)
+
+    def _on_queue_select(self, _event: object | None) -> None:
+        button = getattr(self, "cancel_queue_button", None)
+        tree = getattr(self, "queue_tree", None)
+        if button is None or tree is None:
+            return
+        selection = tree.selection()
+        with self.queue_lock:
+            cancellable = any(
+                record.task_id in selection and record.status == "queued"
+                for record in self.queue_records
+            )
+        button.configure(state="normal" if cancellable else "disabled")
+
+    def _cancel_selected_queue_task(self) -> None:
+        tree = getattr(self, "queue_tree", None)
+        if tree is None:
+            return
+        selection = set(tree.selection())
+        if not selection:
+            return
+        with self.queue_lock:
+            remaining = [
+                record
+                for record in self.queue_records
+                if record.task_id not in selection or record.status != "queued"
+            ]
+            changed = len(remaining) != len(self.queue_records)
+            if changed:
+                self.queue_records = remaining
+                self.queue_store.save(self.queue_records)
+        if changed:
+            self._append_log("已取消所选排队任务。")
+            self._refresh_queue_tree()
+            self._update_idle_status()
+
+    def _start_live_task(
+        self,
+        task_id: str,
+        label: str,
+        action: Callable[[], int],
+    ) -> None:
+        if self.busy:
+            messagebox.showinfo("任务进行中", "请先停止当前录音。")
+            return
+        self.busy = True
+        self.current_task_id = task_id
+        self.current_task_label = label
+        self.current_task_session_id = None
+        self.current_live_task_id = task_id
+        self.start_live_button.configure(state="disabled")
+        self.status_var.set(f"{label}：准备中")
+        self._set_live_progress_state(f"{label}：准备中")
+
+        def worker() -> None:
+            try:
+                result = action()
+            except Exception as exc:
+                self.event_queue.put(("task_error", "live", task_id, label, str(exc)))
+            else:
+                self.event_queue.put(("task_done", "live", task_id, label, result))
+
+        self.current_worker = threading.Thread(target=worker, daemon=False)
+        self.current_worker.start()
+
     def _start_live_session(self) -> None:
         if not self._ensure_ready_for_run():
             return
@@ -614,19 +929,20 @@ class LiveNoteGui:
             messagebox.showwarning("没有输入设备", "请先选择一个输入设备。")
             return
         device = self.live_devices[index]
+        task_id = self._next_task_id()
         try:
             runner = self.service.create_live_coordinator(
                 title=title,
                 source=str(device.index),
                 kind=self.live_kind_var.get(),
                 language=_optional_language_override(self.live_language_var.get()),
-                on_progress=self.event_queue.put,
+                on_progress=self._progress_callback("live", task_id),
             )
         except Exception as exc:
             messagebox.showerror("启动失败", str(exc))
             return
         self.current_live_runner = runner
-        self._run_background("实时录音", runner.run, detachable_live=True)
+        self._start_live_task(task_id, "实时录音", runner.run)
         self.stop_live_button.configure(state="normal")
         self.pause_live_button.configure(state="normal", text="暂停录音")
 
@@ -651,46 +967,54 @@ class LiveNoteGui:
             self._append_log("已请求暂停录音。")
 
     def _start_import(self) -> None:
-        if not self._ensure_ready_for_run():
+        if not self._ensure_queue_ready():
             return
         media_path = Path(self.import_file_var.get().strip()).expanduser()
         if not media_path.exists():
             messagebox.showwarning("文件不存在", "请选择一个有效的本地音频或视频文件。")
             return
-        try:
-            runner = self.service.create_import_coordinator(
-                file_path=str(media_path),
-                title=self.import_title_var.get().strip() or None,
-                kind=self.import_kind_var.get(),
-                language=_optional_language_override(self.import_language_var.get()),
-                on_progress=self.event_queue.put,
-            )
-        except Exception as exc:
-            messagebox.showerror("导入失败", str(exc))
-            return
-        self._run_background("文件导入", runner.run)
+        self._enqueue_queue_task(
+            label="文件导入",
+            action="import",
+            payload={
+                "file_path": str(media_path),
+                "title": self.import_title_var.get().strip() or None,
+                "kind": self.import_kind_var.get(),
+                "language": _optional_language_override(self.import_language_var.get()),
+            },
+        )
 
     def _retry_retranscribe(self) -> None:
         summary = self._selected_summary()
-        if summary is None or not self._ensure_ready_for_run():
+        if summary is None or not self._ensure_queue_ready():
             return
-        self._run_background(
-            "重转写并重写",
-            lambda: self.service.retranscribe(summary.session_id, on_progress=self.event_queue.put),
+        self._enqueue_queue_task(
+            label="重转写并重写",
+            action="session_action",
+            payload={"action": "retranscribe", "session_id": summary.session_id},
         )
 
     def _retry_refine(self) -> None:
         summary = self._selected_summary()
-        if summary is None or not self._ensure_ready_for_run():
+        if summary is None:
             return
-        self._run_background(
-            "离线精修并重写",
-            lambda: self.service.refine(summary.session_id, on_progress=self.event_queue.put),
+        if not _summary_supports_refine(summary):
+            messagebox.showinfo(
+                "无法离线精修",
+                "所选会话没有可用的整场录音（session.live.wav），无法执行离线精修并重写。",
+            )
+            return
+        if not self._ensure_queue_ready():
+            return
+        self._enqueue_queue_task(
+            label="离线精修并重写",
+            action="session_action",
+            payload={"action": "refine", "session_id": summary.session_id},
         )
 
     def _merge_selected_sessions(self) -> None:
         summaries = self._selected_summaries(min_count=2)
-        if summaries is None or not self._ensure_ready_for_run():
+        if summaries is None or not self._ensure_queue_ready():
             return
         if not messagebox.askyesno(
             "合并会话",
@@ -700,30 +1024,30 @@ class LiveNoteGui:
             ),
         ):
             return
-        self._run_background(
-            "合并会话",
-            lambda: self.service.merge(
-                [summary.session_id for summary in summaries],
-                on_progress=self.event_queue.put,
-            ),
+        self._enqueue_queue_task(
+            label="合并会话",
+            action="merge",
+            payload={"session_ids": [summary.session_id for summary in summaries]},
         )
 
     def _retry_republish(self) -> None:
         summary = self._selected_summary()
-        if summary is None or not self._ensure_ready_for_run():
+        if summary is None or not self._ensure_queue_ready():
             return
-        self._run_background(
-            "重新生成整理",
-            lambda: self.service.republish(summary.session_id, on_progress=self.event_queue.put),
+        self._enqueue_queue_task(
+            label="重新生成整理",
+            action="session_action",
+            payload={"action": "republish", "session_id": summary.session_id},
         )
 
     def _retry_resync(self) -> None:
         summary = self._selected_summary()
-        if summary is None or not self._ensure_ready_for_run():
+        if summary is None or not self._ensure_queue_ready():
             return
-        self._run_background(
-            "重新同步 Obsidian",
-            lambda: self.service.resync_notes(summary.session_id, on_progress=self.event_queue.put),
+        self._enqueue_queue_task(
+            label="重新同步 Obsidian",
+            action="session_action",
+            payload={"action": "resync", "session_id": summary.session_id},
         )
 
     def _run_background(
@@ -746,6 +1070,7 @@ class LiveNoteGui:
         self.status_var.set(f"{label}：准备中")
         self.progress.configure(mode="indeterminate", value=0)
         self.progress.start(12)
+        self._set_task_progress_state(f"{label}：准备中")
 
         def worker() -> None:
             try:
@@ -783,11 +1108,14 @@ class LiveNoteGui:
         if selected_id and selected_id in self.history_rows:
             self.history_tree.selection_set(selected_id)
             self.history_tree.focus(selected_id)
-        elif not self._selected_summary(prompt=False):
+        summaries = self._selected_summaries(prompt=False)
+        self._update_history_action_states(summaries)
+        if not summaries:
             self.history_detail_var.set("选择一条历史会话查看详情。")
 
     def _on_history_select(self, _event: object) -> None:
         summaries = self._selected_summaries(prompt=False)
+        self._update_history_action_states(summaries)
         if not summaries:
             self.history_detail_var.set("选择一条历史会话查看详情。")
             return
@@ -838,6 +1166,42 @@ class LiveNoteGui:
         if not summaries:
             return None
         return summaries[0]
+
+    def _update_history_action_states(self, summaries: list[SessionSummary] | None) -> None:
+        refine_button = getattr(self, "retry_refine_button", None)
+        if refine_button is None:
+            return
+        if summaries and len(summaries) == 1 and _summary_supports_refine(summaries[0]):
+            refine_button.configure(state="normal")
+            return
+        refine_button.configure(state="disabled")
+
+    def _on_history_actions_resize(self, event: tk.Event[tk.Misc]) -> None:
+        self._relayout_history_actions(event.width)
+
+    def _relayout_history_actions(self, available_width: int | None = None) -> None:
+        frame = getattr(self, "history_actions_frame", None)
+        buttons = getattr(self, "history_action_buttons", None)
+        if frame is None or not buttons:
+            return
+        resolved_width = available_width or frame.winfo_width()
+        item_widths = [button.winfo_reqwidth() for button in buttons]
+        if resolved_width <= 1:
+            resolved_width = sum(item_widths) + max(0, len(item_widths) - 1) * 8
+        positions = _wrap_action_rows(resolved_width, item_widths, gap=8)
+        max_columns = max((column for _, column in positions), default=-1) + 1
+        for index in range(max(len(buttons), max_columns)):
+            frame.grid_columnconfigure(index, weight=0)
+        for button in buttons:
+            button.grid_forget()
+        for button, (row, column) in zip(buttons, positions, strict=False):
+            button.grid(
+                row=row,
+                column=column,
+                sticky="w",
+                padx=(0 if column == 0 else 8, 0),
+                pady=(0 if row == 0 else 8, 0),
+            )
 
     def _open_transcript(self) -> None:
         summary = self._selected_summary()
@@ -1023,8 +1387,14 @@ class LiveNoteGui:
                 self._handle_progress(item)
                 continue
 
-            event_type, task_id, label, payload = item
-            if event_type == "task_error":
+            if len(item) == 5:
+                event_type, source, task_id, label, payload = item
+            else:
+                event_type, task_id, label, payload = item
+                source = "live"
+            if source == "queue":
+                self._handle_queue_terminal_event(event_type, task_id, label, payload)
+            elif event_type == "task_error":
                 if task_id == self.current_task_id:
                     self._finish_task()
                     self._append_log(f"{label}失败：{payload}")
@@ -1048,6 +1418,13 @@ class LiveNoteGui:
         self.root.after(150, self._poll_events)
 
     def _handle_progress(self, event: ProgressEvent) -> None:
+        if event.source == "queue":
+            self._handle_queue_progress(event)
+            return
+        if event.source == "live":
+            self._handle_live_progress(event)
+            return
+
         is_foreground = self._is_foreground_event(event)
         if is_foreground and event.stage == "capture_finished" and self.current_live_task_id:
             self._append_log(event.message)
@@ -1062,16 +1439,61 @@ class LiveNoteGui:
 
         self.status_var.set(event.message)
         self._append_log(event.message)
-        if event.total:
-            self.progress.stop()
-            self.progress.configure(mode="determinate")
-            self.progress["value"] = round(event.current or 0) / event.total * 100
-        elif event.stage in {"done", "error"}:
-            self.progress.stop()
-            self.progress.configure(mode="determinate", value=0)
+        self._set_task_progress_state(
+            event.message,
+            current=event.current,
+            total=event.total,
+            active=event.stage not in {"done", "error"},
+        )
+
+    def _handle_live_progress(self, event: ProgressEvent) -> None:
+        if event.stage == "capture_finished" and event.task_id == self.current_live_task_id:
+            self._append_log(event.message)
+            self._detach_live_task(event.session_id)
+            self._refresh_history()
+            return
+        if event.task_id in self.background_tasks:
+            prefix = f"[后台 {event.session_id}] " if event.session_id else "[后台] "
+            self._append_log(f"{prefix}{event.message}")
+            return
+        self.status_var.set(event.message)
+        self._append_log(event.message)
+        self._set_live_progress_state(
+            event.message,
+            current=event.current,
+            total=event.total,
+            active=event.stage not in {"done", "error"},
+        )
+
+    def _handle_queue_progress(self, event: ProgressEvent) -> None:
+        if self.queue_current_task_id is not None and event.task_id != self.queue_current_task_id:
+            return
+        if not self.busy:
+            self.status_var.set(event.message)
+        self._append_log(f"[队列] {event.message}")
+        self._set_queue_progress_state(
+            event.message,
+            current=event.current,
+            total=event.total,
+            active=event.stage not in {"done", "error"},
+        )
+
+    def _handle_queue_terminal_event(
+        self,
+        event_type: str,
+        task_id: str,
+        label: str,
+        payload: object,
+    ) -> None:
+        self._finish_queue_task(task_id)
+        if event_type == "task_error":
+            self._append_log(f"{label}失败：{payload}")
+            messagebox.showerror(f"{label}失败", str(payload))
         else:
-            self.progress.configure(mode="indeterminate")
-            self.progress.start(12)
+            self._append_log(f"{label}完成。")
+        self._refresh_history()
+        self._refresh_doctor_checks()
+        self._maybe_start_next_queue_task()
 
     def _finish_task(self) -> None:
         self.busy = False
@@ -1086,11 +1508,26 @@ class LiveNoteGui:
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
         self._update_idle_status()
+        self._maybe_start_next_queue_task()
+
+    def _finish_queue_task(self, task_id: str) -> None:
+        if task_id == self.queue_current_task_id:
+            self.queue_worker = None
+            self.queue_current_task_id = None
+            self.queue_current_task_label = None
+        self._refresh_queue_tree()
+        queued = sum(1 for record in self.queue_records if record.status == "queued")
+        if queued:
+            self._set_queue_progress_state(f"等待执行 {queued} 项。", active=False)
+        elif not self.busy:
+            self._set_queue_progress_state("当前没有任务。", active=False)
+        self._update_idle_status()
 
     def _finish_background_task(self, task_id: str) -> None:
         self.background_tasks.pop(task_id, None)
         self.background_task_sessions.pop(task_id, None)
         self._update_idle_status()
+        self._maybe_start_next_queue_task()
 
     def _detach_live_task(self, session_id: str | None) -> None:
         task_id = self.current_task_id
@@ -1144,6 +1581,15 @@ class LiveNoteGui:
         self.task_sequence += 1
         return f"task-{self.task_sequence:04d}"
 
+    def _sync_task_sequence(self, records: list[QueuedTaskRecord]) -> None:
+        max_seen = getattr(self, "task_sequence", 0)
+        for record in records:
+            prefix, _, suffix = record.task_id.partition("-")
+            if prefix != "task" or not suffix.isdigit():
+                continue
+            max_seen = max(max_seen, int(suffix))
+        self.task_sequence = max_seen
+
     def _reset_live_controls(self) -> None:
         self.stop_live_button.configure(state="disabled")
         self.pause_live_button.configure(state="disabled", text="暂停录音")
@@ -1151,11 +1597,86 @@ class LiveNoteGui:
     def _update_idle_status(self) -> None:
         if self.busy:
             return
-        pending = len(self.background_tasks)
+        if getattr(self, "queue_worker", None) is not None:
+            return
+        background_tasks = getattr(self, "background_tasks", {})
+        queue_records = getattr(self, "queue_records", [])
+        pending = len(background_tasks)
         if pending:
             self.status_var.set(f"准备就绪（后台处理中 {pending} 项）")
+            queued = sum(1 for record in queue_records if record.status == "queued")
+            if queued:
+                self._set_queue_progress_state(f"等待执行 {queued} 项。", active=False)
+            else:
+                self._set_queue_progress_state(f"后台处理中 {pending} 项。", active=False)
+            return
+        queued = sum(1 for record in queue_records if record.status == "queued")
+        if queued:
+            self.status_var.set(f"准备就绪（队列中 {queued} 项）")
+            self._set_queue_progress_state(f"等待执行 {queued} 项。", active=False)
             return
         self.status_var.set("准备就绪")
+        self._set_queue_progress_state("当前没有任务。", active=False)
+
+    def _set_live_progress_state(
+        self,
+        message: str,
+        *,
+        current: int | None = None,
+        total: int | None = None,
+        active: bool = True,
+    ) -> None:
+        if total:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            self.progress["value"] = round((current or 0) / total * 100)
+            return
+        if active:
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(12)
+            return
+        self.progress.stop()
+        self.progress.configure(mode="determinate", value=0)
+
+    def _set_queue_progress_state(
+        self,
+        message: str,
+        *,
+        current: int | None = None,
+        total: int | None = None,
+        active: bool = True,
+    ) -> None:
+        if hasattr(self, "task_progress_var"):
+            self.task_progress_var.set(message)
+        history_progress = getattr(self, "history_progress", None)
+        if history_progress is None:
+            return
+        if total:
+            history_progress.stop()
+            history_progress.configure(mode="determinate")
+            history_progress["value"] = round((current or 0) / total * 100)
+            return
+        if active:
+            history_progress.configure(mode="indeterminate")
+            history_progress.start(12)
+            return
+        history_progress.stop()
+        history_progress.configure(mode="determinate", value=0)
+
+    def _set_task_progress_state(
+        self,
+        message: str,
+        *,
+        current: int | None = None,
+        total: int | None = None,
+        active: bool = True,
+    ) -> None:
+        self._set_queue_progress_state(
+            message,
+            current=current,
+            total=total,
+            active=active,
+        )
 
     def _append_log(self, line: str) -> None:
         self.log_text.configure(state="normal")
@@ -1173,6 +1694,16 @@ class LiveNoteGui:
         if self.busy:
             if not messagebox.askyesno("退出", "当前任务仍在进行，确定直接关闭窗口吗？"):
                 return
+        elif self.queue_worker is not None:
+            queued = sum(1 for record in self.queue_records if record.status == "queued")
+            if not messagebox.askyesno(
+                "退出",
+                (
+                    "当前仍有离线任务在执行。关闭窗口后，本轮运行中的任务会继续到自然结束；"
+                    f"剩余 {queued} 项待执行任务会保留到下次启动。是否继续关闭窗口？"
+                ),
+            ):
+                return
         elif self.background_tasks:
             if not messagebox.askyesno(
                 "退出",
@@ -1180,6 +1711,12 @@ class LiveNoteGui:
                     f"仍有 {len(self.background_tasks)} 个后台任务在继续处理。"
                     "关闭窗口后进程会继续运行直到这些任务完成。是否继续关闭窗口？"
                 ),
+            ):
+                return
+        elif any(record.status == "queued" for record in self.queue_records):
+            if not messagebox.askyesno(
+                "退出",
+                "仍有待执行的排队任务。关闭窗口后它们会在下次启动时恢复。是否继续关闭窗口？",
             ):
                 return
         self.root.destroy()
@@ -1196,6 +1733,117 @@ def _entry_row(
     ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=(10, 0))
     if hint:
         ttk.Label(parent, text=hint).grid(row=row, column=2, sticky="w", padx=(8, 0), pady=(10, 0))
+
+
+def _build_vertical_scroller(parent: ttk.Frame) -> ttk.Frame:
+    parent.columnconfigure(0, weight=1)
+    parent.rowconfigure(0, weight=1)
+
+    canvas = tk.Canvas(parent, highlightthickness=0, borderwidth=0)
+    canvas.grid(row=0, column=0, sticky="nsew")
+
+    scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+    scrollbar.grid(row=0, column=1, sticky="ns")
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    content = ttk.Frame(canvas)
+    content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+
+    def _sync_scroll_region(_event: object) -> None:
+        bbox = canvas.bbox("all")
+        if bbox is not None:
+            canvas.configure(scrollregion=bbox)
+
+    def _sync_content_width(event: tk.Event[tk.Misc]) -> None:
+        canvas.itemconfigure(content_window, width=event.width)
+
+    content.bind("<Configure>", _sync_scroll_region)
+    canvas.bind("<Configure>", _sync_content_width)
+    _bind_mousewheel_scrolling(parent.winfo_toplevel(), canvas)
+    return content
+
+
+def _bind_mousewheel_scrolling(root: tk.Misc, canvas: tk.Canvas) -> None:
+    def _is_descendant_of_canvas(widget: tk.Misc | None) -> bool:
+        current = widget
+        while current is not None:
+            if current is canvas:
+                return True
+            current = getattr(current, "master", None)
+        return False
+
+    def _scroll(event: tk.Event[tk.Misc]) -> None:
+        try:
+            widget_under_pointer = canvas.winfo_containing(event.x_root, event.y_root)
+        except tk.TclError:
+            return
+        if not _is_descendant_of_canvas(widget_under_pointer):
+            return
+        if getattr(event, "num", None) == 4:
+            delta = -1
+        elif getattr(event, "num", None) == 5:
+            delta = 1
+        elif getattr(event, "delta", 0):
+            delta = -1 if event.delta > 0 else 1
+        else:
+            return
+        canvas.yview_scroll(delta, "units")
+
+    root.bind_all("<MouseWheel>", _scroll, add="+")
+    root.bind_all("<Button-4>", _scroll, add="+")
+    root.bind_all("<Button-5>", _scroll, add="+")
+
+
+def _wrap_action_rows(
+    available_width: int,
+    item_widths: list[int],
+    *,
+    gap: int,
+) -> list[tuple[int, int]]:
+    if not item_widths:
+        return []
+    width_limit = max(available_width, max(item_widths))
+    used_width = 0
+    row = 0
+    column = 0
+    layout: list[tuple[int, int]] = []
+    for item_width in item_widths:
+        proposed_width = item_width if column == 0 else used_width + gap + item_width
+        if column > 0 and proposed_width > width_limit:
+            row += 1
+            column = 0
+            used_width = item_width
+        else:
+            used_width = proposed_width
+        layout.append((row, column))
+        column += 1
+    return layout
+
+
+def _summary_supports_refine(summary: SessionSummary) -> bool:
+    if summary.input_mode != "live":
+        return False
+    if (summary.session_dir / "session.live.wav").exists():
+        return True
+    try:
+        workspace = SessionWorkspace.load(summary.session_dir)
+    except Exception:
+        return False
+    return can_reconstruct_session_live_audio(workspace)
+
+
+def _queue_target_text(record: QueuedTaskRecord) -> str:
+    payload = record.payload
+    if record.action == "import":
+        return Path(str(payload.get("file_path", ""))).name or "本地文件"
+    if record.action == "merge":
+        session_ids = payload.get("session_ids", [])
+        if isinstance(session_ids, list):
+            return f"{len(session_ids)} 条会话"
+        return "多条会话"
+    if record.action == "session_action":
+        return str(payload.get("session_id") or "会话")
+    return record.label
 
 
 def _entry_row_with_button(
