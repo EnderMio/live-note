@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -9,6 +10,53 @@ from live_note.app.task_queue_runtime import TaskQueueRuntime
 
 
 class TaskQueueRuntimeTests(unittest.TestCase):
+    def test_concurrent_remove_and_enqueue_preserves_latest_persisted_snapshot(self) -> None:
+        initial = build_task_record(
+            task_id="task-0001",
+            action="session_action",
+            label="离线精修并重写",
+            payload={"action": "refine", "session_id": "session-1"},
+            created_at="2026-03-16T10:00:00+00:00",
+            status="running",
+            started_at="2026-03-16T10:02:00+00:00",
+        )
+        store = _BlockingSaveStore()
+        runtime = TaskQueueRuntime(store, initial_records=[initial])
+
+        remover = threading.Thread(target=runtime.remove, args=("task-0001",))
+        remover.start()
+        self.assertTrue(store.first_save_started.wait(timeout=1))
+
+        enqueue_result: list[object] = []
+
+        def enqueue() -> None:
+            enqueue_result.append(
+                runtime.enqueue(
+                    label="重新生成整理",
+                    action="session_action",
+                    payload={"action": "republish", "session_id": "session-2"},
+                    created_at="2026-03-16T10:03:00+00:00",
+                )
+            )
+
+        enqueuer = threading.Thread(target=enqueue)
+        enqueuer.start()
+
+        self.assertFalse(
+            store.second_save_started.wait(timeout=0.1),
+            "第二次保存不应在第一次保存释放前越过锁。",
+        )
+        store.allow_first_save.set()
+        remover.join(timeout=1)
+        enqueuer.join(timeout=1)
+        self.assertFalse(remover.is_alive())
+        self.assertFalse(enqueuer.is_alive())
+
+        self.assertEqual(1, len(enqueue_result))
+        self.assertIsNotNone(enqueue_result[0])
+        self.assertEqual(runtime.records, store.persisted_records)
+        self.assertEqual(["task-0002"], [item.task_id for item in store.persisted_records])
+
     def test_load_keeps_active_records_and_persists_after_interrupted_recovery(self) -> None:
         queued = build_task_record(
             task_id="task-0007",
@@ -156,3 +204,24 @@ class TaskQueueRuntimeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _BlockingSaveStore:
+    def __init__(self) -> None:
+        self.first_save_started = threading.Event()
+        self.second_save_started = threading.Event()
+        self.allow_first_save = threading.Event()
+        self._save_count = 0
+        self.persisted_records: list = []
+
+    def load(self) -> QueueLoadResult:
+        return QueueLoadResult(active=[], interrupted=[], warnings=[])
+
+    def save(self, records: list) -> None:
+        self._save_count += 1
+        if self._save_count == 1:
+            self.first_save_started.set()
+            self.allow_first_save.wait(timeout=1)
+        elif self._save_count == 2:
+            self.second_save_started.set()
+        self.persisted_records = list(records)

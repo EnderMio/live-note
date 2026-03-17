@@ -36,9 +36,8 @@ class TaskQueueRuntime:
         with self._lock:
             self._records = list(loaded.active_records)
             self._sync_task_sequence(self._records)
-            active_records = list(self._records)
-        if loaded.interrupted_records:
-            self.store.save(active_records)
+            if loaded.interrupted_records:
+                self.store.save(list(self._records))
         return loaded
 
     def next_task_id(self) -> str:
@@ -67,9 +66,8 @@ class TaskQueueRuntime:
                 created_at=created_at,
             )
             self._records.append(record)
-            snapshot = list(self._records)
-        self.store.save(snapshot)
-        return record
+            self.store.save(list(self._records))
+            return record
 
     def next_queued(self) -> QueuedTaskRecord | None:
         with self._lock:
@@ -88,9 +86,8 @@ class TaskQueueRuntime:
             if updated_record is None:
                 raise KeyError(task_id)
             self._records = updated_records
-            snapshot = list(self._records)
-        self.store.save(snapshot)
-        return updated_record
+            self.store.save(list(self._records))
+            return updated_record
 
     def remove(self, task_id: str) -> bool:
         with self._lock:
@@ -98,9 +95,8 @@ class TaskQueueRuntime:
             if len(remaining) == len(self._records):
                 return False
             self._records = remaining
-            snapshot = list(self._records)
-        self.store.save(snapshot)
-        return True
+            self.store.save(list(self._records))
+            return True
 
     def cancel(self, task_ids: set[str]) -> int:
         with self._lock:
@@ -113,9 +109,8 @@ class TaskQueueRuntime:
             if not cancelled:
                 return 0
             self._records = remaining
-            snapshot = list(self._records)
-        self.store.save(snapshot)
-        return cancelled
+            self.store.save(list(self._records))
+            return cancelled
 
     def queued_count(self) -> int:
         with self._lock:
