@@ -16,7 +16,8 @@ from .coordinator import can_reconstruct_session_live_audio
 from .events import ProgressEvent
 from .journal import SessionWorkspace
 from .services import AppService, SessionSummary, SettingsDraft
-from .task_queue import QueuedTaskRecord, TaskQueueStore, build_task_record
+from .task_queue import QueuedTaskRecord, QueueLoadResult, TaskQueueStore
+from .task_queue_runtime import TaskQueueRuntime
 
 KIND_CHOICES = ["generic", "meeting", "lecture"]
 LLM_WIRE_API_CHOICES = ["chat_completions", "responses"]
@@ -56,8 +57,6 @@ class LiveNoteGui:
         self.root = root
         self.service = service
         self.event_queue: queue.Queue[object] = queue.Queue()
-        self.queue_lock = threading.Lock()
-        self.task_sequence = 0
         self.current_worker: threading.Thread | None = None
         self.current_task_id: str | None = None
         self.current_task_label: str | None = None
@@ -67,8 +66,7 @@ class LiveNoteGui:
         self.background_tasks: dict[str, str] = {}
         self.background_task_sessions: dict[str, str | None] = {}
         self.busy = False
-        self.queue_store = TaskQueueStore(self.service.task_queue_path())
-        self.queue_records: list[QueuedTaskRecord] = []
+        self.queue_runtime = TaskQueueRuntime(TaskQueueStore(self.service.task_queue_path()))
         self.queue_worker: threading.Thread | None = None
         self.queue_current_task_id: str | None = None
         self.queue_current_task_label: str | None = None
@@ -695,12 +693,8 @@ class LiveNoteGui:
         return callback
 
     def _load_task_queue_state(self) -> None:
-        loaded = self.queue_store.load()
-        with self.queue_lock:
-            self.queue_records = list(loaded.active_records)
-        self._sync_task_sequence(self.queue_records)
-        if loaded.interrupted_records:
-            self.queue_store.save(self.queue_records)
+        loaded = self._queue_runtime().load()
+        self._sync_queue_compat_state()
         self._refresh_queue_tree()
         for warning in loaded.warnings:
             self._append_log(warning)
@@ -716,19 +710,14 @@ class LiveNoteGui:
         return True
 
     def _enqueue_queue_task(self, *, label: str, action: str, payload: dict[str, object]) -> None:
-        record = build_task_record(
-            task_id=self._next_task_id(),
-            action=action,
+        record = self._queue_runtime().enqueue(
             label=label,
+            action=action,
             payload=payload,
             created_at=iso_now(),
         )
-        with self.queue_lock:
-            duplicate = any(item.fingerprint == record.fingerprint for item in self.queue_records)
-            if not duplicate:
-                self.queue_records.append(record)
-                self.queue_store.save(self.queue_records)
-        if duplicate:
+        self._sync_queue_compat_state()
+        if record is None:
             self._append_log(f"{label} 已在队列中，跳过重复入队。")
             self._update_idle_status()
             return
@@ -746,24 +735,15 @@ class LiveNoteGui:
         ):
             self._update_idle_status()
             return
-        with self.queue_lock:
-            next_record = next(
-                (record for record in self.queue_records if record.status == "queued"),
-                None,
-            )
+        next_record = self._queue_runtime().next_queued()
         if next_record is None:
             self._update_idle_status()
             return
         self._start_queue_task(next_record)
 
     def _start_queue_task(self, record: QueuedTaskRecord) -> None:
-        started_record = replace(record, status="running", started_at=iso_now())
-        with self.queue_lock:
-            self.queue_records = [
-                started_record if item.task_id == record.task_id else item
-                for item in self.queue_records
-            ]
-            self.queue_store.save(self.queue_records)
+        started_record = self._queue_runtime().mark_running(record.task_id, started_at=iso_now())
+        self._sync_queue_compat_state()
         self.queue_current_task_id = started_record.task_id
         self.queue_current_task_label = started_record.label
         self._refresh_queue_tree()
@@ -821,12 +801,9 @@ class LiveNoteGui:
         raise RuntimeError(f"不支持的队列任务：{record.action}")
 
     def _remove_queue_record(self, task_id: str) -> None:
-        with self.queue_lock:
-            remaining = [record for record in self.queue_records if record.task_id != task_id]
-            if len(remaining) == len(self.queue_records):
-                return
-            self.queue_records = remaining
-            self.queue_store.save(self.queue_records)
+        if not self._queue_runtime().remove(task_id):
+            return
+        self._sync_queue_compat_state()
 
     def _refresh_queue_tree(self) -> None:
         tree = getattr(self, "queue_tree", None)
@@ -834,9 +811,7 @@ class LiveNoteGui:
             return
         for item in tree.get_children():
             tree.delete(item)
-        with self.queue_lock:
-            records = list(self.queue_records)
-        for record in records:
+        for record in self._queue_records_snapshot():
             tree.insert(
                 "",
                 "end",
@@ -856,11 +831,10 @@ class LiveNoteGui:
         if button is None or tree is None:
             return
         selection = tree.selection()
-        with self.queue_lock:
-            cancellable = any(
-                record.task_id in selection and record.status == "queued"
-                for record in self.queue_records
-            )
+        cancellable = any(
+            (record := self._queue_record(task_id)) is not None and record.status == "queued"
+            for task_id in selection
+        )
         button.configure(state="normal" if cancellable else "disabled")
 
     def _cancel_selected_queue_task(self) -> None:
@@ -870,17 +844,9 @@ class LiveNoteGui:
         selection = set(tree.selection())
         if not selection:
             return
-        with self.queue_lock:
-            remaining = [
-                record
-                for record in self.queue_records
-                if record.task_id not in selection or record.status != "queued"
-            ]
-            changed = len(remaining) != len(self.queue_records)
-            if changed:
-                self.queue_records = remaining
-                self.queue_store.save(self.queue_records)
-        if changed:
+        cancelled = self._queue_runtime().cancel(selection)
+        self._sync_queue_compat_state()
+        if cancelled:
             self._append_log("已取消所选排队任务。")
             self._refresh_queue_tree()
             self._update_idle_status()
@@ -1516,7 +1482,7 @@ class LiveNoteGui:
             self.queue_current_task_id = None
             self.queue_current_task_label = None
         self._refresh_queue_tree()
-        queued = sum(1 for record in self.queue_records if record.status == "queued")
+        queued = self._queued_count()
         if queued:
             self._set_queue_progress_state(f"等待执行 {queued} 项。", active=False)
         elif not self.busy:
@@ -1578,10 +1544,20 @@ class LiveNoteGui:
         return None
 
     def _next_task_id(self) -> str:
-        self.task_sequence += 1
-        return f"task-{self.task_sequence:04d}"
+        runtime = getattr(self, "queue_runtime", None)
+        if runtime is not None:
+            task_id = runtime.next_task_id()
+            self._sync_queue_compat_state()
+            return task_id
+        task_sequence = getattr(self, "task_sequence", 0) + 1
+        self.task_sequence = task_sequence
+        return f"task-{task_sequence:04d}"
 
     def _sync_task_sequence(self, records: list[QueuedTaskRecord]) -> None:
+        runtime = getattr(self, "queue_runtime", None)
+        if runtime is not None:
+            self.queue_records = runtime.records
+            return
         max_seen = getattr(self, "task_sequence", 0)
         for record in records:
             prefix, _, suffix = record.task_id.partition("-")
@@ -1600,17 +1576,16 @@ class LiveNoteGui:
         if getattr(self, "queue_worker", None) is not None:
             return
         background_tasks = getattr(self, "background_tasks", {})
-        queue_records = getattr(self, "queue_records", [])
         pending = len(background_tasks)
         if pending:
             self.status_var.set(f"准备就绪（后台处理中 {pending} 项）")
-            queued = sum(1 for record in queue_records if record.status == "queued")
+            queued = self._queued_count()
             if queued:
                 self._set_queue_progress_state(f"等待执行 {queued} 项。", active=False)
             else:
                 self._set_queue_progress_state(f"后台处理中 {pending} 项。", active=False)
             return
-        queued = sum(1 for record in queue_records if record.status == "queued")
+        queued = self._queued_count()
         if queued:
             self.status_var.set(f"准备就绪（队列中 {queued} 项）")
             self._set_queue_progress_state(f"等待执行 {queued} 项。", active=False)
@@ -1695,7 +1670,7 @@ class LiveNoteGui:
             if not messagebox.askyesno("退出", "当前任务仍在进行，确定直接关闭窗口吗？"):
                 return
         elif self.queue_worker is not None:
-            queued = sum(1 for record in self.queue_records if record.status == "queued")
+            queued = self._queued_count()
             if not messagebox.askyesno(
                 "退出",
                 (
@@ -1713,13 +1688,58 @@ class LiveNoteGui:
                 ),
             ):
                 return
-        elif any(record.status == "queued" for record in self.queue_records):
+        elif self._queued_count():
             if not messagebox.askyesno(
                 "退出",
                 "仍有待执行的排队任务。关闭窗口后它们会在下次启动时恢复。是否继续关闭窗口？",
             ):
                 return
         self.root.destroy()
+
+    def _queue_runtime(self) -> TaskQueueRuntime:
+        runtime = getattr(self, "queue_runtime", None)
+        if runtime is None:
+            store = getattr(self, "queue_store", None)
+            if store is None:
+                service = getattr(self, "service", None)
+                if service is not None:
+                    store = TaskQueueStore(service.task_queue_path())
+                else:
+                    store = _InMemoryQueueStore(list(getattr(self, "queue_records", [])))
+                self.queue_store = store
+            runtime = TaskQueueRuntime(
+                store,
+                initial_records=list(getattr(self, "queue_records", [])),
+            )
+            self.queue_runtime = runtime
+        return runtime
+
+    def _sync_queue_compat_state(self) -> None:
+        runtime = getattr(self, "queue_runtime", None)
+        if runtime is None:
+            return
+        self.queue_records = runtime.records
+
+    def _queue_records_snapshot(self) -> list[QueuedTaskRecord]:
+        runtime = getattr(self, "queue_runtime", None)
+        if runtime is not None:
+            return runtime.records
+        return list(getattr(self, "queue_records", []))
+
+    def _queued_count(self) -> int:
+        runtime = getattr(self, "queue_runtime", None)
+        if runtime is not None:
+            return runtime.queued_count()
+        return sum(1 for record in getattr(self, "queue_records", []) if record.status == "queued")
+
+    def _queue_record(self, task_id: str) -> QueuedTaskRecord | None:
+        runtime = getattr(self, "queue_runtime", None)
+        if runtime is not None:
+            return runtime.get(task_id)
+        return next(
+            (record for record in getattr(self, "queue_records", []) if record.task_id == task_id),
+            None,
+        )
 
 
 def _entry_row(
@@ -1733,6 +1753,17 @@ def _entry_row(
     ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=(10, 0))
     if hint:
         ttk.Label(parent, text=hint).grid(row=row, column=2, sticky="w", padx=(8, 0), pady=(10, 0))
+
+
+class _InMemoryQueueStore:
+    def __init__(self, initial_records: list[QueuedTaskRecord]) -> None:
+        self._records = list(initial_records)
+
+    def load(self) -> QueueLoadResult:
+        return QueueLoadResult(active=list(self._records), interrupted=[], warnings=[])
+
+    def save(self, records: list[QueuedTaskRecord]) -> None:
+        self._records = list(records)
 
 
 def _build_vertical_scroller(parent: ttk.Frame) -> ttk.Frame:
