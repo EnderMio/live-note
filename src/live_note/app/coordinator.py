@@ -32,15 +32,9 @@ from live_note.domain import (
     SessionMetadata,
     TranscriptEntry,
 )
-from live_note.llm import LlmError, OpenAiCompatibleClient
+from live_note.llm import OpenAiCompatibleClient
 from live_note.obsidian.client import ObsidianClient, ObsidianError
-from live_note.obsidian.renderer import (
-    build_structured_failure_note,
-    build_structured_note,
-    build_structured_pending_note,
-    build_transcript_note,
-)
-from live_note.review import detect_review_items
+from live_note.obsidian.renderer import build_transcript_note
 from live_note.transcribe.text import build_transcription_prompt, normalize_transcript_text
 from live_note.transcribe.whisper import (
     WhisperError,
@@ -53,6 +47,11 @@ from live_note.utils import iso_now, slugify_filename
 
 from .events import ProgressCallback, ProgressEvent
 from .journal import SessionWorkspace, build_workspace, session_root
+from .session_outputs import (
+    build_structured_output,
+    publish_final_outputs,
+    write_initial_transcript,
+)
 
 FRAME_STOP = object()
 FRAME_PAUSE = object()
@@ -977,18 +976,6 @@ def sync_session_notes(
     return 0
 
 
-def _write_initial_transcript(
-    workspace: SessionWorkspace,
-    metadata: SessionMetadata,
-    obsidian: ObsidianClient,
-    logger: logging.Logger,
-    status: str,
-) -> None:
-    initial_note = build_transcript_note(metadata, [], status=status)
-    workspace.write_transcript(initial_note)
-    _try_sync_note(obsidian, metadata.transcript_note_path, initial_note, logger, "原文初始笔记")
-
-
 def _mark_session_failed(
     *,
     workspace: SessionWorkspace,
@@ -1011,6 +998,22 @@ def _mark_session_failed(
     )
 
 
+def _write_initial_transcript(
+    workspace: SessionWorkspace,
+    metadata: SessionMetadata,
+    obsidian: ObsidianClient,
+    logger: logging.Logger,
+    status: str,
+) -> None:
+    write_initial_transcript(
+        workspace,
+        metadata,
+        obsidian,
+        logger,
+        status=status,
+    )
+
+
 def _publish_final_outputs(
     workspace: SessionWorkspace,
     metadata: SessionMetadata,
@@ -1019,46 +1022,14 @@ def _publish_final_outputs(
     logger: logging.Logger,
     on_progress: ProgressCallback | None = None,
 ) -> None:
-    final_entries = workspace.transcript_entries()
-    review_items = detect_review_items(final_entries, metadata.language)
-    session_audio_path = "session.live.wav" if workspace.session_live_wav.exists() else None
-    structured_body, structured_status = _build_structured_output(
-        llm_client=llm_client,
-        metadata=metadata,
-        entries=final_entries,
-        transcript_note_path=metadata.transcript_note_path,
-    )
-    _emit_progress(
-        on_progress,
-        "publishing",
-        "正在生成最终原文。",
-        session_id=metadata.session_id,
-    )
-    final_transcript = build_transcript_note(
+    publish_final_outputs(
+        workspace,
         metadata,
-        final_entries,
-        status=structured_status,
-        review_items=review_items,
-        session_audio_path=session_audio_path,
-    )
-    workspace.write_transcript(final_transcript)
-    _try_sync_note(
         obsidian,
-        metadata.transcript_note_path,
-        final_transcript,
+        llm_client,
         logger,
-        "原文最终笔记",
+        on_progress=on_progress,
     )
-
-    _emit_progress(
-        on_progress,
-        "summarizing",
-        "正在生成整理稿。",
-        session_id=metadata.session_id,
-    )
-    workspace.write_structured(structured_body)
-    _try_sync_note(obsidian, metadata.structured_note_path, structured_body, logger, "整理笔记")
-    workspace.update_session(status=structured_status)
 
 
 def _build_structured_output(
@@ -1067,46 +1038,12 @@ def _build_structured_output(
     entries: list[TranscriptEntry],
     transcript_note_path: str,
 ) -> tuple[str, str]:
-    if not entries:
-        body = build_structured_failure_note(
-            metadata,
-            transcript_note_path=transcript_note_path,
-            reason="当前会话没有可用的转写文本。",
-        )
-        return body, "structured_failed"
-
-    if not llm_client.is_enabled():
-        body = build_structured_pending_note(
-            metadata,
-            transcript_note_path=transcript_note_path,
-            reason="当前会话未启用自动整理，请按需手动补写。",
-        )
-        return body, "transcript_only"
-
-    if not llm_client.is_configured():
-        body = build_structured_pending_note(
-            metadata,
-            transcript_note_path=transcript_note_path,
-            reason="LLM 已启用但配置不完整，先保留可手动补写的整理模板。",
-        )
-        return body, "transcript_only"
-
-    try:
-        llm_markdown = llm_client.generate_structured_note(metadata, entries)
-        body = build_structured_note(
-            metadata,
-            llm_markdown=llm_markdown,
-            transcript_note_path=transcript_note_path,
-            status="finalized",
-        )
-        return body, "finalized"
-    except LlmError as exc:
-        body = build_structured_failure_note(
-            metadata,
-            transcript_note_path=transcript_note_path,
-            reason=str(exc),
-        )
-        return body, "structured_failed"
+    return build_structured_output(
+        llm_client=llm_client,
+        metadata=metadata,
+        entries=entries,
+        transcript_note_path=transcript_note_path,
+    )
 
 
 def _normalize_merge_session_ids(session_ids: list[str]) -> list[str]:
