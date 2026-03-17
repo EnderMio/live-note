@@ -115,7 +115,7 @@ class MergeSessionTests(unittest.TestCase):
                 patch("live_note.app.coordinator._attach_console_logging"),
                 patch("live_note.app.coordinator.ObsidianClient"),
                 patch("live_note.app.coordinator.OpenAiCompatibleClient"),
-                patch("live_note.app.coordinator._publish_final_outputs"),
+                patch("live_note.app.coordinator.publish_final_outputs"),
                 patch(
                     "live_note.app.coordinator._run_live_refinement",
                     side_effect=lambda **kwargs: kwargs["metadata"],

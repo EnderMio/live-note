@@ -8,11 +8,15 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from live_note.app.journal import SessionWorkspace
-from live_note.app.session_outputs import build_structured_output, publish_final_outputs
+from live_note.app.session_outputs import (
+    build_structured_output,
+    publish_final_outputs,
+    try_sync_note,
+)
 from live_note.config import LlmConfig, ObsidianConfig
 from live_note.domain import SessionMetadata, TranscriptEntry
 from live_note.llm import LlmError, OpenAiCompatibleClient
-from live_note.obsidian.client import ObsidianClient
+from live_note.obsidian.client import ObsidianClient, ObsidianError
 
 
 class SessionOutputsTests(unittest.TestCase):
@@ -150,6 +154,26 @@ class SessionOutputsTests(unittest.TestCase):
 
         self.assertEqual("structured_failed", status)
         self.assertIn("LLM 请求失败", body)
+
+    def test_try_sync_note_swallows_obsidian_error_and_logs_warning(self) -> None:
+        obsidian = Mock(spec=ObsidianClient)
+        obsidian.put_note.side_effect = ObsidianError("ssl failed")
+        logger = Mock()
+
+        try_sync_note(
+            obsidian,
+            "Sessions/Transcripts/2026-03-18/test.md",
+            "# test",
+            logger,
+            "原文笔记",
+        )
+
+        logger.warning.assert_called_once()
+        self.assertEqual(
+            "%s 同步失败，将保留在本地 journal 中: %s",
+            logger.warning.call_args.args[0],
+        )
+        self.assertEqual("原文笔记", logger.warning.call_args.args[1])
 
 
 if __name__ == "__main__":

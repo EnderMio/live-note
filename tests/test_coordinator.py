@@ -51,7 +51,7 @@ class CoordinatorFailureTests(unittest.TestCase):
                 patch("live_note.app.coordinator.WhisperInferenceClient"),
                 patch("live_note.app.coordinator.WhisperServerProcess"),
                 patch(
-                    "live_note.app.coordinator._write_initial_transcript",
+                    "live_note.app.coordinator.write_initial_transcript",
                     side_effect=RuntimeError("startup boom"),
                 ),
             ):

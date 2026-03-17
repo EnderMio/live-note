@@ -27,7 +27,7 @@ def write_initial_transcript(
 ) -> None:
     initial_note = build_transcript_note(metadata, [], status=status)
     workspace.write_transcript(initial_note)
-    _try_sync_note(obsidian, metadata.transcript_note_path, initial_note, logger, "原文初始笔记")
+    try_sync_note(obsidian, metadata.transcript_note_path, initial_note, logger, "原文初始笔记")
 
 
 def publish_final_outputs(
@@ -62,7 +62,7 @@ def publish_final_outputs(
         session_audio_path=session_audio_path,
     )
     workspace.write_transcript(final_transcript)
-    _try_sync_note(
+    try_sync_note(
         obsidian,
         metadata.transcript_note_path,
         final_transcript,
@@ -77,7 +77,7 @@ def publish_final_outputs(
         session_id=metadata.session_id,
     )
     workspace.write_structured(structured_body)
-    _try_sync_note(obsidian, metadata.structured_note_path, structured_body, logger, "整理笔记")
+    try_sync_note(obsidian, metadata.structured_note_path, structured_body, logger, "整理笔记")
     workspace.update_session(status=structured_status)
 
 
@@ -129,7 +129,7 @@ def build_structured_output(
         return body, "structured_failed"
 
 
-def _try_sync_note(
+def try_sync_note(
     obsidian: ObsidianClient,
     path: str,
     content: str,

@@ -33,7 +33,7 @@ from live_note.domain import (
     TranscriptEntry,
 )
 from live_note.llm import OpenAiCompatibleClient
-from live_note.obsidian.client import ObsidianClient, ObsidianError
+from live_note.obsidian.client import ObsidianClient
 from live_note.obsidian.renderer import build_transcript_note
 from live_note.transcribe.text import build_transcription_prompt, normalize_transcript_text
 from live_note.transcribe.whisper import (
@@ -48,8 +48,8 @@ from live_note.utils import iso_now, slugify_filename
 from .events import ProgressCallback, ProgressEvent
 from .journal import SessionWorkspace, build_workspace, session_root
 from .session_outputs import (
-    build_structured_output,
     publish_final_outputs,
+    try_sync_note,
     write_initial_transcript,
 )
 
@@ -209,7 +209,7 @@ class SessionCoordinator:
             whisper_client = WhisperInferenceClient(whisper_config)
             whisper_server = WhisperServerProcess(whisper_config, workspace.logs_txt)
 
-            _write_initial_transcript(workspace, metadata, obsidian, logger, status="live")
+            write_initial_transcript(workspace, metadata, obsidian, logger, status="live")
             metadata = workspace.update_status("live")
             _emit_progress(
                 self.on_progress,
@@ -319,7 +319,7 @@ class SessionCoordinator:
                         transcript_source=previous_source,
                         refine_status="failed",
                     )
-            _publish_final_outputs(
+            publish_final_outputs(
                 workspace,
                 metadata,
                 obsidian,
@@ -549,7 +549,7 @@ class FileImportCoordinator:
             whisper_config = _runtime_whisper_config(self.config.whisper, self.language)
             whisper_client = WhisperInferenceClient(whisper_config)
 
-            _write_initial_transcript(workspace, metadata, obsidian, logger, status="importing")
+            write_initial_transcript(workspace, metadata, obsidian, logger, status="importing")
             metadata = workspace.update_status("importing")
             _emit_progress(
                 self.on_progress,
@@ -627,7 +627,7 @@ class FileImportCoordinator:
                 if normalized_path.exists() and not self.config.importer.keep_normalized_audio:
                     normalized_path.unlink()
 
-            _publish_final_outputs(
+            publish_final_outputs(
                 workspace,
                 metadata,
                 obsidian,
@@ -689,7 +689,7 @@ def finalize_session(
         seed_entries=workspace.transcript_entries(),
     )
 
-    _publish_final_outputs(
+    publish_final_outputs(
         workspace,
         metadata,
         obsidian,
@@ -739,7 +739,7 @@ def retranscribe_session(
         seed_entries=[],
     )
 
-    _publish_final_outputs(
+    publish_final_outputs(
         workspace,
         metadata,
         obsidian,
@@ -813,7 +813,7 @@ def refine_session(
             refine_status="failed",
         )
 
-    _publish_final_outputs(
+    publish_final_outputs(
         workspace,
         metadata,
         obsidian,
@@ -876,7 +876,7 @@ def merge_sessions(
 
     obsidian = ObsidianClient(config.obsidian)
     llm_client = OpenAiCompatibleClient(config.llm)
-    _publish_final_outputs(
+    publish_final_outputs(
         workspace,
         metadata,
         obsidian,
@@ -910,7 +910,7 @@ def republish_session(
     )
     obsidian = ObsidianClient(config.obsidian)
     llm_client = OpenAiCompatibleClient(config.llm)
-    _publish_final_outputs(
+    publish_final_outputs(
         workspace,
         metadata,
         obsidian,
@@ -952,7 +952,7 @@ def sync_session_notes(
         session_id=metadata.session_id,
     )
     if workspace.transcript_md.exists():
-        _try_sync_note(
+        try_sync_note(
             obsidian,
             metadata.transcript_note_path,
             workspace.transcript_md.read_text(encoding="utf-8"),
@@ -960,7 +960,7 @@ def sync_session_notes(
             "原文笔记",
         )
     if workspace.structured_md.exists():
-        _try_sync_note(
+        try_sync_note(
             obsidian,
             metadata.structured_note_path,
             workspace.structured_md.read_text(encoding="utf-8"),
@@ -995,54 +995,6 @@ def _mark_session_failed(
         f"{label}失败：{exc}",
         session_id=metadata.session_id,
         error=str(exc),
-    )
-
-
-def _write_initial_transcript(
-    workspace: SessionWorkspace,
-    metadata: SessionMetadata,
-    obsidian: ObsidianClient,
-    logger: logging.Logger,
-    status: str,
-) -> None:
-    write_initial_transcript(
-        workspace,
-        metadata,
-        obsidian,
-        logger,
-        status=status,
-    )
-
-
-def _publish_final_outputs(
-    workspace: SessionWorkspace,
-    metadata: SessionMetadata,
-    obsidian: ObsidianClient,
-    llm_client: OpenAiCompatibleClient,
-    logger: logging.Logger,
-    on_progress: ProgressCallback | None = None,
-) -> None:
-    publish_final_outputs(
-        workspace,
-        metadata,
-        obsidian,
-        llm_client,
-        logger,
-        on_progress=on_progress,
-    )
-
-
-def _build_structured_output(
-    llm_client: OpenAiCompatibleClient,
-    metadata: SessionMetadata,
-    entries: list[TranscriptEntry],
-    transcript_note_path: str,
-) -> tuple[str, str]:
-    return build_structured_output(
-        llm_client=llm_client,
-        metadata=metadata,
-        entries=entries,
-        transcript_note_path=transcript_note_path,
     )
 
 
@@ -1491,7 +1443,7 @@ def _process_segment(
         )
         content = build_transcript_note(metadata, list(entries), status=live_status)
         workspace.write_transcript(content)
-        _try_sync_note(
+        try_sync_note(
             obsidian,
             metadata.transcript_note_path,
             content,
@@ -1643,19 +1595,6 @@ def _open_session_audio_writer(
     if not enabled:
         return nullcontext(None)
     return SessionAudioWriter(path, sample_rate)
-
-
-def _try_sync_note(
-    obsidian: ObsidianClient,
-    path: str,
-    content: str,
-    logger: logging.Logger,
-    label: str,
-) -> None:
-    try:
-        obsidian.put_note(path, content)
-    except ObsidianError as exc:
-        logger.warning("%s 同步失败，将保留在本地 journal 中: %s", label, exc)
 
 
 def _enqueue_with_retry(target_queue: queue.Queue[Any], item: Any) -> None:
