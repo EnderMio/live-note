@@ -63,6 +63,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         launch_gui_mock.assert_called_once_with(Path("/tmp/gui.toml"))
 
+    def test_gui_preview_qt_command_dispatches_to_launcher(self) -> None:
+        with patch("live_note.app.cli.launch_gui_preview_qt", return_value=0) as preview_mock:
+            exit_code = main(["gui-preview-qt"])
+
+        self.assertEqual(0, exit_code)
+        preview_mock.assert_called_once_with()
+
     def test_doctor_uses_service_checks(self) -> None:
         service = Mock()
         service.doctor_checks.return_value = [

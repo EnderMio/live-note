@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("doctor", help="检查依赖、配置与外部服务")
     subparsers.add_parser("devices", help="列出输入设备")
     subparsers.add_parser("gui", help="启动桌面界面")
+    subparsers.add_parser("gui-preview-qt", help="启动 Qt 毛玻璃悬浮窗预览")
 
     start_parser = subparsers.add_parser("start", help="开始一场实时转写会话")
     start_parser.add_argument("--title", help="会话标题，例如 周会 / 机器学习导论")
@@ -75,6 +76,8 @@ def main(argv: list[str] | None = None) -> int:
         return command_devices()
     if args.command == "gui":
         return launch_gui(Path(args.config))
+    if args.command == "gui-preview-qt":
+        return launch_gui_preview_qt()
     if args.command == "doctor":
         return command_doctor(Path(args.config))
 
@@ -149,6 +152,20 @@ def launch_gui(config_path: Path) -> int:
     from live_note.app.gui import launch_gui as launch_gui_impl
 
     return launch_gui_impl(config_path)
+
+
+def launch_gui_preview_qt() -> int:
+    try:
+        from live_note.app.gui_qt_preview import launch_gui_preview_qt as launch_preview_impl
+    except ImportError as exc:
+        print(
+            "Qt 预览依赖未安装。请先运行 `make setup-gui` 或 "
+            "`python3 -m pip install -e \".[gui]\"`。",
+            file=sys.stderr,
+        )
+        print(exc, file=sys.stderr)
+        return 1
+    return launch_preview_impl()
 
 
 def _resolve_kind(kind: str, profile_legacy: str | None) -> str:

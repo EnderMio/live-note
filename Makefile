@@ -1,19 +1,27 @@
-PYTHON ?= python3
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 PYTHONPATH := src
 ARGS ?=
 
-.PHONY: setup dev gui doctor devices import finalize retranscribe refine merge test lint
+.PHONY: setup setup-gui dev gui gui-preview-qt doctor devices import finalize retranscribe refine merge test lint
 
 setup:
 	$(PYTHON) -m venv .venv
 	.venv/bin/pip install --upgrade pip
 	.venv/bin/pip install -e ".[dev]"
 
+setup-gui:
+	$(PYTHON) -m venv .venv
+	.venv/bin/pip install --upgrade pip
+	.venv/bin/pip install -e ".[dev,gui]"
+
 dev:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note start $(ARGS)
 
 gui:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note gui $(ARGS)
+
+gui-preview-qt:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note gui-preview-qt $(ARGS)
 
 doctor:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note doctor

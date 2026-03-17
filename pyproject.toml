@@ -19,6 +19,10 @@ dev = [
   "pytest>=8.4.0",
   "ruff>=0.12.0",
 ]
+gui = [
+  "PySide6>=6.8,<7",
+  "pyobjc-framework-Cocoa>=12.1; platform_system == 'Darwin'",
+]
 
 [project.scripts]
 live-note = "live_note.app.cli:main"
@@ -28,6 +32,9 @@ live-note = "live_note.app.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+live_note = ["assets/branding/*.svg", "assets/branding/*.png"]
 
 [tool.ruff]
 line-length = 100
