@@ -24,6 +24,8 @@ def build_transcript_note(
         f"status: {yaml_quote(status)}",
         f"transcript_source: {yaml_quote(metadata.transcript_source)}",
         f"refine_status: {yaml_quote(metadata.refine_status)}",
+        f"execution_target: {yaml_quote(metadata.execution_target)}",
+        f"speaker_status: {yaml_quote(metadata.speaker_status)}",
         "tags:",
         "  - live-note/transcript",
         f"  - live-note/{metadata.kind}",
@@ -36,7 +38,7 @@ def build_transcript_note(
     ]
     if entries:
         lines.extend(
-            f"- [{format_ms(entry.started_ms)}] {compact_text(entry.text)}" for entry in entries
+            f"- [{format_ms(entry.started_ms)}] {_entry_text(entry)}" for entry in entries
         )
     else:
         lines.append("- 等待音频输入或文件转写…")
@@ -51,8 +53,12 @@ def build_transcript_note(
             f"- 语言: `{metadata.language}`",
             f"- 转写来源: `{metadata.transcript_source}`",
             f"- 精修状态: `{metadata.refine_status}`",
+            f"- 运行位置: `{metadata.execution_target}`",
+            f"- 说话人区分: `{metadata.speaker_status}`",
         ]
     )
+    if metadata.remote_session_id:
+        lines.append(f"- 远端会话: `{metadata.remote_session_id}`")
     if session_audio_path:
         lines.append(f"- 整场录音: `{session_audio_path}`")
     if review_items is not None:
@@ -99,6 +105,8 @@ def build_structured_note(
             f"status: {yaml_quote(status)}",
             f"transcript_source: {yaml_quote(metadata.transcript_source)}",
             f"refine_status: {yaml_quote(metadata.refine_status)}",
+            f"execution_target: {yaml_quote(metadata.execution_target)}",
+            f"speaker_status: {yaml_quote(metadata.speaker_status)}",
             "tags:",
             "  - live-note/structured",
             f"  - live-note/{metadata.kind}",
@@ -131,6 +139,8 @@ def build_structured_failure_note(
             'status: "failed"',
             f"transcript_source: {yaml_quote(metadata.transcript_source)}",
             f"refine_status: {yaml_quote(metadata.refine_status)}",
+            f"execution_target: {yaml_quote(metadata.execution_target)}",
+            f"speaker_status: {yaml_quote(metadata.speaker_status)}",
             "tags:",
             "  - live-note/structured",
             "  - live-note/failed",
@@ -174,6 +184,8 @@ def build_structured_pending_note(
             'status: "pending"',
             f"transcript_source: {yaml_quote(metadata.transcript_source)}",
             f"refine_status: {yaml_quote(metadata.refine_status)}",
+            f"execution_target: {yaml_quote(metadata.execution_target)}",
+            f"speaker_status: {yaml_quote(metadata.speaker_status)}",
             "tags:",
             "  - live-note/structured",
             "  - live-note/pending",
@@ -213,6 +225,8 @@ def _build_generation_section(metadata: SessionMetadata) -> str:
         "",
         f"- 转写来源: `{metadata.transcript_source}`",
         f"- 精修状态: `{metadata.refine_status}`",
+        f"- 运行位置: `{metadata.execution_target}`",
+        f"- 说话人区分: `{metadata.speaker_status}`",
     ]
     if metadata.transcript_source == "live":
         if metadata.refine_status == "failed":
@@ -229,3 +243,10 @@ def _clip_review_excerpt(value: str) -> str:
     if len(excerpt) <= 80:
         return excerpt
     return excerpt[:77].rstrip() + "..."
+
+
+def _entry_text(entry: TranscriptEntry) -> str:
+    text = compact_text(entry.text)
+    if entry.speaker_label:
+        return f"{entry.speaker_label}: {text}"
+    return text

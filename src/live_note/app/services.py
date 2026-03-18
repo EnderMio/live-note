@@ -11,10 +11,14 @@ from live_note.audio.capture import InputDevice, list_input_devices
 from live_note.config import (
     AppConfig,
     AudioConfig,
+    FunAsrConfig,
     ImportConfig,
     LlmConfig,
     ObsidianConfig,
     RefineConfig,
+    RemoteConfig,
+    ServeConfig,
+    SpeakerConfig,
     WhisperConfig,
     load_config,
     load_env_file,
@@ -22,6 +26,8 @@ from live_note.config import (
 )
 from live_note.obsidian.client import ObsidianClient
 
+from ..remote.client import RemoteClient
+from ..remote.protocol import entry_from_dict, metadata_from_dict
 from .coordinator import (
     FileImportCoordinator,
     SessionCoordinator,
@@ -35,6 +41,9 @@ from .coordinator import (
 from .events import ProgressCallback
 from .journal import SessionWorkspace
 from .journal import list_sessions as iter_session_roots
+from .remote_coordinator import RemoteLiveCoordinator
+from .remote_sync import apply_remote_artifacts
+from .task_queue import QueuedTaskRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +67,8 @@ class SessionSummary:
     latest_error: str | None
     transcript_source: str
     refine_status: str
+    execution_target: str
+    speaker_status: str
     session_dir: Path
     transcript_file: Path
     structured_file: Path
@@ -87,6 +98,20 @@ class SettingsDraft:
     llm_stream: bool = False
     llm_wire_api: str = "chat_completions"
     llm_requires_openai_auth: bool = False
+    remote_enabled: bool = False
+    remote_base_url: str = "http://127.0.0.1:8765"
+    remote_api_token: str = ""
+    remote_live_chunk_ms: int = 240
+    serve_host: str = "127.0.0.1"
+    serve_port: int = 8765
+    serve_api_token: str = ""
+    funasr_base_url: str = "ws://127.0.0.1:10095"
+    funasr_mode: str = "2pass"
+    funasr_use_itn: bool = True
+    speaker_enabled: bool = False
+    speaker_segmentation_model: str = ""
+    speaker_embedding_model: str = ""
+    speaker_cluster_threshold: float = 0.5
     obsidian_api_key: str = ""
     llm_api_key: str = ""
 
@@ -115,6 +140,20 @@ class SettingsDraft:
             llm_stream=config.llm.stream,
             llm_wire_api=config.llm.wire_api,
             llm_requires_openai_auth=config.llm.requires_openai_auth,
+            remote_enabled=config.remote.enabled,
+            remote_base_url=config.remote.base_url,
+            remote_api_token=config.remote.api_token or "",
+            remote_live_chunk_ms=config.remote.live_chunk_ms,
+            serve_host=config.serve.host,
+            serve_port=config.serve.port,
+            serve_api_token=config.serve.api_token or "",
+            funasr_base_url=config.funasr.base_url,
+            funasr_mode=config.funasr.mode,
+            funasr_use_itn=config.funasr.use_itn,
+            speaker_enabled=config.speaker.enabled,
+            speaker_segmentation_model=str(config.speaker.segmentation_model or ""),
+            speaker_embedding_model=str(config.speaker.embedding_model or ""),
+            speaker_cluster_threshold=config.speaker.cluster_threshold,
             obsidian_api_key=config.obsidian.api_key or "",
             llm_api_key=config.llm.api_key or "",
         )
@@ -150,6 +189,20 @@ class AppService:
             save_session_wav=True,
             refine_enabled=True,
             refine_auto_after_live=True,
+            remote_enabled=False,
+            remote_base_url="http://127.0.0.1:8765",
+            remote_api_token="",
+            remote_live_chunk_ms=240,
+            serve_host="127.0.0.1",
+            serve_port=8765,
+            serve_api_token="",
+            funasr_base_url="ws://127.0.0.1:10095",
+            funasr_mode="2pass",
+            funasr_use_itn=True,
+            speaker_enabled=False,
+            speaker_segmentation_model="",
+            speaker_embedding_model="",
+            speaker_cluster_threshold=0.5,
             obsidian_enabled=bool(env_values.get("OBSIDIAN_API_KEY")),
             llm_enabled=bool(env_values.get("LLM_API_KEY") or env_values.get("OPENAI_API_KEY")),
             obsidian_api_key=env_values.get("OBSIDIAN_API_KEY", ""),
@@ -182,6 +235,13 @@ class AppService:
                 errors.append("启用 LLM 整理时，LLM 模型名不能为空。")
             if draft.llm_wire_api not in {"chat_completions", "responses"}:
                 errors.append("LLM 协议仅支持 chat_completions 或 responses。")
+        if draft.remote_enabled and not draft.remote_base_url.strip():
+            errors.append("启用远端模式时，远端 Base URL 不能为空。")
+        if draft.speaker_enabled:
+            if not draft.speaker_segmentation_model.strip():
+                errors.append("启用说话人区分时，分割模型路径不能为空。")
+            if not draft.speaker_embedding_model.strip():
+                errors.append("启用说话人区分时，嵌入模型路径不能为空。")
         return errors
 
     def save_settings(self, draft: SettingsDraft) -> AppConfig:
@@ -245,6 +305,39 @@ class AppService:
                 requires_openai_auth=draft.llm_requires_openai_auth,
                 timeout_seconds=existing.llm.timeout_seconds,
                 api_key=draft.llm_api_key.strip() or None,
+            ),
+            remote=RemoteConfig(
+                enabled=draft.remote_enabled,
+                base_url=draft.remote_base_url.rstrip("/"),
+                api_token=draft.remote_api_token.strip() or None,
+                timeout_seconds=existing.remote.timeout_seconds,
+                live_chunk_ms=int(draft.remote_live_chunk_ms),
+            ),
+            serve=ServeConfig(
+                host=draft.serve_host.strip() or "127.0.0.1",
+                port=int(draft.serve_port),
+                api_token=draft.serve_api_token.strip() or None,
+            ),
+            funasr=FunAsrConfig(
+                base_url=draft.funasr_base_url.rstrip("/"),
+                mode=draft.funasr_mode,
+                use_itn=draft.funasr_use_itn,
+            ),
+            speaker=SpeakerConfig(
+                enabled=draft.speaker_enabled,
+                segmentation_model=(
+                    Path(draft.speaker_segmentation_model).expanduser()
+                    if draft.speaker_segmentation_model.strip()
+                    else None
+                ),
+                embedding_model=(
+                    Path(draft.speaker_embedding_model).expanduser()
+                    if draft.speaker_embedding_model.strip()
+                    else None
+                ),
+                cluster_threshold=float(draft.speaker_cluster_threshold),
+                min_duration_on=existing.speaker.min_duration_on,
+                min_duration_off=existing.speaker.min_duration_off,
             ),
             root_dir=self.config_path.parent,
         )
@@ -357,6 +450,81 @@ class AppService:
         else:
             checks.append(DoctorCheck("llm", "SKIP", "已关闭 LLM 整理，仅输出原文和待整理模板"))
 
+        if draft.remote_enabled:
+            checks.append(
+                DoctorCheck(
+                    "remote_api_token",
+                    "OK" if draft.remote_api_token else "WARN",
+                    "远端 API Token；未设置时仅适合无认证的局域网环境",
+                )
+            )
+            try:
+                remote_client = RemoteClient(
+                    RemoteConfig(
+                        enabled=True,
+                        base_url=draft.remote_base_url.rstrip("/"),
+                        api_token=draft.remote_api_token or None,
+                    )
+                )
+                payload = remote_client.health()
+            except Exception as exc:
+                detail = str(exc) if draft.remote_base_url else "未配置远端 Base URL"
+                checks.append(DoctorCheck("remote_health", "FAIL", detail))
+            else:
+                detail = (
+                    f"连通 {draft.remote_base_url.rstrip('/')} | "
+                    f"{payload.get('service', 'unknown-service')}"
+                )
+                if "speaker_enabled" in payload:
+                    detail += (
+                        f" | speaker={'on' if bool(payload.get('speaker_enabled')) else 'off'}"
+                    )
+                checks.append(DoctorCheck("remote_health", "OK", detail))
+        else:
+            checks.append(DoctorCheck("remote", "SKIP", "已关闭远端模式，默认使用本机转写"))
+
+        if draft.speaker_enabled:
+            segmentation_model = (
+                Path(draft.speaker_segmentation_model).expanduser()
+                if draft.speaker_segmentation_model
+                else None
+            )
+            embedding_model = (
+                Path(draft.speaker_embedding_model).expanduser()
+                if draft.speaker_embedding_model
+                else None
+            )
+            checks.append(
+                DoctorCheck(
+                    "speaker_segmentation_model",
+                    "OK" if segmentation_model and segmentation_model.exists() else "FAIL",
+                    f"分割模型 {draft.speaker_segmentation_model or '未配置'}",
+                )
+            )
+            checks.append(
+                DoctorCheck(
+                    "speaker_embedding_model",
+                    "OK" if embedding_model and embedding_model.exists() else "FAIL",
+                    f"嵌入模型 {draft.speaker_embedding_model or '未配置'}",
+                )
+            )
+            checks.append(
+                DoctorCheck(
+                    "speaker_numpy",
+                    "OK" if _module_available("numpy") else "FAIL",
+                    "Python 包 numpy",
+                )
+            )
+            checks.append(
+                DoctorCheck(
+                    "speaker_sherpa_onnx",
+                    "OK" if _module_available("sherpa_onnx") else "FAIL",
+                    "Python 包 sherpa_onnx",
+                )
+            )
+        else:
+            checks.append(DoctorCheck("speaker", "SKIP", "已关闭说话人区分"))
+
         return checks
 
     def list_input_devices(self) -> list[InputDevice]:
@@ -393,6 +561,8 @@ class AppService:
                     latest_error=latest_error,
                     transcript_source=metadata.transcript_source,
                     refine_status=metadata.refine_status,
+                    execution_target=metadata.execution_target,
+                    speaker_status=metadata.speaker_status,
                     session_dir=workspace.root,
                     transcript_file=workspace.transcript_md,
                     structured_file=workspace.structured_md,
@@ -407,14 +577,26 @@ class AppService:
         kind: str,
         language: str | None = None,
         on_progress: ProgressCallback | None = None,
+        auto_refine_after_live: bool | None = None,
     ) -> SessionCoordinator:
-        return SessionCoordinator(
-            config=self.load_config(),
+        config = self.load_config()
+        coordinator_cls = (
+            RemoteLiveCoordinator
+            if getattr(config.remote, "enabled", False)
+            else SessionCoordinator
+        )
+        kwargs = dict(
+            config=config,
             title=title,
             source=source,
             kind=kind,
             language=language,
             on_progress=on_progress,
+        )
+        if auto_refine_after_live is not None:
+            kwargs["auto_refine_after_live"] = auto_refine_after_live
+        return coordinator_cls(
+            **kwargs,
         )
 
     def create_import_coordinator(
@@ -453,7 +635,22 @@ class AppService:
         session_id: str,
         on_progress: ProgressCallback | None = None,
     ) -> int:
-        return refine_session(self.load_config(), session_id, on_progress=on_progress)
+        config = self.load_config()
+        workspace = SessionWorkspace.load(config.root_dir / ".live-note" / "sessions" / session_id)
+        metadata = workspace.read_session()
+        if metadata.execution_target == "remote":
+            remote_session_id = metadata.remote_session_id or metadata.session_id
+            client = RemoteClient(config.remote)
+            client.refine(remote_session_id)
+            artifacts = client.get_artifacts(remote_session_id)
+            apply_remote_artifacts(
+                config,
+                metadata_from_dict(dict(artifacts["metadata"])),
+                [entry_from_dict(dict(item)) for item in artifacts.get("entries", [])],
+                on_progress=on_progress,
+            )
+            return 0
+        return refine_session(config, session_id, on_progress=on_progress)
 
     def merge(
         self,
@@ -481,6 +678,42 @@ class AppService:
         on_progress: ProgressCallback | None = None,
     ) -> int:
         return sync_session_notes(self.load_config(), session_id, on_progress=on_progress)
+
+    def run_queue_task(
+        self,
+        record: QueuedTaskRecord,
+        *,
+        on_progress: ProgressCallback | None = None,
+    ) -> int:
+        payload = record.payload
+        if record.action == "import":
+            language = payload.get("language")
+            runner = self.create_import_coordinator(
+                file_path=str(payload["file_path"]),
+                title=payload.get("title") or None,
+                kind=str(payload.get("kind") or "generic"),
+                language=language if isinstance(language, str) else None,
+                on_progress=on_progress,
+            )
+            return runner.run()
+        if record.action == "merge":
+            return self.merge(
+                [str(item) for item in payload.get("session_ids", [])],
+                title=payload.get("title") if isinstance(payload.get("title"), str) else None,
+                on_progress=on_progress,
+            )
+        if record.action == "session_action":
+            operation = payload.get("action") or payload.get("operation")
+            session_id = str(payload["session_id"])
+            if operation == "retranscribe":
+                return self.retranscribe(session_id, on_progress=on_progress)
+            if operation == "refine":
+                return self.refine(session_id, on_progress=on_progress)
+            if operation == "republish":
+                return self.republish(session_id, on_progress=on_progress)
+            if operation == "resync":
+                return self.resync_notes(session_id, on_progress=on_progress)
+        raise RuntimeError(f"不支持的队列任务：{record.action}")
 
     def open_path(self, path: Path) -> None:
         subprocess.run(["open", str(path)], check=False)
@@ -585,6 +818,10 @@ def _default_config(root_dir: Path) -> AppConfig:
             requires_openai_auth=False,
             api_key=None,
         ),
+        remote=RemoteConfig(),
+        serve=ServeConfig(),
+        funasr=FunAsrConfig(),
+        speaker=SpeakerConfig(),
         root_dir=root_dir.resolve(),
     )
 
@@ -603,6 +840,8 @@ def _build_broken_session_summary(root: Path, exc: Exception) -> SessionSummary:
         latest_error=str(exc),
         transcript_source="unknown",
         refine_status="unknown",
+        execution_target="unknown",
+        speaker_status="unknown",
         session_dir=root,
         transcript_file=root / "transcript.md",
         structured_file=root / "structured.md",

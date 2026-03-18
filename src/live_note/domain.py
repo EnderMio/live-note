@@ -26,6 +26,7 @@ class TranscriptEntry:
     started_ms: int
     ended_ms: int
     text: str
+    speaker_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,7 @@ class SegmentEvent:
     wav_path: str | None = None
     text: str | None = None
     error: str | None = None
+    speaker_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +58,7 @@ class SegmentState:
     wav_path: Path | None
     text: str | None
     error: str | None
+    speaker_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +77,9 @@ class SessionMetadata:
     status: str
     transcript_source: str = "live"
     refine_status: str = "disabled"
+    execution_target: str = "local"
+    remote_session_id: str | None = None
+    speaker_status: str = "disabled"
 
     @property
     def note_stem(self) -> str:

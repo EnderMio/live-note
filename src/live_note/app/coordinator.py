@@ -4,7 +4,6 @@ import logging
 import queue
 import shutil
 import threading
-import time
 import wave
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -24,7 +23,7 @@ from live_note.audio.convert import (
     split_wav_file,
 )
 from live_note.audio.segmentation import SegmentWindow, SpeechSegmenter
-from live_note.config import AppConfig
+from live_note.config import AppConfig, with_refine_auto_after_live
 from live_note.domain import (
     AudioFrame,
     PendingSegment,
@@ -57,6 +56,7 @@ FRAME_STOP = object()
 FRAME_PAUSE = object()
 FRAME_RESUME = object()
 SEGMENT_STOP = object()
+SEGMENT_CONTEXT_RESET = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,12 +147,13 @@ class SessionCoordinator:
         kind: str,
         language: str | None = None,
         on_progress: ProgressCallback | None = None,
+        auto_refine_after_live: bool | None = None,
     ):
-        self.config = config
+        self.config = with_refine_auto_after_live(config, auto_refine_after_live)
         self.title = title
         self.source = source
         self.kind = kind
-        self.language = language or config.whisper.language
+        self.language = language or self.config.whisper.language
         self.on_progress = on_progress
         self.entries: list[TranscriptEntry] = []
         self._thread_errors: queue.Queue[BaseException] = queue.Queue()
@@ -238,6 +239,7 @@ class SessionCoordinator:
                 args=(segment_queue, workspace, metadata, obsidian, whisper_client),
             )
             capture_finished = False
+            capture_announced = False
 
             with whisper_server:
                 segment_thread.start()
@@ -262,12 +264,31 @@ class SessionCoordinator:
                             )
                             capture_finished = True
                             break
+                        self._raise_thread_error_if_any()
+                        if self._stop_event.is_set():
+                            logger.info("收到停止请求，开始收尾。")
+                            _emit_progress(
+                                self.on_progress,
+                                "stopping",
+                                "正在停止录音并收尾。",
+                                session_id=metadata.session_id,
+                            )
+                            capture_finished = True
+                            break
                         if capture.error:
                             raise AudioCaptureError(str(capture.error))
                         if not capture.is_alive:
                             raise AudioCaptureError("音频采集线程已停止。")
-                        self._raise_thread_error_if_any()
-                        time.sleep(0.25)
+                        if self._stop_event.wait(0.25):
+                            logger.info("收到停止请求，开始收尾。")
+                            _emit_progress(
+                                self.on_progress,
+                                "stopping",
+                                "正在停止录音并收尾。",
+                                session_id=metadata.session_id,
+                            )
+                            capture_finished = True
+                            break
                 except KeyboardInterrupt:
                     logger.info("收到停止信号，开始收尾。")
                     capture_finished = True
@@ -280,9 +301,7 @@ class SessionCoordinator:
                 finally:
                     capture.stop()
                     capture.join(timeout=5)
-                    _enqueue_with_retry(frame_queue, FRAME_STOP)
-                    segment_thread.join()
-                    if capture_finished:
+                    if capture_finished and not capture_announced:
                         metadata = workspace.update_status("finalizing")
                         _emit_progress(
                             self.on_progress,
@@ -290,6 +309,9 @@ class SessionCoordinator:
                             "录音已停止，后台继续转写、精修和整理。",
                             session_id=metadata.session_id,
                         )
+                        capture_announced = True
+                    _enqueue_with_retry(frame_queue, FRAME_STOP)
+                    segment_thread.join()
                     transcribe_thread.join()
 
             self._raise_thread_error_if_any()
@@ -427,6 +449,7 @@ class SessionCoordinator:
                         break
                     if item is FRAME_PAUSE:
                         emit_segments(segmenter.flush())
+                        _enqueue_with_retry(segment_queue, SEGMENT_CONTEXT_RESET)
                         continue
                     if item is FRAME_RESUME:
                         continue
@@ -455,11 +478,15 @@ class SessionCoordinator:
         whisper_client: WhisperInferenceClient,
     ) -> None:
         logger = workspace.session_logger()
+        prompt_entries: list[TranscriptEntry] = []
         try:
             while True:
                 item = segment_queue.get()
                 if item is SEGMENT_STOP:
                     break
+                if item is SEGMENT_CONTEXT_RESET:
+                    prompt_entries.clear()
+                    continue
                 assert isinstance(item, PendingSegment)
                 success = _process_segment(
                     pending=item,
@@ -469,6 +496,7 @@ class SessionCoordinator:
                     whisper_client=whisper_client,
                     logger=logger,
                     entries=self.entries,
+                    context_entries=prompt_entries,
                     live_status="live",
                     sample_rate=self.config.audio.sample_rate,
                 )
@@ -671,23 +699,24 @@ def finalize_session(
 
     obsidian = ObsidianClient(config.obsidian)
     llm_client = OpenAiCompatibleClient(config.llm)
-    whisper_config = _runtime_whisper_config(config.whisper, metadata.language)
     metadata = workspace.update_status("finalizing")
 
     missing = [
         state for state in workspace.rebuild_segment_states() if state.wav_path and not state.text
     ]
-    _recover_session_segments(
-        workspace=workspace,
-        metadata=metadata,
-        whisper_config=whisper_config,
-        logger=logger,
-        states=missing,
-        on_progress=on_progress,
-        verb="补转写",
-        status="transcribing",
-        seed_entries=workspace.transcript_entries(),
-    )
+    if missing:
+        whisper_config = _runtime_whisper_config(config.whisper, metadata.language)
+        _recover_session_segments(
+            workspace=workspace,
+            metadata=metadata,
+            whisper_config=whisper_config,
+            logger=logger,
+            states=missing,
+            on_progress=on_progress,
+            verb="补转写",
+            status="transcribing",
+            seed_entries=workspace.transcript_entries(),
+        )
 
     publish_final_outputs(
         workspace,
@@ -1414,14 +1443,16 @@ def _process_segment(
     logger: logging.Logger,
     entries: list[TranscriptEntry],
     live_status: str,
+    context_entries: list[TranscriptEntry] | None = None,
     sample_rate: int | None = None,
 ) -> bool:
     try:
+        prompt_entries = context_entries if context_entries is not None else entries
         text = _transcribe_segment_text(
             whisper_client=whisper_client,
             wav_path=pending.wav_path,
             language=metadata.language,
-            entries=entries,
+            entries=prompt_entries,
             pcm16=pending.pcm16,
             sample_rate=sample_rate,
         )
@@ -1433,14 +1464,15 @@ def _process_segment(
             pending.ended_ms,
             text,
         )
-        entries.append(
-            TranscriptEntry(
-                segment_id=pending.segment_id,
-                started_ms=pending.started_ms,
-                ended_ms=pending.ended_ms,
-                text=text,
-            )
+        entry = TranscriptEntry(
+            segment_id=pending.segment_id,
+            started_ms=pending.started_ms,
+            ended_ms=pending.ended_ms,
+            text=text,
         )
+        entries.append(entry)
+        if context_entries is not None:
+            context_entries.append(entry)
         content = build_transcript_note(metadata, list(entries), status=live_status)
         workspace.write_transcript(content)
         try_sync_note(

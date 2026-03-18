@@ -97,6 +97,16 @@ class SessionWorkspace:
             if event.kind == "segment_transcribed":
                 text = event.text
                 error = None
+                if event.speaker_label is not None:
+                    current = SegmentState(
+                        segment_id=current.segment_id,
+                        started_ms=current.started_ms,
+                        ended_ms=current.ended_ms,
+                        wav_path=current.wav_path,
+                        text=current.text,
+                        error=current.error,
+                        speaker_label=event.speaker_label,
+                    )
             elif event.kind == "segment_failed":
                 error = event.error
             else:
@@ -111,6 +121,11 @@ class SessionWorkspace:
                 wav_path=wav_path,
                 text=text,
                 error=error,
+                speaker_label=(
+                    event.speaker_label
+                    if event.speaker_label is not None
+                    else current.speaker_label
+                ),
             )
         return sorted(states.values(), key=lambda item: (item.started_ms, item.segment_id))
 
@@ -121,6 +136,7 @@ class SessionWorkspace:
                 started_ms=state.started_ms,
                 ended_ms=state.ended_ms,
                 text=state.text,
+                speaker_label=state.speaker_label,
             )
             for state in self.rebuild_segment_states(journal_path=journal_path)
             if state.text
@@ -182,6 +198,7 @@ class SessionWorkspace:
         started_ms: int,
         ended_ms: int,
         text: str,
+        speaker_label: str | None = None,
         journal_path: Path | None = None,
     ) -> None:
         self.append_event(
@@ -192,6 +209,7 @@ class SessionWorkspace:
                 ended_ms=ended_ms,
                 text=text,
                 created_at=iso_now(),
+                speaker_label=speaker_label,
             ),
             journal_path=journal_path,
         )
@@ -217,10 +235,19 @@ class SessionWorkspace:
         )
 
 
-def _render_toml(values: dict[str, str]) -> str:
+def _render_toml(values: dict[str, object]) -> str:
     rendered = []
     for key, value in values.items():
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        if value is None:
+            rendered.append(f"{key} = \"\"")
+            continue
+        if isinstance(value, bool):
+            rendered.append(f"{key} = {'true' if value else 'false'}")
+            continue
+        if isinstance(value, int | float):
+            rendered.append(f"{key} = {value}")
+            continue
+        escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
         rendered.append(f'{key} = "{escaped}"')
     return "\n".join(rendered) + "\n"
 

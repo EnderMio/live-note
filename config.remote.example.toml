@@ -9,7 +9,7 @@ queue_size = 256
 save_session_wav = true
 
 [import]
-ffmpeg_binary = "ffmpeg"
+ffmpeg_binary = "/opt/homebrew/bin/ffmpeg"
 chunk_seconds = 45
 keep_normalized_audio = false
 
@@ -18,8 +18,8 @@ enabled = true
 auto_after_live = true
 
 [whisper]
-binary = "~/whisper.cpp/build/bin/whisper-server"
-model = "~/whisper.cpp/models/ggml-large-v3-turbo.bin"
+binary = "/Users/your-user/whisper.cpp/build/bin/whisper-server"
+model = "/Users/your-user/whisper.cpp/models/ggml-large-v3.bin"
 host = "127.0.0.1"
 port = 8178
 threads = 4
@@ -29,7 +29,7 @@ request_timeout_seconds = 120
 startup_timeout_seconds = 45
 
 [obsidian]
-enabled = true
+enabled = false
 base_url = "https://127.0.0.1:27124"
 transcript_dir = "Sessions/Transcripts"
 structured_dir = "Sessions/Summaries"
@@ -55,9 +55,9 @@ timeout_seconds = 20
 live_chunk_ms = 240
 
 [serve]
-host = "127.0.0.1"
+host = "0.0.0.0"
 port = 8765
-api_token = ""
+api_token = "replace-me"
 
 [funasr]
 base_url = "ws://127.0.0.1:10095"

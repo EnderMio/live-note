@@ -59,6 +59,52 @@ class RendererTests(unittest.TestCase):
         self.assertIn("## 待复核段落", content)
         self.assertIn("session.live.wav", content)
 
+    def test_build_transcript_note_prefixes_speaker_labels(self) -> None:
+        content = build_transcript_note(
+            self.metadata,
+            [
+                TranscriptEntry(
+                    segment_id="seg-00001",
+                    started_ms=0,
+                    ended_ms=2500,
+                    text="今天讲梯度下降。",
+                    speaker_label="Speaker 2",
+                )
+            ],
+            status="live",
+        )
+
+        self.assertIn("- [00:00:00] Speaker 2: 今天讲梯度下降。", content)
+
+    def test_build_transcript_note_includes_remote_metadata_when_present(self) -> None:
+        metadata = SessionMetadata(
+            session_id="20260315-210500-机器学习",
+            title="机器学习导论",
+            kind="lecture",
+            input_mode="live",
+            source_label="MacBook Pro 麦克风",
+            source_ref="1",
+            language="zh",
+            started_at="2026-03-15T13:05:00+00:00",
+            transcript_note_path="Sessions/Transcripts/2026-03-15/机器学习导论-210500.md",
+            structured_note_path="Sessions/Summaries/2026-03-15/机器学习导论-210500.md",
+            session_dir="/tmp/session",
+            status="live",
+            transcript_source="live",
+            refine_status="pending",
+            execution_target="remote",
+            remote_session_id="remote-123",
+            speaker_status="done",
+        )
+
+        content = build_transcript_note(metadata, [], status="live")
+
+        self.assertIn('execution_target: "remote"', content)
+        self.assertIn('speaker_status: "done"', content)
+        self.assertIn("- 运行位置: `remote`", content)
+        self.assertIn("- 远端会话: `remote-123`", content)
+        self.assertIn("- 说话人区分: `done`", content)
+
     def test_build_structured_failure_note_links_back_to_transcript(self) -> None:
         content = build_structured_failure_note(
             self.metadata,
@@ -79,3 +125,20 @@ class RendererTests(unittest.TestCase):
         self.assertIn("## 生成说明", content)
         self.assertIn("## 关键点", content)
         self.assertIn("## 时间线", content)
+
+    def test_build_transcript_note_prefixes_speaker_label_when_present(self) -> None:
+        content = build_transcript_note(
+            self.metadata,
+            [
+                TranscriptEntry(
+                    segment_id="seg-00001",
+                    started_ms=0,
+                    ended_ms=2500,
+                    text="今天讲梯度下降。",
+                    speaker_label="Speaker 2",
+                )
+            ],
+            status="live",
+        )
+
+        self.assertIn("- [00:00:00] Speaker 2: 今天讲梯度下降。", content)

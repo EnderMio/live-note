@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from live_note.app.cli import main
+from live_note.app.cli import build_parser, main
 
 
 class CliTests(unittest.TestCase):
@@ -63,12 +63,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         launch_gui_mock.assert_called_once_with(Path("/tmp/gui.toml"))
 
-    def test_gui_preview_qt_command_dispatches_to_launcher(self) -> None:
-        with patch("live_note.app.cli.launch_gui_preview_qt", return_value=0) as preview_mock:
-            exit_code = main(["gui-preview-qt"])
-
-        self.assertEqual(0, exit_code)
-        preview_mock.assert_called_once_with()
+    def test_gui_preview_qt_command_is_not_available(self) -> None:
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["gui-preview-qt"])
 
     def test_doctor_uses_service_checks(self) -> None:
         service = Mock()
@@ -83,6 +80,34 @@ class CliTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         service.doctor_checks.assert_called_once()
         print_mock.assert_called_once_with("[OK] config: 已加载 /tmp/config.toml")
+
+    def test_serve_command_dispatches_to_launcher(self) -> None:
+        with patch("live_note.app.cli.launch_remote_server", return_value=0) as serve_mock:
+            exit_code = main(["--config", "/tmp/live-note.toml", "serve"])
+
+        self.assertEqual(0, exit_code)
+        serve_mock.assert_called_once_with(Path("/tmp/live-note.toml"))
+
+    def test_remote_deploy_command_dispatches_to_launcher(self) -> None:
+        with patch("live_note.app.cli.launch_remote_deploy", return_value=0) as deploy_mock:
+            exit_code = main(
+                [
+                    "remote-deploy",
+                    "--host",
+                    "ender@172.21.0.159",
+                    "--speaker",
+                    "--skip-deps",
+                    "--dry-run",
+                ]
+            )
+
+        self.assertEqual(0, exit_code)
+        deploy_mock.assert_called_once()
+        args = deploy_mock.call_args.args[0]
+        self.assertEqual("ender@172.21.0.159", args.host)
+        self.assertTrue(args.speaker)
+        self.assertTrue(args.skip_deps)
+        self.assertTrue(args.dry_run)
 
     def test_retranscribe_command_dispatches_to_coordinator(self) -> None:
         with patch(

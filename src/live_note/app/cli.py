@@ -12,6 +12,7 @@ from live_note.app.coordinator import (
     refine_session,
     retranscribe_session,
 )
+from live_note.app.remote_coordinator import RemoteLiveCoordinator
 from live_note.app.services import AppService
 from live_note.audio.capture import AudioCaptureError, list_input_devices
 from live_note.config import load_config
@@ -28,7 +29,62 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("doctor", help="检查依赖、配置与外部服务")
     subparsers.add_parser("devices", help="列出输入设备")
     subparsers.add_parser("gui", help="启动桌面界面")
-    subparsers.add_parser("gui-preview-qt", help="启动 Qt 毛玻璃悬浮窗预览")
+    subparsers.add_parser("serve", help="启动局域网远端转写服务")
+    remote_deploy_parser = subparsers.add_parser(
+        "remote-deploy",
+        help="同步代码到远端机器，并安装/更新 launchd 常驻服务",
+    )
+    remote_deploy_parser.add_argument(
+        "--host",
+        required=True,
+        help="远端 SSH 地址，例如 ender@mini.local",
+    )
+    remote_deploy_parser.add_argument("--remote-dir", default="~/live-note", help="远端项目目录")
+    remote_deploy_parser.add_argument(
+        "--data-dir",
+        default="~/Library/Application Support/live-note",
+        help="远端配置与 token 存放目录",
+    )
+    remote_deploy_parser.add_argument(
+        "--config-path",
+        default="~/Library/Application Support/live-note/config.remote.toml",
+        help="远端 serve 配置文件路径",
+    )
+    remote_deploy_parser.add_argument(
+        "--label",
+        default="com.live-note.remote",
+        help="launchd 服务标识",
+    )
+    remote_deploy_parser.add_argument(
+        "--remote-home",
+        default=None,
+        help="远端用户 home 目录，默认按 /Users/<ssh-user> 推断",
+    )
+    remote_deploy_parser.add_argument(
+        "--python-bin",
+        default="python3",
+        help="远端用于创建虚拟环境的 Python 命令",
+    )
+    remote_deploy_parser.add_argument(
+        "--speaker",
+        action="store_true",
+        help="同时安装说话人区分依赖",
+    )
+    remote_deploy_parser.add_argument(
+        "--skip-deps",
+        action="store_true",
+        help="跳过远端依赖安装，仅同步代码与服务配置",
+    )
+    remote_deploy_parser.add_argument(
+        "--no-start",
+        action="store_true",
+        help="只安装服务，不立即重启 launchd",
+    )
+    remote_deploy_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="仅打印将执行的命令，不真正连接远端",
+    )
 
     start_parser = subparsers.add_parser("start", help="开始一场实时转写会话")
     start_parser.add_argument("--title", help="会话标题，例如 周会 / 机器学习导论")
@@ -76,8 +132,10 @@ def main(argv: list[str] | None = None) -> int:
         return command_devices()
     if args.command == "gui":
         return launch_gui(Path(args.config))
-    if args.command == "gui-preview-qt":
-        return launch_gui_preview_qt()
+    if args.command == "serve":
+        return launch_remote_server(Path(args.config))
+    if args.command == "remote-deploy":
+        return launch_remote_deploy(args)
     if args.command == "doctor":
         return command_doctor(Path(args.config))
 
@@ -92,7 +150,12 @@ def main(argv: list[str] | None = None) -> int:
         if not title:
             print("start 命令需要提供 --title", file=sys.stderr)
             return 1
-        runner = SessionCoordinator(
+        coordinator_cls = (
+            RemoteLiveCoordinator
+            if getattr(getattr(config, "remote", None), "enabled", False)
+            else SessionCoordinator
+        )
+        runner = coordinator_cls(
             config=config,
             title=title,
             source=args.source,
@@ -154,18 +217,31 @@ def launch_gui(config_path: Path) -> int:
     return launch_gui_impl(config_path)
 
 
-def launch_gui_preview_qt() -> int:
-    try:
-        from live_note.app.gui_qt_preview import launch_gui_preview_qt as launch_preview_impl
-    except ImportError as exc:
-        print(
-            "Qt 预览依赖未安装。请先运行 `make setup-gui` 或 "
-            "`python3 -m pip install -e \".[gui]\"`。",
-            file=sys.stderr,
-        )
-        print(exc, file=sys.stderr)
-        return 1
-    return launch_preview_impl()
+def launch_remote_server(config_path: Path) -> int:
+    from live_note.remote.server import serve_remote_app
+
+    return serve_remote_app(config_path)
+
+
+def launch_remote_deploy(args: argparse.Namespace) -> int:
+    from live_note.remote.deploy import RemoteDeployOptions, deploy_remote_service
+
+    return deploy_remote_service(
+        project_root=Path.cwd(),
+        options=RemoteDeployOptions(
+            host=args.host,
+            remote_dir=args.remote_dir,
+            data_dir=args.data_dir,
+            config_path=args.config_path,
+            label=args.label,
+            remote_home=args.remote_home,
+            python_bin=args.python_bin,
+            speaker=args.speaker,
+            skip_deps=args.skip_deps,
+            start_service=not args.no_start,
+            dry_run=args.dry_run,
+        ),
+    )
 
 
 def _resolve_kind(kind: str, profile_legacy: str | None) -> str:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 
@@ -70,6 +70,39 @@ class LlmConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RemoteConfig:
+    enabled: bool = False
+    base_url: str = "http://127.0.0.1:8765"
+    api_token: str | None = None
+    timeout_seconds: int = 20
+    live_chunk_ms: int = 240
+
+
+@dataclass(frozen=True, slots=True)
+class ServeConfig:
+    host: str = "127.0.0.1"
+    port: int = 8765
+    api_token: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FunAsrConfig:
+    base_url: str = "ws://127.0.0.1:10095"
+    mode: str = "2pass"
+    use_itn: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerConfig:
+    enabled: bool = False
+    segmentation_model: Path | None = None
+    embedding_model: Path | None = None
+    cluster_threshold: float = 0.5
+    min_duration_on: float = 0.3
+    min_duration_off: float = 0.5
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     audio: AudioConfig
     importer: ImportConfig
@@ -78,6 +111,19 @@ class AppConfig:
     obsidian: ObsidianConfig
     llm: LlmConfig
     root_dir: Path
+    remote: RemoteConfig = field(default_factory=RemoteConfig)
+    serve: ServeConfig = field(default_factory=ServeConfig)
+    funasr: FunAsrConfig = field(default_factory=FunAsrConfig)
+    speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
+
+
+def with_refine_auto_after_live(config: AppConfig, auto_after_live: bool | None) -> AppConfig:
+    if auto_after_live is None or config.refine.auto_after_live == auto_after_live:
+        return config
+    return replace(
+        config,
+        refine=replace(config.refine, auto_after_live=auto_after_live),
+    )
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -114,10 +160,17 @@ def load_config(config_path: Path | None = None, env_path: Path | None = None) -
     whisper_data = data.get("whisper", {})
     obsidian_data = data.get("obsidian", {})
     llm_data = data.get("llm", {})
+    remote_data = data.get("remote", {})
+    serve_data = data.get("serve", {})
+    funasr_data = data.get("funasr", {})
+    speaker_data = data.get("speaker", {})
 
     model_path = Path(str(whisper_data["model"])).expanduser()
     if not model_path.is_absolute():
         model_path = (root_dir / model_path).resolve()
+
+    segmentation_model = _resolve_optional_path(root_dir, speaker_data.get("segmentation_model"))
+    embedding_model = _resolve_optional_path(root_dir, speaker_data.get("embedding_model"))
 
     llm_requires_openai_auth = bool(llm_data.get("requires_openai_auth", False))
     llm_api_key = merged_env.get("LLM_API_KEY")
@@ -170,6 +223,33 @@ def load_config(config_path: Path | None = None, env_path: Path | None = None) -
             requires_openai_auth=llm_requires_openai_auth,
             timeout_seconds=int(llm_data.get("timeout_seconds", 45)),
             api_key=llm_api_key,
+        ),
+        remote=RemoteConfig(
+            enabled=bool(remote_data.get("enabled", False)),
+            base_url=str(remote_data.get("base_url", "http://127.0.0.1:8765")).rstrip("/"),
+            api_token=(
+                str(remote_data["api_token"]).strip() if remote_data.get("api_token") else None
+            ),
+            timeout_seconds=int(remote_data.get("timeout_seconds", 20)),
+            live_chunk_ms=int(remote_data.get("live_chunk_ms", 240)),
+        ),
+        serve=ServeConfig(
+            host=str(serve_data.get("host", "127.0.0.1")),
+            port=int(serve_data.get("port", 8765)),
+            api_token=str(serve_data["api_token"]).strip() if serve_data.get("api_token") else None,
+        ),
+        funasr=FunAsrConfig(
+            base_url=str(funasr_data.get("base_url", "ws://127.0.0.1:10095")).rstrip("/"),
+            mode=str(funasr_data.get("mode", "2pass")),
+            use_itn=bool(funasr_data.get("use_itn", True)),
+        ),
+        speaker=SpeakerConfig(
+            enabled=bool(speaker_data.get("enabled", False)),
+            segmentation_model=segmentation_model,
+            embedding_model=embedding_model,
+            cluster_threshold=float(speaker_data.get("cluster_threshold", 0.5)),
+            min_duration_on=float(speaker_data.get("min_duration_on", 0.3)),
+            min_duration_off=float(speaker_data.get("min_duration_off", 0.5)),
         ),
         root_dir=root_dir,
     )
@@ -244,6 +324,43 @@ def render_config(config: AppConfig) -> str:
                 "timeout_seconds": config.llm.timeout_seconds,
             },
         ),
+        (
+            "remote",
+            {
+                "enabled": config.remote.enabled,
+                "base_url": config.remote.base_url,
+                "api_token": config.remote.api_token or "",
+                "timeout_seconds": config.remote.timeout_seconds,
+                "live_chunk_ms": config.remote.live_chunk_ms,
+            },
+        ),
+        (
+            "serve",
+            {
+                "host": config.serve.host,
+                "port": config.serve.port,
+                "api_token": config.serve.api_token or "",
+            },
+        ),
+        (
+            "funasr",
+            {
+                "base_url": config.funasr.base_url,
+                "mode": config.funasr.mode,
+                "use_itn": config.funasr.use_itn,
+            },
+        ),
+        (
+            "speaker",
+            {
+                "enabled": config.speaker.enabled,
+                "segmentation_model": str(config.speaker.segmentation_model or ""),
+                "embedding_model": str(config.speaker.embedding_model or ""),
+                "cluster_threshold": config.speaker.cluster_threshold,
+                "min_duration_on": config.speaker.min_duration_on,
+                "min_duration_off": config.speaker.min_duration_off,
+            },
+        ),
     ]
     lines: list[str] = []
     for section_name, values in sections:
@@ -291,3 +408,15 @@ def _normalize_wire_api(value: str) -> str:
     if normalized == "responses":
         return "responses"
     return value.strip() or "chat_completions"
+
+
+def _resolve_optional_path(root_dir: Path, value: object) -> Path | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return path
+    return (root_dir / path).resolve()

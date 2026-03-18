@@ -2,17 +2,17 @@ PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 PYTHONPATH := src
 ARGS ?=
 
-.PHONY: setup setup-gui dev gui gui-preview-qt doctor devices import finalize retranscribe refine merge test lint
+.PHONY: setup setup-speaker dev gui serve deploy-remote doctor devices import finalize retranscribe refine merge test lint
 
 setup:
 	$(PYTHON) -m venv .venv
 	.venv/bin/pip install --upgrade pip
 	.venv/bin/pip install -e ".[dev]"
 
-setup-gui:
+setup-speaker:
 	$(PYTHON) -m venv .venv
 	.venv/bin/pip install --upgrade pip
-	.venv/bin/pip install -e ".[dev,gui]"
+	.venv/bin/pip install -e ".[dev,speaker]"
 
 dev:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note start $(ARGS)
@@ -20,8 +20,11 @@ dev:
 gui:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note gui $(ARGS)
 
-gui-preview-qt:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note gui-preview-qt $(ARGS)
+serve:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note serve $(ARGS)
+
+deploy-remote:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note remote-deploy $(ARGS)
 
 doctor:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note doctor
