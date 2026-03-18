@@ -11,6 +11,7 @@ from unittest.mock import ANY, MagicMock, Mock, patch
 from live_note.app.events import ProgressEvent
 from live_note.app.gui import (
     LiveNoteGui,
+    _build_execution_target_hint,
     _build_vertical_scroller,
     _language_code_to_display,
     _normalize_language_value,
@@ -18,6 +19,7 @@ from live_note.app.gui import (
     _summary_supports_refine,
     _wrap_action_rows,
 )
+from live_note.app.services import DoctorCheck
 from live_note.app.task_queue import QueueLoadResult, build_task_record
 
 
@@ -33,6 +35,21 @@ class GuiLanguageTests(unittest.TestCase):
 
     def test_language_code_to_display_returns_known_label(self) -> None:
         self.assertEqual("中文（zh）", _language_code_to_display("zh", allow_blank=False))
+
+    def test_build_execution_target_hint_uses_local_when_remote_disabled(self) -> None:
+        self.assertEqual("当前转写：本机", _build_execution_target_hint(False, "", None))
+
+    def test_build_execution_target_hint_marks_remote_as_connected(self) -> None:
+        self.assertEqual(
+            "当前转写：远端服务（172.21.0.159，已连接）",
+            _build_execution_target_hint(True, "http://172.21.0.159:8765", "OK"),
+        )
+
+    def test_build_execution_target_hint_marks_remote_as_unreachable(self) -> None:
+        self.assertEqual(
+            "当前转写：远端服务（172.21.0.159，未连通）",
+            _build_execution_target_hint(True, "http://172.21.0.159:8765", "FAIL"),
+        )
 
 
 class GuiHistoryTests(unittest.TestCase):
@@ -82,6 +99,219 @@ class GuiHistoryTests(unittest.TestCase):
 
 
 class GuiTaskTests(unittest.TestCase):
+    def test_parse_live_auto_stop_seconds_accepts_decimal_minutes(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.live_stop_after_minutes_var = SimpleNamespace(get=lambda: "1.5")
+
+        self.assertEqual(90, gui._parse_live_auto_stop_seconds())
+
+    def test_parse_live_auto_stop_seconds_treats_blank_as_disabled(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.live_stop_after_minutes_var = SimpleNamespace(get=lambda: " ")
+
+        self.assertIsNone(gui._parse_live_auto_stop_seconds())
+
+    def test_build_settings_tab_includes_remote_client_section(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        for name in [
+            "ffmpeg_var",
+            "whisper_binary_var",
+            "whisper_model_var",
+            "whisper_host_var",
+            "whisper_port_var",
+            "whisper_threads_var",
+            "whisper_language_var",
+            "whisper_translate_var",
+            "save_session_wav_var",
+            "refine_enabled_var",
+            "refine_auto_after_live_var",
+            "obsidian_enabled_var",
+            "obsidian_base_url_var",
+            "obsidian_transcript_dir_var",
+            "obsidian_structured_dir_var",
+            "obsidian_verify_ssl_var",
+            "obsidian_api_key_var",
+            "llm_enabled_var",
+            "llm_base_url_var",
+            "llm_model_var",
+            "llm_stream_var",
+            "llm_wire_api_var",
+            "llm_requires_openai_auth_var",
+            "llm_api_key_var",
+            "remote_enabled_var",
+            "remote_base_url_var",
+            "remote_api_token_var",
+            "remote_live_chunk_ms_var",
+        ]:
+            setattr(gui, name, object())
+        gui._autodetect_settings = Mock()
+        gui._save_settings = Mock()
+        gui._refresh_doctor_checks = Mock()
+        gui._open_path = Mock()
+        gui.service = SimpleNamespace(
+            config_path=Path("/tmp/config.toml"),
+            env_path=Path("/tmp/.env"),
+        )
+
+        content = MagicMock()
+        frame_texts: list[str] = []
+
+        def widget_factory(*_args, **kwargs):
+            widget = MagicMock()
+            widget.grid = Mock()
+            widget.columnconfigure = Mock()
+            widget.heading = Mock()
+            widget.column = Mock()
+            return widget
+
+        def label_frame_factory(*_args, **kwargs):
+            frame_texts.append(kwargs.get("text", ""))
+            return widget_factory()
+
+        with (
+            patch("live_note.app.gui._build_vertical_scroller", return_value=content),
+            patch("live_note.app.gui.ttk.Frame", side_effect=widget_factory),
+            patch("live_note.app.gui.ttk.Button", side_effect=widget_factory),
+            patch("live_note.app.gui.ttk.Checkbutton", side_effect=widget_factory),
+            patch("live_note.app.gui.ttk.Label", side_effect=widget_factory),
+            patch("live_note.app.gui.ttk.Treeview", side_effect=widget_factory),
+            patch("live_note.app.gui.ttk.LabelFrame", side_effect=label_frame_factory),
+            patch("live_note.app.gui._entry_row"),
+            patch("live_note.app.gui._entry_row_with_button"),
+            patch("live_note.app.gui._combobox_row"),
+            patch("live_note.app.gui._language_row"),
+        ):
+            gui._build_settings_tab(MagicMock())
+
+        self.assertIn("远端转写", frame_texts)
+
+    def test_refresh_doctor_checks_updates_execution_target_hint(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.service = SimpleNamespace(
+            doctor_checks=lambda: [
+                DoctorCheck(
+                    "remote_health",
+                    "OK",
+                    "连通 http://172.21.0.159:8765 | live-note-remote",
+                )
+            ]
+        )
+        gui.doctor_tree = MagicMock()
+        gui.remote_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.remote_base_url_var = SimpleNamespace(get=lambda: "http://172.21.0.159:8765")
+        gui.execution_target_var = SimpleNamespace(set=Mock())
+
+        gui._refresh_doctor_checks()
+
+        gui.execution_target_var.set.assert_called_once_with(
+            "当前转写：远端服务（172.21.0.159，已连接）"
+        )
+
+    def test_start_live_session_logs_current_execution_target(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        runner = Mock()
+        gui._ensure_ready_for_run = Mock(return_value=True)
+        gui.live_title_var = SimpleNamespace(get=lambda: "产品周会")
+        gui.live_devices = [SimpleNamespace(index=2)]
+        gui.live_device_combo = SimpleNamespace(current=lambda: 0)
+        gui.service = SimpleNamespace(create_live_coordinator=Mock(return_value=runner))
+        gui.live_kind_var = SimpleNamespace(get=lambda: "meeting")
+        gui.live_language_var = SimpleNamespace(get=lambda: "沿用默认设置")
+        gui.live_auto_refine_var = SimpleNamespace(get=lambda: True)
+        gui.live_stop_after_minutes_var = SimpleNamespace(get=lambda: "")
+        gui.refine_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.save_session_wav_var = SimpleNamespace(get=lambda: True)
+        gui._progress_callback = Mock(return_value=Mock())
+        gui._next_task_id = Mock(return_value="task-1")
+        gui._start_live_task = Mock()
+        gui._arm_live_auto_stop = Mock()
+        gui.stop_live_button = MagicMock()
+        gui.pause_live_button = MagicMock()
+        gui.execution_target_var = SimpleNamespace(
+            get=lambda: "当前转写：远端服务（172.21.0.159，已连接）"
+        )
+        gui._append_log = Mock()
+
+        gui._start_live_session()
+
+        gui._append_log.assert_called_once_with("当前转写：远端服务（172.21.0.159，已连接）")
+        gui._arm_live_auto_stop.assert_called_once_with(None)
+
+    def test_start_live_session_passes_auto_refine_choice(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        runner = Mock()
+        gui._ensure_ready_for_run = Mock(return_value=True)
+        gui.live_title_var = SimpleNamespace(get=lambda: "产品周会")
+        gui.live_devices = [SimpleNamespace(index=2)]
+        gui.live_device_combo = SimpleNamespace(current=lambda: 0)
+        gui.service = SimpleNamespace(create_live_coordinator=Mock(return_value=runner))
+        gui.live_kind_var = SimpleNamespace(get=lambda: "meeting")
+        gui.live_language_var = SimpleNamespace(get=lambda: "沿用默认设置")
+        gui.live_auto_refine_var = SimpleNamespace(get=lambda: False)
+        gui.live_stop_after_minutes_var = SimpleNamespace(get=lambda: "15")
+        gui.refine_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.save_session_wav_var = SimpleNamespace(get=lambda: True)
+        gui._progress_callback = Mock(return_value=Mock())
+        gui._next_task_id = Mock(return_value="task-1")
+        gui._start_live_task = Mock()
+        gui._arm_live_auto_stop = Mock()
+        gui.stop_live_button = MagicMock()
+        gui.pause_live_button = MagicMock()
+        gui.execution_target_var = SimpleNamespace(get=lambda: "当前转写：本机")
+        gui._append_log = Mock()
+
+        gui._start_live_session()
+
+        gui.service.create_live_coordinator.assert_called_once_with(
+            title="产品周会",
+            source="2",
+            kind="meeting",
+            language=None,
+            on_progress=ANY,
+            auto_refine_after_live=False,
+        )
+        gui._arm_live_auto_stop.assert_called_once_with(900)
+
+    def test_toggle_live_pause_pauses_and_resumes_auto_stop(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        runner = SimpleNamespace(is_paused=False, request_pause=Mock(), request_resume=Mock())
+        gui.current_live_runner = runner
+        gui.pause_live_button = MagicMock()
+        gui._append_log = Mock()
+        gui._pause_live_auto_stop = Mock()
+        gui._resume_live_auto_stop = Mock()
+
+        gui._toggle_live_pause()
+
+        runner.request_pause.assert_called_once_with()
+        gui._pause_live_auto_stop.assert_called_once_with()
+
+        runner = SimpleNamespace(is_paused=True, request_pause=Mock(), request_resume=Mock())
+        gui.current_live_runner = runner
+        gui.pause_live_button = MagicMock()
+        gui._append_log = Mock()
+        gui._pause_live_auto_stop = Mock()
+        gui._resume_live_auto_stop = Mock()
+
+        gui._toggle_live_pause()
+
+        runner.request_resume.assert_called_once_with()
+        gui._resume_live_auto_stop.assert_called_once_with()
+
+    def test_request_live_stop_cancels_auto_stop_timer(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.current_live_runner = SimpleNamespace(request_stop=Mock())
+        gui.stop_live_button = MagicMock()
+        gui.pause_live_button = MagicMock()
+        gui._cancel_live_auto_stop = Mock()
+        gui._append_log = Mock()
+
+        gui._request_live_stop("已到自动停止时间，等待当前片段收尾。")
+
+        gui.current_live_runner.request_stop.assert_called_once_with()
+        gui._cancel_live_auto_stop.assert_called_once_with()
+        gui._append_log.assert_called_once_with("已到自动停止时间，等待当前片段收尾。")
+
     def test_summary_supports_refine_when_live_segments_can_be_reconstructed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             session_dir = Path(temp_dir)
@@ -229,17 +459,41 @@ class GuiTaskTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             gui = LiveNoteGui.__new__(LiveNoteGui)
             gui.retry_refine_button = MagicMock()
+            gui.merge_sessions_button = MagicMock()
 
             gui._update_history_action_states(
                 [
                     SimpleNamespace(
                         input_mode="live",
                         session_dir=Path(temp_dir),
+                        execution_target="local",
                     )
                 ]
             )
 
         gui.retry_refine_button.configure.assert_called_once_with(state="disabled")
+
+    def test_update_history_action_states_disables_merge_for_remote_sessions(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.retry_refine_button = MagicMock()
+        gui.merge_sessions_button = MagicMock()
+
+        gui._update_history_action_states(
+            [
+                SimpleNamespace(
+                    input_mode="file",
+                    session_dir=Path("/tmp/a"),
+                    execution_target="remote",
+                ),
+                SimpleNamespace(
+                    input_mode="file",
+                    session_dir=Path("/tmp/b"),
+                    execution_target="local",
+                ),
+            ]
+        )
+
+        gui.merge_sessions_button.configure.assert_called_once_with(state="disabled")
 
     def test_retry_retranscribe_enqueues_queue_task(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
@@ -253,6 +507,26 @@ class GuiTaskTests(unittest.TestCase):
             label="重转写并重写",
             action="session_action",
             payload={"action": "retranscribe", "session_id": "session-1"},
+        )
+
+    def test_merge_selected_sessions_rejects_remote_sessions(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui._selected_summaries = Mock(
+            return_value=[
+                SimpleNamespace(session_id="session-1", execution_target="remote"),
+                SimpleNamespace(session_id="session-2", execution_target="remote"),
+            ]
+        )
+        gui._ensure_queue_ready = Mock(return_value=True)
+        gui._enqueue_queue_task = Mock()
+
+        with patch("live_note.app.gui.messagebox.showinfo") as showinfo_mock:
+            gui._merge_selected_sessions()
+
+        gui._enqueue_queue_task.assert_not_called()
+        showinfo_mock.assert_called_once_with(
+            "暂不支持",
+            "远端会话暂不支持在桌面端直接合并，请先分别完成整理或后续在服务端处理。",
         )
 
     def test_maybe_start_next_queue_task_starts_first_record_when_idle(self) -> None:
