@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import queue
 import threading
 import time
@@ -27,7 +28,20 @@ def _load_sounddevice():
         import sounddevice as sd
     except ModuleNotFoundError as exc:
         raise AudioCaptureError("缺少 sounddevice 依赖。先运行 pip install -e .") from exc
+    _disable_sounddevice_atexit(sd)
     return sd
+
+
+def _disable_sounddevice_atexit(sd) -> None:
+    if getattr(sd, "_live_note_atexit_disabled", False):
+        return
+    exit_handler = getattr(sd, "_exit_handler", None)
+    if exit_handler is not None:
+        try:
+            atexit.unregister(exit_handler)
+        except Exception:
+            pass
+    setattr(sd, "_live_note_atexit_disabled", True)
 
 
 def list_input_devices() -> list[InputDevice]:

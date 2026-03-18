@@ -20,12 +20,15 @@ _CN_PROMPT_GUARD = (
     "只转写实际听到的语音。"
     "如果只有静音、背景噪声、音乐、掌声或环境声，请返回空字符串。"
     "不要补全，不要编造，不要输出“谢谢观看”“感谢观看”“欢迎订阅我的频道”“谢谢大家”等片尾话术。"
+    "如果结果只剩标点、破折号、重复短语或明显胡言乱语，也请返回空字符串。"
     "中文请使用简体中文。"
 )
 _EN_PROMPT_GUARD = (
     "Transcribe only audible speech. "
     "If the audio contains only silence, noise, music, applause, or ambient sound, "
     "return an empty string. "
+    "If the result would be only punctuation, dashes, "
+    "or a repeated short phrase, return an empty string. "
     "Do not invent outro phrases such as 'thanks for watching' or 'please subscribe'."
 )
 _AUTO_PROMPT_GUARD = (
@@ -33,7 +36,10 @@ _AUTO_PROMPT_GUARD = (
     "If the audio contains only silence, noise, music, applause, or ambient sound, "
     "return an empty string. "
     "Preserve the original spoken languages and scripts. "
+    "Use Simplified Chinese for Chinese text. "
     "If speakers switch languages, keep the mixed output instead of translating or rewriting. "
+    "If the result would be only punctuation, dashes, "
+    "or a repeated short phrase, return an empty string. "
     "Do not invent outro phrases such as 'thanks for watching' or 'please subscribe'."
 )
 _SUSPICIOUS_OUTRO_PHRASES = (
@@ -51,6 +57,7 @@ _SUSPICIOUS_OUTRO_PHRASES = (
     "感谢大家",
 )
 _PUNCTUATION_PATTERN = re.compile(r"[，。！？!?,.、：:；;“”\"'`·\s]+")
+_REPEATED_SPAN_PATTERN = re.compile(r"(.{1,8})\1{2,}")
 
 
 def build_transcription_prompt(language: str, entries: Sequence[TranscriptEntry]) -> str:
@@ -74,7 +81,7 @@ def normalize_transcript_text(
     if not normalized:
         return ""
 
-    if _should_simplify(language) and _SIMPLIFIER:
+    if _should_simplify(language, normalized) and _SIMPLIFIER:
         normalized = _SIMPLIFIER.convert(normalized)
     normalized = normalized.strip()
     if pcm16 and sample_rate and _should_drop_silence_hallucination(normalized, pcm16, sample_rate):
@@ -107,8 +114,12 @@ def _is_chinese_language(language: str) -> bool:
     return normalized == "zh" or normalized.startswith("zh-")
 
 
-def _should_simplify(language: str) -> bool:
-    return _is_chinese_language(language)
+def _should_simplify(language: str, text: str) -> bool:
+    if _is_chinese_language(language):
+        return True
+    if not _is_auto_language(language):
+        return False
+    return not _contains_japanese_kana(text)
 
 
 def _build_guard_prompt(language: str) -> str:
@@ -119,17 +130,43 @@ def _build_guard_prompt(language: str) -> str:
     return _EN_PROMPT_GUARD
 
 
+def _contains_japanese_kana(text: str) -> bool:
+    return any("\u3040" <= char <= "\u30ff" for char in text)
+
+
 def _should_drop_silence_hallucination(text: str, pcm16: bytes, sample_rate: int) -> bool:
+    if _looks_like_punctuation_noise(text):
+        return True
+
     cleaned = _normalize_phrase(text)
-    if not cleaned or len(cleaned) > 20:
-        return False
-    if not any(phrase in cleaned for phrase in _SUSPICIOUS_OUTRO_PHRASES):
-        return False
-    return _estimate_rms_ratio(pcm16) < _noise_floor_threshold(sample_rate)
+    if not cleaned:
+        return True
+
+    rms_ratio = _estimate_rms_ratio(pcm16)
+    noise_floor = _noise_floor_threshold(sample_rate)
+
+    if len(cleaned) <= 20 and any(phrase in cleaned for phrase in _SUSPICIOUS_OUTRO_PHRASES):
+        return rms_ratio < noise_floor
+    if _looks_like_repetitive_hallucination(cleaned):
+        return rms_ratio < noise_floor * 1.5
+    return False
 
 
 def _normalize_phrase(text: str) -> str:
     return _PUNCTUATION_PATTERN.sub("", compact_text(text)).lower()
+
+
+def _looks_like_punctuation_noise(text: str) -> bool:
+    condensed = compact_text(text)
+    return bool(condensed) and not _normalize_phrase(condensed)
+
+
+def _looks_like_repetitive_hallucination(cleaned: str) -> bool:
+    if len(cleaned) < 6:
+        return False
+    if _REPEATED_SPAN_PATTERN.search(cleaned):
+        return True
+    return any(char * 4 in cleaned for char in cleaned if char.strip())
 
 
 def _estimate_rms_ratio(pcm16: bytes) -> float:

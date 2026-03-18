@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Protocol
 
 from live_note.config import AudioConfig
@@ -20,6 +22,18 @@ class SegmentWindow:
 
 class SegmentationError(RuntimeError):
     pass
+
+
+class NativeVadWrapper:
+    def __init__(self, native_module: ModuleType, aggressiveness: int):
+        self._native_module = native_module
+        self._handle = native_module.create()
+        native_module.init(self._handle)
+        native_module.set_mode(self._handle, aggressiveness)
+
+    def is_speech(self, pcm16: bytes, sample_rate: int) -> bool:
+        frame_count = len(pcm16) // 2
+        return bool(self._native_module.process(self._handle, sample_rate, pcm16, frame_count))
 
 
 class SpeechSegmenter:
@@ -77,7 +91,21 @@ class SpeechSegmenter:
 
     def _load_vad(self) -> VadLike:
         try:
-            import webrtcvad
+            webrtcvad = importlib.import_module("webrtcvad")
         except ModuleNotFoundError as exc:
-            raise SegmentationError("缺少 webrtcvad-wheels 依赖。先运行 pip install -e .") from exc
+            native_vad = self._load_native_vad()
+            if native_vad is not None:
+                return native_vad
+            detail = str(exc)
+            raise SegmentationError(
+                f"无法加载 webrtcvad：{detail}。先运行 pip install -e .，"
+                "或改用带 pkg_resources 的兼容环境。"
+            ) from exc
         return webrtcvad.Vad(self.config.vad_aggressiveness)
+
+    def _load_native_vad(self) -> VadLike | None:
+        try:
+            native_module = importlib.import_module("_webrtcvad")
+        except ModuleNotFoundError:
+            return None
+        return NativeVadWrapper(native_module, self.config.vad_aggressiveness)
