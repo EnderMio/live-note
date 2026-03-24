@@ -52,6 +52,7 @@ enabled = false
 base_url = "http://127.0.0.1:8765"
 api_token = ""
 timeout_seconds = 20
+upload_timeout_seconds = 180
 live_chunk_ms = 240
 
 [serve]
@@ -60,14 +61,18 @@ port = 8765
 api_token = "replace-me"
 
 [funasr]
+enabled = false
 base_url = "ws://127.0.0.1:10095"
 mode = "2pass"
 use_itn = true
 
 [speaker]
 enabled = false
+backend = "sherpa_onnx"
 segmentation_model = ""
 embedding_model = ""
+expected_speakers = 0
 cluster_threshold = 0.5
 min_duration_on = 0.3
 min_duration_off = 0.5
+pyannote_model = "pyannote/speaker-diarization-community-1"

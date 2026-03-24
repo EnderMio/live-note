@@ -75,6 +75,7 @@ class RemoteConfig:
     base_url: str = "http://127.0.0.1:8765"
     api_token: str | None = None
     timeout_seconds: int = 20
+    upload_timeout_seconds: int = 180
     live_chunk_ms: int = 240
 
 
@@ -87,6 +88,7 @@ class ServeConfig:
 
 @dataclass(frozen=True, slots=True)
 class FunAsrConfig:
+    enabled: bool = False
     base_url: str = "ws://127.0.0.1:10095"
     mode: str = "2pass"
     use_itn: bool = True
@@ -95,11 +97,15 @@ class FunAsrConfig:
 @dataclass(frozen=True, slots=True)
 class SpeakerConfig:
     enabled: bool = False
+    backend: str = "sherpa_onnx"
     segmentation_model: Path | None = None
     embedding_model: Path | None = None
+    expected_speakers: int = 0
     cluster_threshold: float = 0.5
     min_duration_on: float = 0.3
     min_duration_off: float = 0.5
+    pyannote_model: str = "pyannote/speaker-diarization-community-1"
+    pyannote_auth_token: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +237,7 @@ def load_config(config_path: Path | None = None, env_path: Path | None = None) -
                 str(remote_data["api_token"]).strip() if remote_data.get("api_token") else None
             ),
             timeout_seconds=int(remote_data.get("timeout_seconds", 20)),
+            upload_timeout_seconds=int(remote_data.get("upload_timeout_seconds", 180)),
             live_chunk_ms=int(remote_data.get("live_chunk_ms", 240)),
         ),
         serve=ServeConfig(
@@ -239,17 +246,26 @@ def load_config(config_path: Path | None = None, env_path: Path | None = None) -
             api_token=str(serve_data["api_token"]).strip() if serve_data.get("api_token") else None,
         ),
         funasr=FunAsrConfig(
+            enabled=bool(funasr_data.get("enabled", False)),
             base_url=str(funasr_data.get("base_url", "ws://127.0.0.1:10095")).rstrip("/"),
             mode=str(funasr_data.get("mode", "2pass")),
             use_itn=bool(funasr_data.get("use_itn", True)),
         ),
         speaker=SpeakerConfig(
             enabled=bool(speaker_data.get("enabled", False)),
+            backend=_normalize_speaker_backend(str(speaker_data.get("backend", "sherpa_onnx"))),
             segmentation_model=segmentation_model,
             embedding_model=embedding_model,
+            expected_speakers=int(speaker_data.get("expected_speakers", 0)),
             cluster_threshold=float(speaker_data.get("cluster_threshold", 0.5)),
             min_duration_on=float(speaker_data.get("min_duration_on", 0.3)),
             min_duration_off=float(speaker_data.get("min_duration_off", 0.5)),
+            pyannote_model=(
+                str(speaker_data.get("pyannote_model", "pyannote/speaker-diarization-community-1"))
+                .strip()
+                or "pyannote/speaker-diarization-community-1"
+            ),
+            pyannote_auth_token=merged_env.get("PYANNOTE_AUTH_TOKEN") or None,
         ),
         root_dir=root_dir,
     )
@@ -331,6 +347,7 @@ def render_config(config: AppConfig) -> str:
                 "base_url": config.remote.base_url,
                 "api_token": config.remote.api_token or "",
                 "timeout_seconds": config.remote.timeout_seconds,
+                "upload_timeout_seconds": config.remote.upload_timeout_seconds,
                 "live_chunk_ms": config.remote.live_chunk_ms,
             },
         ),
@@ -345,6 +362,7 @@ def render_config(config: AppConfig) -> str:
         (
             "funasr",
             {
+                "enabled": config.funasr.enabled,
                 "base_url": config.funasr.base_url,
                 "mode": config.funasr.mode,
                 "use_itn": config.funasr.use_itn,
@@ -354,11 +372,14 @@ def render_config(config: AppConfig) -> str:
             "speaker",
             {
                 "enabled": config.speaker.enabled,
+                "backend": config.speaker.backend,
                 "segmentation_model": str(config.speaker.segmentation_model or ""),
                 "embedding_model": str(config.speaker.embedding_model or ""),
+                "expected_speakers": config.speaker.expected_speakers,
                 "cluster_threshold": config.speaker.cluster_threshold,
                 "min_duration_on": config.speaker.min_duration_on,
                 "min_duration_off": config.speaker.min_duration_off,
+                "pyannote_model": config.speaker.pyannote_model,
             },
         ),
     ]
@@ -408,6 +429,15 @@ def _normalize_wire_api(value: str) -> str:
     if normalized == "responses":
         return "responses"
     return value.strip() or "chat_completions"
+
+
+def _normalize_speaker_backend(value: str) -> str:
+    normalized = value.strip().lower().replace("-", "_")
+    if normalized in {"", "sherpa", "sherpa_onnx"}:
+        return "sherpa_onnx"
+    if normalized in {"pyannote", "pyannote_audio"}:
+        return "pyannote"
+    return value.strip() or "sherpa_onnx"
 
 
 def _resolve_optional_path(root_dir: Path, value: object) -> Path | None:

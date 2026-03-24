@@ -50,6 +50,7 @@ class RemoteConfigTests(unittest.TestCase):
                         'api_token = "server-token"',
                         "",
                         "[funasr]",
+                        "enabled = true",
                         'base_url = "ws://127.0.0.1:10095"',
                         'mode = "2pass"',
                         "use_itn = false",
@@ -58,6 +59,7 @@ class RemoteConfigTests(unittest.TestCase):
                         "enabled = true",
                         'segmentation_model = "/models/seg.onnx"',
                         'embedding_model = "/models/embed.onnx"',
+                        "expected_speakers = 3",
                         "cluster_threshold = 0.61",
                         "min_duration_on = 0.4",
                         "min_duration_off = 0.7",
@@ -76,12 +78,14 @@ class RemoteConfigTests(unittest.TestCase):
         self.assertEqual("0.0.0.0", config.serve.host)
         self.assertEqual(18765, config.serve.port)
         self.assertEqual("server-token", config.serve.api_token)
+        self.assertTrue(config.funasr.enabled)
         self.assertEqual("ws://127.0.0.1:10095", config.funasr.base_url)
         self.assertEqual("2pass", config.funasr.mode)
         self.assertFalse(config.funasr.use_itn)
         self.assertTrue(config.speaker.enabled)
         self.assertEqual(Path("/models/seg.onnx"), config.speaker.segmentation_model)
         self.assertEqual(Path("/models/embed.onnx"), config.speaker.embedding_model)
+        self.assertEqual(3, config.speaker.expected_speakers)
         self.assertAlmostEqual(0.61, config.speaker.cluster_threshold)
         self.assertAlmostEqual(0.4, config.speaker.min_duration_on)
         self.assertAlmostEqual(0.7, config.speaker.min_duration_off)
@@ -120,4 +124,50 @@ class RemoteConfigTests(unittest.TestCase):
         self.assertIn("[serve]", rendered)
         self.assertIn("[funasr]", rendered)
         self.assertIn("[speaker]", rendered)
+        self.assertIn("expected_speakers = 0", rendered)
 
+    def test_load_config_reads_pyannote_speaker_backend_and_env_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_path = root / "ggml-large-v3.bin"
+            model_path.write_bytes(b"model")
+            config_path = root / "config.toml"
+            env_path = root / ".env"
+            env_path.write_text("PYANNOTE_AUTH_TOKEN=hf-token\n", encoding="utf-8")
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "[audio]",
+                        "",
+                        "[import]",
+                        "",
+                        "[refine]",
+                        "",
+                        "[whisper]",
+                        'binary = "/Users/demo/whisper-server"',
+                        f'model = "{model_path}"',
+                        "",
+                        "[obsidian]",
+                        "enabled = false",
+                        "",
+                        "[llm]",
+                        "enabled = false",
+                        "",
+                        "[speaker]",
+                        "enabled = true",
+                        'backend = "pyannote"',
+                        'pyannote_model = "pyannote/speaker-diarization-community-1"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path, env_path)
+
+        self.assertTrue(config.speaker.enabled)
+        self.assertEqual("pyannote", config.speaker.backend)
+        self.assertEqual(
+            "pyannote/speaker-diarization-community-1",
+            config.speaker.pyannote_model,
+        )
+        self.assertEqual("hf-token", config.speaker.pyannote_auth_token)
