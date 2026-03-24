@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from live_note.config import RemoteConfig
@@ -64,6 +65,82 @@ class RemoteClient:
     def health(self) -> dict[str, Any]:
         return self._request_json("GET", "/api/v1/health")
 
+    def create_import_task(
+        self,
+        file_path: str,
+        *,
+        title: str | None,
+        kind: str,
+        language: str | None,
+        speaker_enabled: bool | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        media_path = Path(file_path).expanduser().resolve()
+        query = {
+            key: value
+            for key, value in {
+                "filename": media_path.name,
+                "title": title,
+                "kind": kind,
+                "language": language,
+                "request_id": request_id,
+            }.items()
+            if value is not None
+        }
+        if speaker_enabled is not None:
+            query["speaker_enabled"] = "1" if speaker_enabled else "0"
+        payload = self._request_json(
+            "POST",
+            "/api/v1/imports",
+            query=query,
+            body=media_path.read_bytes(),
+            content_type="application/octet-stream",
+            timeout_seconds=self.config.upload_timeout_seconds,
+        )
+        if not isinstance(payload, dict):
+            raise RemoteClientError("远端导入任务响应格式无效。")
+        return payload
+
+    def get_import_task(self, task_id: str) -> dict[str, Any]:
+        encoded_task_id = _quote_path_segment(task_id)
+        payload = self._request_json("GET", f"/api/v1/imports/{encoded_task_id}")
+        if not isinstance(payload, dict):
+            raise RemoteClientError("远端导入状态响应格式无效。")
+        return payload
+
+    def cancel_import_task(self, task_id: str) -> dict[str, Any]:
+        encoded_task_id = _quote_path_segment(task_id)
+        payload = self._request_json(
+            "POST",
+            f"/api/v1/imports/{encoded_task_id}/actions/cancel",
+        )
+        if not isinstance(payload, dict):
+            raise RemoteClientError("远端导入取消响应格式无效。")
+        return payload
+
+    def list_tasks(self) -> dict[str, Any]:
+        payload = self._request_json("GET", "/api/v1/tasks")
+        if not isinstance(payload, dict):
+            raise RemoteClientError("远端任务列表响应格式无效。")
+        return payload
+
+    def get_task(self, task_id: str) -> dict[str, Any]:
+        encoded_task_id = _quote_path_segment(task_id)
+        payload = self._request_json("GET", f"/api/v1/tasks/{encoded_task_id}")
+        if not isinstance(payload, dict):
+            raise RemoteClientError("远端任务详情响应格式无效。")
+        return payload
+
+    def cancel_task(self, task_id: str) -> dict[str, Any]:
+        encoded_task_id = _quote_path_segment(task_id)
+        payload = self._request_json(
+            "POST",
+            f"/api/v1/tasks/{encoded_task_id}/actions/cancel",
+        )
+        if not isinstance(payload, dict):
+            raise RemoteClientError("远端任务取消响应格式无效。")
+        return payload
+
     def get_session(self, session_id: str) -> dict[str, Any]:
         encoded_session_id = _quote_path_segment(session_id)
         return self._request_json("GET", f"/api/v1/sessions/{encoded_session_id}")
@@ -81,15 +158,32 @@ class RemoteClient:
     def get_artifacts(self, session_id: str) -> dict[str, Any]:
         return self.get_session_artifacts(session_id)
 
-    def refine_session(self, session_id: str) -> dict[str, Any]:
+    def refine_session(self, session_id: str, *, request_id: str | None = None) -> dict[str, Any]:
         encoded_session_id = _quote_path_segment(session_id)
         return self._request_json(
             "POST",
             f"/api/v1/sessions/{encoded_session_id}/actions/refine",
+            query={"request_id": request_id} if request_id else None,
         )
 
-    def refine(self, session_id: str) -> dict[str, Any]:
-        return self.refine_session(session_id)
+    def refine(self, session_id: str, *, request_id: str | None = None) -> dict[str, Any]:
+        return self.refine_session(session_id, request_id=request_id)
+
+    def retranscribe_session(
+        self,
+        session_id: str,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        encoded_session_id = _quote_path_segment(session_id)
+        return self._request_json(
+            "POST",
+            f"/api/v1/sessions/{encoded_session_id}/actions/retranscribe",
+            query={"request_id": request_id} if request_id else None,
+        )
+
+    def retranscribe(self, session_id: str, *, request_id: str | None = None) -> dict[str, Any]:
+        return self.retranscribe_session(session_id, request_id=request_id)
 
     def open_live(self) -> RemoteLiveConnection:
         return self.connect_live({})
@@ -119,18 +213,34 @@ class RemoteClient:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
+        *,
+        query: dict[str, str] | None = None,
+        body: bytes | None = None,
+        content_type: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> dict[str, Any] | list[Any]:
+        if payload is not None and body is not None:
+            raise ValueError("payload 和 body 不能同时传入。")
         url = f"{self.config.base_url.rstrip('/')}{path}"
-        body: bytes | None = None
+        if query:
+            url = f"{url}?{urlencode(query)}"
+        request_body: bytes | None = None
         headers = {"Accept": "application/json"}
         if payload is not None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            request_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"
+        elif body is not None:
+            request_body = body
+            if content_type:
+                headers["Content-Type"] = content_type
         if self.config.api_token:
             headers["Authorization"] = f"Bearer {self.config.api_token}"
-        request = Request(url, data=body, method=method, headers=headers)
+        request = Request(url, data=request_body, method=method, headers=headers)
+        request_timeout = (
+            self.config.timeout_seconds if timeout_seconds is None else int(timeout_seconds)
+        )
         try:
-            with urlopen(request, timeout=self.config.timeout_seconds) as response:
+            with urlopen(request, timeout=request_timeout) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")

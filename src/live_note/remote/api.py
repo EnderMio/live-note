@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, Header, HTTPException, WebSocket
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket
 
 from live_note.config import AppConfig
 
@@ -45,11 +45,99 @@ def create_remote_app(service: RemoteSessionService) -> FastAPI:
     @app.post("/api/v1/sessions/{session_id}/actions/refine")
     def refine(
         session_id: str,
+        request_id: str | None = None,
         authorization: str | None = Header(default=None),
     ) -> dict[str, object]:
         _authorize_http(service, authorization)
         try:
-            return service.request_refine(session_id)
+            return service.request_refine(session_id, request_id=request_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/v1/sessions/{session_id}/actions/retranscribe")
+    def retranscribe(
+        session_id: str,
+        request_id: str | None = None,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        _authorize_http(service, authorization)
+        try:
+            return service.request_retranscribe(session_id, request_id=request_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/v1/imports")
+    async def create_import(
+        request: Request,
+        filename: str,
+        title: str | None = None,
+        kind: str = "generic",
+        language: str | None = None,
+        speaker_enabled: bool | None = None,
+        request_id: str | None = None,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        _authorize_http(service, authorization)
+        body = await request.body()
+        try:
+            return service.create_import_task(
+                filename=filename,
+                title=title,
+                kind=kind,
+                language=language,
+                speaker_enabled=speaker_enabled,
+                request_id=request_id,
+                file_bytes=body,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/v1/imports/{task_id}")
+    def import_status(
+        task_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        _authorize_http(service, authorization)
+        try:
+            return service.import_task_payload(task_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/v1/imports/{task_id}/actions/cancel")
+    def cancel_import(
+        task_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        _authorize_http(service, authorization)
+        try:
+            return service.cancel_import_task(task_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/v1/tasks")
+    def tasks(authorization: str | None = Header(default=None)) -> dict[str, object]:
+        _authorize_http(service, authorization)
+        return service.list_tasks_payload()
+
+    @app.get("/api/v1/tasks/{task_id}")
+    def task(
+        task_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        _authorize_http(service, authorization)
+        try:
+            return service.task_payload(task_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/v1/tasks/{task_id}/actions/cancel")
+    def cancel_task(
+        task_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
+        _authorize_http(service, authorization)
+        try:
+            return service.cancel_task(task_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

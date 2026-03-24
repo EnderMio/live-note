@@ -15,12 +15,16 @@ class LiveStartRequest:
     source_label: str
     source_ref: str
     auto_refine_after_live: bool | None = None
+    speaker_enabled: bool | None = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> LiveStartRequest:
         auto_refine_after_live = payload.get("auto_refine_after_live")
         if auto_refine_after_live is not None:
             auto_refine_after_live = _optional_bool(auto_refine_after_live)
+        speaker_enabled = payload.get("speaker_enabled")
+        if speaker_enabled is not None:
+            speaker_enabled = _optional_bool(speaker_enabled)
         return cls(
             title=str(payload.get("title", "")).strip(),
             kind=str(payload.get("kind", "generic")).strip() or "generic",
@@ -29,6 +33,7 @@ class LiveStartRequest:
             or "remote-audio",
             source_ref=str(payload.get("source_ref", "remote")).strip() or "remote",
             auto_refine_after_live=auto_refine_after_live,
+            speaker_enabled=speaker_enabled,
         )
 
 
