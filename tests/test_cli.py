@@ -28,6 +28,31 @@ class CliTests(unittest.TestCase):
         )
         runner.run.assert_called_once()
 
+    def test_import_command_uses_remote_import_coordinator_when_remote_enabled(self) -> None:
+        runner = Mock()
+        runner.run.return_value = 0
+        config = SimpleNamespace(remote=SimpleNamespace(enabled=True))
+
+        with patch("live_note.app.cli.load_config", return_value=config) as load_config_mock:
+            with patch("live_note.app.cli.FileImportCoordinator") as local_factory:
+                with patch(
+                    "live_note.app.cli.RemoteImportCoordinator",
+                    return_value=runner,
+                ) as factory:
+                    exit_code = main(["import", "--file", "/tmp/demo.mp3", "--kind", "meeting"])
+
+        self.assertEqual(0, exit_code)
+        load_config_mock.assert_called_once()
+        local_factory.assert_not_called()
+        factory.assert_called_once_with(
+            config=config,
+            file_path="/tmp/demo.mp3",
+            title=None,
+            kind="meeting",
+            language=None,
+        )
+        runner.run.assert_called_once()
+
     def test_start_command_accepts_legacy_course_argument(self) -> None:
         runner = Mock()
         runner.run.return_value = 0
@@ -96,6 +121,10 @@ class CliTests(unittest.TestCase):
                     "--host",
                     "ender@172.21.0.159",
                     "--speaker",
+                    "--speaker-pyannote",
+                    "--funasr",
+                    "--funasr-port",
+                    "11095",
                     "--skip-deps",
                     "--dry-run",
                 ]
@@ -106,6 +135,9 @@ class CliTests(unittest.TestCase):
         args = deploy_mock.call_args.args[0]
         self.assertEqual("ender@172.21.0.159", args.host)
         self.assertTrue(args.speaker)
+        self.assertTrue(args.speaker_pyannote)
+        self.assertTrue(args.funasr)
+        self.assertEqual(11095, args.funasr_port)
         self.assertTrue(args.skip_deps)
         self.assertTrue(args.dry_run)
 
