@@ -17,6 +17,7 @@
 - 新建会话页可按本次 live 单独选择“停止后自动离线精修”，不必强制沿用全局默认
 - 文件导入支持 `mp3` / `m4a` / `wav` / `mp4` / `mov` / `mkv` 等本地媒体文件
 - 导入会先用 `ffmpeg` 归一化，再按固定时长切块转写
+- 开启远端模式后，实时录音和文件导入都会优先交给远端服务执行；桌面端负责上传、控制和回写结果
 - live 停止后会先释放录音前台，再在后台继续补转写、离线精修和整理；失败时保留实时草稿继续出稿
 - 本地 `.live-note/sessions/` 保存完整 journal，便于恢复与重放
 - 正式版 GUI 支持离线任务队列：导入、重转写、离线精修、合并、重新生成整理、重新同步都可连续排队
@@ -34,7 +35,7 @@
 6. 运行 `make doctor`
 7. 运行 `make gui` 打开桌面界面；如需命令行模式，再运行 `make devices` 查看实时输入设备
 
-如果你准备在远端机器上启用说话人区分，额外运行 `make setup-speaker`，它会安装 `numpy` 与 `sherpa-onnx`。
+如果你准备在远端机器上启用 sherpa 说话人区分，额外运行 `make setup-speaker`。如果准备启用 `pyannote` 后端，运行 `make setup-speaker-pyannote`。
 
 说明：如果项目根目录存在 `.venv/bin/python`，`make` 会优先使用它，减少系统 Python 与项目依赖不一致导致的环境偏差。
 
@@ -45,7 +46,8 @@
 - `make gui`：启动桌面界面，包含首启向导、实时录音、文件导入和历史会话
 - `make serve`：启动局域网远端转写服务，适合放在 Mac mini 等常电机器上
 - `make deploy-remote ARGS='--host ender@mini.local'`：把当前代码同步到远端，并安装或更新 `launchd` 常驻服务
-- `make setup-speaker`：安装说话人区分依赖，适合在远端机器上启用 `speaker` 后处理
+- `make setup-speaker`：安装 sherpa 说话人区分依赖
+- `make setup-speaker-pyannote`：安装 `pyannote.audio` 说话人区分依赖
 - `make dev ARGS='--title 周会 --source 2 --kind meeting'`：实时转写
 - `make import ARGS='--file ~/Recordings/demo.mp4 --title 产品复盘 --kind meeting'`：导入音频或视频文件
 - `make finalize ARGS='--session 20260315-210500-产品复盘'`：只补转写缺失片段，并重写原文/整理稿
@@ -60,37 +62,70 @@
 
 1. 在 Mac mini 上准备好 `ffmpeg`、`whisper.cpp`、模型文件和同一份项目代码
 2. 在本机执行 `make deploy-remote ARGS='--host ender@mini.local'`。它会用 `rsync` 同步仓库、在远端建立 `.venv`、安装依赖，并写入 `~/Library/LaunchAgents/com.live-note.remote.plist`
-3. 首次部署时，命令只会在远端缺少配置时自动复制 [config.remote.example.toml](config.remote.example.toml) 到 `~/Library/Application Support/live-note/config.remote.toml`，不会覆盖你已经调整过的远端配置
-4. 登录 Mac mini，编辑 `~/Library/Application Support/live-note/config.remote.toml`；在这份文件里保持 `remote.enabled = false`，配置 `[serve]`、`[whisper]` 和可选的 `[speaker]`
-5. 如需启用说话人区分，可重新执行 `make deploy-remote ARGS='--host ender@mini.local --speaker'`，它会把远端依赖升级到 `.[dev,speaker]`
-6. 在桌面端把 `[remote]` 打开，例如：
+3. 如果要把实时稿切到 FunASR，可直接执行 `make deploy-remote ARGS='--host ender@mini.local --funasr'`。这会额外在远端创建 `~/live-note-funasr/`、拉取官方 `FunASR` 仓库、安装 `modelscope + funasr`，并注册 `~/Library/LaunchAgents/com.live-note.funasr.plist`
+4. 首次部署时，命令只会在远端缺少配置时自动复制 [config.remote.example.toml](config.remote.example.toml) 到 `~/Library/Application Support/live-note/config.remote.toml`，不会覆盖你已经调整过的远端配置
+5. 登录 Mac mini，编辑 `~/Library/Application Support/live-note/config.remote.toml`；在这份文件里保持 `remote.enabled = false`，配置 `[serve]`、`[whisper]`，并按需打开 `[funasr].enabled` 与 `[speaker]`
+6. 如需启用 sherpa 说话人区分，可执行 `make deploy-remote ARGS='--host ender@mini.local --speaker'`；如需启用 `pyannote`，执行 `make deploy-remote ARGS='--host ender@mini.local --speaker-pyannote'`
+7. 在桌面端把 `[remote]` 打开，例如：
 
 ```toml
 [remote]
 enabled = true
 base_url = "http://mini.local:8765"
 api_token = "your-remote-token"
+upload_timeout_seconds = 180
 live_chunk_ms = 240
 ```
 
 补充说明：
 
-- 当前远端 live 链路仍复用本项目现有的 `whisper.cpp + 分段` 方案，不是 FunASR 的真流式识别
-- `[funasr]` 目前主要作为后续接入预留配置，不建议把它当成已完全打通的默认链路
+- 默认远端 live 链路仍可继续使用 `whisper.cpp + 分段`
+- 本机 `make import ...` 和 GUI 的“导入录音”在 `remote.enabled = true` 时也会自动走远端，不再使用本机 `ffmpeg/whisper.cpp`
+- 远端现在统一维护 `import / postprocess / refine / retranscribe` 四类托管任务；文件导入、远端 live 停止后的后台整理，以及历史页里对远端会话发起的“离线精修 / 重转写”，都会先注册成远端任务再异步执行
+- 这些远端托管任务现在由服务端按严格 FIFO 串行执行；同一时刻只会处理 1 个重任务，后续任务会在“远端任务”区显示为 `排队中`
+- 当前远端导入协议仍保留 `/api/v1/imports` 入口，但它内部也会注册为统一远端任务；桌面端上传原始文件后，会轮询 `/api/v1/tasks` 与 `/api/v1/tasks/{task_id}`，并按 `result_version` 自动回写本地镜像
+- 因为远端导入使用 HTTP 直接上传，第一次点击导入后会先经历一个“上传音频到远端”的阶段；大文件在这个阶段不会立即出现分段进度
+- 大文件上传超时时，可提高 `[remote].upload_timeout_seconds`；默认 `180` 秒
+- 远端导入拿到 `session_id` 后，会持续把原文快照回写到本机会话目录，并按本机 Obsidian 设置增量同步；不必等整场导入完成才看到 transcript
+- 如果本机代码已升级到支持远端导入，但 Mac mini 还没重新执行 `make deploy-remote ...`，桌面端会直接提示“远端服务版本过旧”，需要先更新远端服务
+- `remote-deploy --funasr` 只负责把 FunASR websocket runtime 部署到远端，并注册 `com.live-note.funasr`；它默认按本机回环口的明文 `ws://127.0.0.1:10095` 启动，不启用 TLS；真正切换到 FunASR 仍要把远端 `config.remote.toml` 的 `[funasr].enabled = true` 打开
+- `remote-deploy` 在 `--python-bin` 保持默认 `python3` 时，会先尝试复用远端现有 `.venv` 的 base Python，避免把已经运行的 conda / pyenv 环境意外重建成系统 Python
+- 如果远端默认 `python3` 低于 3.10，官方 FunASR websocket server 会因语法不兼容而启动失败；这类机器上部署时请显式追加 `--python-bin /opt/miniconda3/bin/python3`
+- 如果把远端配置中的 `[funasr].enabled = true` 打开，远端实时稿会改走 FunASR WebSocket；停止录音后仍会按当前 `[whisper]` 配置执行最终精修
+- GUI 设置页里的 FunASR 项只负责保存桌面端的远端配置模板，不会直接切换已运行的 Mac mini 服务；实际后端以“设置与诊断”里的 `backend=...` 为准，切换仍需修改远端 `config.remote.toml` 并重启服务
 - 远端运行配置不要直接放在仓库根目录；否则后续 `rsync --delete`、拉新分支或重建工作区时容易被覆盖
 - `remote-deploy` 默认会重启远端 `launchd` 服务；如果你只想更新代码不重启，可追加 `--no-start`
 - 远端会话完成后，桌面端会把远端 artifacts 回写成本地 `.live-note/sessions/<session_id>/` 镜像，再按本地设置同步到 Obsidian
+- 远端会话的本地镜像会沿用服务端返回的笔记路径，不会因为本地重连或最终同步再额外创建一份空白原文笔记
+- 远端导入同样会回写成本地镜像，所以历史列表、离线任务、重转写和重新导出仍然按本地会话工作
+- 客户端关闭或断线时，远端托管任务会继续在服务端执行；重新打开 GUI 后，可在“记录库”顶部的“远端任务”区重新附着查看进度，并在结果同步失败时手动点击“重试同步”
+- 远端任务附着信息保存在本地 `.live-note/remote_tasks.json`；它不是执行队列，只用于记录“我正在关注哪些服务端任务”以及这些任务的同步状态。本机“任务队列”负责提交顺序，真正的远端执行顺序以服务端队列为准
+- v1 不做“服务端重启后任务恢复”。如果 Mac mini 上的远端服务被重启，桌面端会把原先仍在活动中的附着记录标成“已丢失 / 服务端已重置，任务无法恢复”；已经完成、失败或取消的历史任务会保留原状态，不会被误标成丢失
 - 远端会话标题可以直接使用中文；桌面端会正确编码带中文的 `session_id` 请求路径，避免完成后同步 artifacts 失败
 - 建议为 `[serve].api_token` 和 `[remote].api_token` 配同一值，不要在无认证状态下直接暴露到更大网络
 - Mac mini 场景建议使用 `launchd` 常驻 `make serve`；至少保证系统重启后服务能自动恢复
-- 远端机器上运行 `make doctor` 时，会额外检查 `remote_health`、说话人模型路径以及 `numpy` / `sherpa_onnx` 依赖
+- 远端机器上运行 `make doctor` 时，会按当前 `speaker.backend` 检查对应依赖：`sherpa_onnx` 或 `pyannote.audio`
 
 ## 说话人区分
 
-- 说话人区分只在远端后处理阶段运行，适合课程、会议、多发言人播客这类录音
-- 启用前先在远端机器运行 `make setup-speaker`，并在服务器配置里填写 `[speaker].segmentation_model` 与 `[speaker].embedding_model`
+- 说话人区分适合课程、会议、多发言人播客这类录音；默认关闭，可在 GUI 新建页按本次会话勾选“本次启用说话人区分”
+- 当前支持本机 live 停止后的后处理、远端 live 停止后的后处理，以及文件导入后的后处理（本机或远端）
+- 本地导入会直接对归一化后的 `source.normalized.wav` 做区分；远端导入则在服务端完成同一流程，再把带 `Speaker 1/2/...` 标签的结果同步回本机
+- 文件导入在开启 speaker 后处理时，会自动把切块时长收紧到 `15s`，减少多人长段混说时整块只贴一个 speaker 的偏差
+- `[speaker].backend = "sherpa_onnx"` 时，填写 `segmentation_model` 与 `embedding_model`，并先运行 `make setup-speaker`
+- `[speaker].backend = "pyannote"` 时，填写 `pyannote_model`，并先运行 `make setup-speaker-pyannote` 或远端部署时追加 `--speaker-pyannote`
+- `pyannote/speaker-diarization-community-1` 首次加载会从 Hugging Face 拉模型；未提供可用 token 时通常会直接返回 `401 Unauthorized`
+- `pyannote` 模型如果需要 Hugging Face 访问令牌，可在 `.env` 或远端环境里配置 `PYANNOTE_AUTH_TOKEN=...`
+- 如果远端机器本身访问 Hugging Face 很慢或超时，需要先解决网络链路；模型缓存完成后，后续 diarization 就不再依赖这一步下载
+- 已知说话人数时，可额外设置 `[speaker].expected_speakers = 3` 这类提示，减少自动聚类把三人会议拆成十几个 speaker 的情况
+- 如果你希望“导入录音”也区分说话人，而导入任务本身是走远端模式执行，那么模型和依赖也必须部署在远端机器上
 - 如果缺依赖或模型不可用，本次会话不会整体失败，但 `speaker_status` 会标成 `failed` 或 `disabled`，原文仍会照常输出
-- 输出到 transcript 时会按 `Speaker 1`、`Speaker 2` 这类标签标注
+- 说话人推理会在独立子进程中执行，避免远端 `serve` 进程在 diarization 期间长时间失去响应
+- 远端导入在说话人阶段被取消时，现在会直接终止 diarization 子进程，不必再等整段推理自然结束
+- 任务进入说话人阶段后，会看到 `speaker 1/3 -> 3/3` 的进度；`speaker_status` 会明确落成 `running / done / failed`
+- speaker 标签会按累计重叠时长归一化成连续的 `Speaker 1`、`Speaker 2`……；匹配时优先看整段总重叠，而不是只看中点是否落在某个短插话里
+- 最终 transcript 不再只保留固定 chunk；speaker 后处理会按 diarization turn 再结合句号/停顿符号，把一大块转写尽量收敛成更细的发言条目
+- 这一步仍然是启发式对齐，不是字级时间戳；如果一段里多人抢话很多，想要更稳定的结果，优先把导入切块调短，或给出 `expected_speakers`
 
 ## 离线精修
 
@@ -131,18 +166,24 @@ requires_openai_auth = true
 ## GUI 说明
 
 - 当前只保留一套正式桌面 GUI：`Tkinter/ttk`
+- 当前桌面界面已收敛为更接近系统偏好设置的浅色主题：更轻的边框、更紧凑的留白、更统一的按钮与表格样式
+- GUI 进度条动画已降到低频率，事件轮询也会在空闲时自动降频，减少空转时的 CPU 占用
 - 顶栏会直接显示当前转写执行位置：`本机`、`远端服务（已连接）` 或 `远端服务（未连通）`，不必开始录音也能确认是否已切到远端
 - 正式版 GUI 的离线动作统一进入 `.live-note/task_queue.json` 持久队列，按严格 FIFO 串行执行；关闭应用后，未开始的排队任务会在下次启动时恢复
+- 历史页里的“取消所选”现在同时支持两类导入任务：尚未开始的排队导入，以及当前正在运行的导入；运行中的导入会发送取消请求并在最近的安全边界停止
 - 如果应用上次退出时某个离线任务仍处于运行中，它会在下次启动时被标记为“中断”，并从待执行队列中移除，不会自动重跑
 - 首次启动如果没有 `config.toml`，会自动弹出向导，预填常见的 `ffmpeg`、`whisper-server` 和模型路径
 - 设置页和首启向导都支持关闭 Obsidian 同步、LLM 整理或离线精修，适合先从本地模式开始
+- 设置页现在也可直接查看和修改说话人区分后端、模型与阈值；切到 `pyannote` 时，可直接填写模型名，访问令牌仍通过 `.env` 中的 `PYANNOTE_AUTH_TOKEN` 提供
 - “新建记录”页签分为“现场记录”和“导入录音”；界面始终只保留一个主按钮，避免开始动作重复出现
 - 现场记录支持“暂停 / 继续 / 结束并整理”；暂停期间不会继续累计记录内容
 - 现场记录支持按本次会话设置自动停止分钟数；到点后行为等同于点击“停止录音”，暂停期间不会继续倒计时
 - 暂停后再继续时，会重置实时转写使用的最近上下文，避免旧上下文把恢复后的弱语音或噪声一路带偏
 - 点击“结束记录”后，界面会尽快回到可再次开始的状态；上一条记录会在后台继续补全原文、整理和导出
+- 文件导入走队列时，“新建会话”页的运行状态面板也会显示当前进度，不必切到历史页才能看到处理状态
 - 如果队列里已有离线任务正在运行，这时开始新的实时录音会允许短暂重叠；但队列不会再启动下一项，直到录音及其后台收尾结束
 - 历史页顶部会显示当前队列进度、待执行列表，并支持取消尚未开始的排队任务
+- 当远端模式开启时，记录库顶部还会显示“远端任务”区：运行中的任务会展示阶段和进度，完成但尚未同步的任务会显示“待同步 / 同步失败”，第二按钮会切换成“重试同步”
 - 如果某条旧会话的 `session.toml` 或 `segments.jsonl` 损坏，历史页会把它隔离显示为 `broken`，不会拖垮整个列表
 - “设置”页改成更接近偏好设置的结构：左侧是能力分组，中间只保留今天真正会用到的设置，右侧用一列就绪状态说明本机是否可直接开始
 - 如果关闭窗口时仍有后台任务，进程会继续运行直到这些任务完成
