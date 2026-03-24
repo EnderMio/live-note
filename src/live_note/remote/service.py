@@ -5,37 +5,50 @@ import json
 import logging
 import queue
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 from live_note.app.coordinator import (
+    FRAME_PAUSE,
+    FRAME_RESUME,
     FRAME_STOP,
     SessionCoordinator,
     _attach_console_logging,
     _emit_progress,
     _mark_session_failed,
+    _open_session_audio_writer,
     _run_live_refinement,
     _runtime_whisper_config,
     create_session_metadata,
+    retranscribe_session,
 )
+from live_note.app.events import ProgressEvent
 from live_note.app.journal import SessionWorkspace, build_workspace, list_sessions
 from live_note.audio.segmentation import SpeechSegmenter
 from live_note.config import AppConfig
-from live_note.domain import AudioFrame, SessionMetadata
+from live_note.domain import AudioFrame, SessionMetadata, TranscriptEntry
 from live_note.obsidian.client import ObsidianClient
 from live_note.obsidian.renderer import build_transcript_note
+from live_note.transcribe.funasr import FunAsrMessage, FunAsrWebSocketClient
 from live_note.transcribe.whisper import WhisperInferenceClient, WhisperServerProcess
+from live_note.utils import slugify_filename
 
 from .protocol import LiveStartRequest, entry_to_dict, metadata_to_dict, progress_to_payload
 from .speaker import apply_speaker_labels
+from .tasks import RemoteTaskRegistry
 
 
 class RemoteSessionService:
     def __init__(self, config: AppConfig):
         self.config = config
+        self._request_upload_locks: dict[str, threading.Lock] = {}
+        self._request_upload_locks_lock = threading.Lock()
+        self.tasks = RemoteTaskRegistry(config, recover_runner=self._build_recovered_runner)
 
     @property
     def api_token(self) -> str | None:
@@ -46,6 +59,11 @@ class RemoteSessionService:
             "status": "ok",
             "service": "live-note-remote",
             "speaker_enabled": self.config.speaker.enabled,
+            "funasr_enabled": self.config.funasr.enabled,
+            "supports_imports": True,
+            "supports_tasks": True,
+            "server_id": self.tasks.server_id,
+            "realtime_backend": "funasr" if self.config.funasr.enabled else "whisper_cpp",
             "remote_enabled": self.config.remote.enabled,
         }
 
@@ -84,37 +102,411 @@ class RemoteSessionService:
             "metadata": metadata_to_dict(metadata),
             "entries": [entry_to_dict(item) for item in workspace.transcript_entries()],
             "has_session_audio": workspace.session_live_wav.exists(),
+            "transcript_content": (
+                workspace.transcript_md.read_text(encoding="utf-8")
+                if workspace.transcript_md.exists()
+                else ""
+            ),
+            "structured_content": (
+                workspace.structured_md.read_text(encoding="utf-8")
+                if workspace.structured_md.exists()
+                else ""
+            ),
         }
 
-    def request_refine(self, session_id: str) -> dict[str, object]:
-        workspace = build_workspace(self.config.root_dir, session_id)
-        metadata = workspace.read_session()
-        logger = workspace.session_logger()
-        previous_source = metadata.transcript_source
-        metadata = workspace.update_session(status="refining", refine_status="refining")
-        try:
-            metadata = _run_live_refinement(
-                config=self.config,
-                workspace=workspace,
-                metadata=metadata,
-                logger=logger,
+    def request_refine(
+        self,
+        session_id: str,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, object]:
+        return self.tasks.create_task(
+            action="refine",
+            label="离线精修并重写",
+            session_id=session_id,
+            request_id=request_id,
+            task_spec={
+                "action": "refine",
+                "session_id": session_id,
+            },
+            build_runner=lambda task_id, _cancel_event: self._build_refine_runner(
+                task_id,
+                session_id,
+            ),
+        )
+
+    def request_retranscribe(
+        self,
+        session_id: str,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, object]:
+        return self.tasks.create_task(
+            action="retranscribe",
+            label="重转写并重写",
+            session_id=session_id,
+            request_id=request_id,
+            task_spec={
+                "action": "retranscribe",
+                "session_id": session_id,
+            },
+            build_runner=lambda task_id, _cancel_event: self._build_retranscribe_runner(
+                task_id,
+                session_id,
+            ),
+        )
+
+    def create_import_task(
+        self,
+        *,
+        filename: str,
+        title: str | None,
+        kind: str,
+        language: str | None,
+        speaker_enabled: bool | None,
+        request_id: str | None,
+        file_bytes: bytes,
+    ) -> dict[str, object]:
+        normalized_name = slugify_filename(Path(filename).name.strip())
+        if not normalized_name:
+            raise ValueError("上传文件名不能为空。")
+        if not file_bytes:
+            raise ValueError("上传文件为空。")
+        normalized_request_id = str(request_id).strip() if request_id is not None else ""
+        request_lock = (
+            self._request_upload_lock(normalized_request_id) if normalized_request_id else None
+        )
+        if request_lock is not None:
+            with request_lock:
+                return self._create_import_task_locked(
+                    normalized_name=normalized_name,
+                    title=title,
+                    kind=kind,
+                    language=language,
+                    speaker_enabled=speaker_enabled,
+                    request_id=request_id,
+                    normalized_request_id=normalized_request_id,
+                    file_bytes=file_bytes,
+                )
+        return self._create_import_task_locked(
+            normalized_name=normalized_name,
+            title=title,
+            kind=kind,
+            language=language,
+            speaker_enabled=speaker_enabled,
+            request_id=request_id,
+            normalized_request_id=normalized_request_id,
+            file_bytes=file_bytes,
+        )
+
+    def _create_import_task_locked(
+        self,
+        *,
+        normalized_name: str,
+        title: str | None,
+        kind: str,
+        language: str | None,
+        speaker_enabled: bool | None,
+        request_id: str | None,
+        normalized_request_id: str,
+        file_bytes: bytes,
+    ) -> dict[str, object]:
+        existing = self.tasks.existing_task_for_request_id(request_id)
+        if existing is not None:
+            return existing
+        upload_name = "upload.bin" if normalized_request_id else normalized_name
+        uploaded_path = self._uploads_dir(request_id=normalized_request_id or None) / upload_name
+        self._write_uploaded_file(uploaded_path, file_bytes)
+        return self.tasks.create_task(
+            action="import",
+            label="文件导入",
+            request_id=request_id,
+            can_cancel=True,
+            task_spec={
+                "action": "import",
+                "uploaded_path": str(uploaded_path),
+                "title": title,
+                "kind": kind,
+                "language": language,
+                "speaker_enabled": speaker_enabled,
+            },
+            build_runner=lambda task_id, cancel_event: self._build_import_runner(
+                task_id=task_id,
+                uploaded_path=uploaded_path,
+                title=title,
+                kind=kind,
+                language=language,
+                speaker_enabled=speaker_enabled,
+                cancel_event=cancel_event,
+            ),
+        )
+
+    def import_task_payload(self, task_id: str) -> dict[str, object]:
+        return self.tasks.task_payload(task_id)
+
+    def cancel_import_task(self, task_id: str) -> dict[str, object]:
+        return self.tasks.cancel_task(task_id)
+
+    def list_tasks_payload(self) -> dict[str, object]:
+        return self.tasks.list_tasks()
+
+    def task_payload(self, task_id: str) -> dict[str, object]:
+        return self.tasks.task_payload(task_id)
+
+    def cancel_task(self, task_id: str) -> dict[str, object]:
+        return self.tasks.cancel_task(task_id)
+
+    def _build_import_runner(
+        self,
+        *,
+        task_id: str,
+        uploaded_path: Path,
+        title: str | None,
+        kind: str,
+        language: str | None,
+        speaker_enabled: bool | None,
+        cancel_event: threading.Event | None,
+    ):
+        def run() -> None:
+            from live_note.app.coordinator import FileImportCoordinator
+
+            config = self.config
+            if speaker_enabled is not None:
+                config = replace(
+                    config,
+                    speaker=replace(config.speaker, enabled=bool(speaker_enabled)),
+                )
+            runner = FileImportCoordinator(
+                config=config,
+                file_path=str(uploaded_path),
+                title=title,
+                kind=kind,
+                language=language,
+                on_progress=lambda event: self._record_task_progress(task_id, event),
+                cancel_event=cancel_event,
             )
-        except Exception:
-            metadata = workspace.update_session(
-                transcript_source=previous_source,
-                refine_status="failed",
-                status="failed",
+            try:
+                exit_code = runner.run()
+                if exit_code != 0:
+                    raise RuntimeError(f"远端导入返回非零退出码: {exit_code}")
+            finally:
+                self._cleanup_uploaded_file(uploaded_path)
+
+        return run
+
+    def _build_refine_runner(self, task_id: str, session_id: str):
+        def run() -> None:
+            workspace = build_workspace(self.config.root_dir, session_id)
+            metadata = workspace.read_session()
+            logger = workspace.session_logger()
+            previous_source = metadata.transcript_source
+            metadata = workspace.update_session(status="refining", refine_status="refining")
+            try:
+                metadata = _run_live_refinement(
+                    config=self.config,
+                    workspace=workspace,
+                    metadata=metadata,
+                    logger=logger,
+                    on_progress=lambda event: self._record_task_progress(task_id, event),
+                )
+            except Exception:
+                workspace.update_session(
+                    transcript_source=previous_source,
+                    refine_status="failed",
+                    status="failed",
+                )
+                raise
+            metadata = apply_speaker_labels(
+                self.config,
+                workspace,
+                metadata,
+                on_progress=lambda event: self._record_task_progress(task_id, event),
             )
-            raise
-        metadata = apply_speaker_labels(self.config, workspace, metadata)
-        metadata = workspace.update_session(status="completed")
-        return {
-            "session_id": session_id,
-            "accepted": True,
-            "status": metadata.status,
-            "speaker_status": metadata.speaker_status,
-            "refine_status": metadata.refine_status,
+            workspace.update_session(status="completed")
+            self.tasks.mark_completed(
+                task_id,
+                message="远端离线精修已完成。",
+                result_changed=True,
+            )
+
+        return run
+
+    def _build_retranscribe_runner(self, task_id: str, session_id: str):
+        def run() -> None:
+            exit_code = retranscribe_session(
+                self.config,
+                session_id,
+                on_progress=lambda event: self._record_task_progress(task_id, event),
+            )
+            if exit_code != 0:
+                raise RuntimeError(f"远端重转写返回非零退出码: {exit_code}")
+            self.tasks.mark_completed(
+                task_id,
+                message="远端重转写已完成。",
+                result_changed=True,
+            )
+
+        return run
+
+    def _create_postprocess_task(
+        self,
+        session_id: str,
+        *,
+        speaker_enabled: bool | None = None,
+    ) -> dict[str, object]:
+        return self.tasks.create_task(
+            action="postprocess",
+            label="后台整理",
+            session_id=session_id,
+            task_spec={
+                "action": "postprocess",
+                "session_id": session_id,
+                "speaker_enabled": speaker_enabled,
+            },
+            build_runner=lambda task_id, _cancel_event: self._build_postprocess_runner(
+                task_id,
+                session_id,
+                speaker_enabled=speaker_enabled,
+            ),
+        )
+
+    def _build_recovered_runner(
+        self,
+        task_id: str,
+        task_spec: dict[str, object] | None,
+        cancel_event: threading.Event | None,
+    ):
+        if not isinstance(task_spec, dict):
+            raise ValueError("缺少 task_spec，无法恢复任务。")
+        action = str(task_spec.get("action") or "").strip().lower()
+        if action == "import":
+            uploaded_path = self._validated_uploaded_path(task_spec.get("uploaded_path"))
+            if not uploaded_path.exists():
+                raise FileNotFoundError(f"import 文件不存在：{uploaded_path}")
+            title = task_spec.get("title")
+            kind = str(task_spec.get("kind") or "generic")
+            language = task_spec.get("language")
+            speaker_enabled = task_spec.get("speaker_enabled")
+            return self._build_import_runner(
+                task_id=task_id,
+                uploaded_path=uploaded_path,
+                title=str(title) if title is not None else None,
+                kind=kind,
+                language=str(language) if language is not None else None,
+                speaker_enabled=bool(speaker_enabled) if speaker_enabled is not None else None,
+                cancel_event=cancel_event,
+            )
+        if action == "refine":
+            session_id = str(task_spec.get("session_id") or "").strip()
+            if not session_id:
+                raise ValueError("refine 任务缺少 session_id。")
+            return self._build_refine_runner(task_id, session_id)
+        if action == "retranscribe":
+            session_id = str(task_spec.get("session_id") or "").strip()
+            if not session_id:
+                raise ValueError("retranscribe 任务缺少 session_id。")
+            return self._build_retranscribe_runner(task_id, session_id)
+        if action == "postprocess":
+            raise RuntimeError("postprocess 任务暂不支持重启恢复，请手动重试。")
+        raise ValueError(f"未知任务恢复动作：{action or '<empty>'}")
+
+    def _build_postprocess_runner(
+        self,
+        task_id: str,
+        session_id: str,
+        *,
+        speaker_enabled: bool | None = None,
+    ):
+        def run() -> None:
+            workspace = build_workspace(self.config.root_dir, session_id)
+            config = self.config
+            if speaker_enabled is not None:
+                config = replace(
+                    config,
+                    speaker=replace(config.speaker, enabled=bool(speaker_enabled)),
+                )
+            _run_remote_postprocess(
+                config,
+                workspace,
+                workspace.read_session(),
+                logger=workspace.session_logger(),
+                on_progress=lambda event: self._record_task_progress(task_id, event),
+            )
+            workspace.update_session(status="completed")
+            self.tasks.mark_completed(
+                task_id,
+                message="远端后台整理已完成。",
+                result_changed=True,
+            )
+
+        return run
+
+    def _record_task_progress(self, task_id: str, event: ProgressEvent) -> None:
+        result_changed = event.stage in {
+            "segment_transcribed",
+            "publishing",
+            "summarizing",
+            "done",
         }
+        self.tasks.record_progress(task_id, event, result_changed=result_changed)
+
+    def _uploads_dir(self, *, request_id: str | None = None) -> Path:
+        root = self._uploads_root()
+        normalized_request_id = str(request_id).strip() if request_id is not None else ""
+        if normalized_request_id:
+            return root / uuid5(NAMESPACE_URL, normalized_request_id).hex
+        return root / uuid4().hex
+
+    def _uploads_root(self) -> Path:
+        return self.config.root_dir / ".live-note" / "remote-imports"
+
+    def _request_upload_lock(self, request_id: str) -> threading.Lock:
+        with self._request_upload_locks_lock:
+            existing = self._request_upload_locks.get(request_id)
+            if existing is not None:
+                return existing
+            created = threading.Lock()
+            self._request_upload_locks[request_id] = created
+            return created
+
+    def _write_uploaded_file(self, uploaded_path: Path, file_bytes: bytes) -> None:
+        uploaded_path.parent.mkdir(parents=True, exist_ok=True)
+        uploaded_path.write_bytes(file_bytes)
+
+    def _validated_uploaded_path(self, uploaded_path: object) -> Path:
+        uploaded_path_text = str(uploaded_path).strip() if uploaded_path is not None else ""
+        if not uploaded_path_text:
+            raise ValueError("import 任务缺少 uploaded_path。")
+        try:
+            candidate = Path(uploaded_path_text).expanduser().resolve(strict=False)
+        except OSError as exc:
+            raise ValueError(f"import uploaded_path 非法：{uploaded_path_text}") from exc
+        uploads_root = self._uploads_root().resolve(strict=False)
+        try:
+            candidate.relative_to(uploads_root)
+        except ValueError as exc:
+            raise ValueError(f"import uploaded_path 超出 uploads root：{candidate}") from exc
+        if candidate == uploads_root:
+            raise ValueError("import uploaded_path 不能指向 uploads 根目录。")
+        return candidate
+
+    def _cleanup_uploaded_file(self, uploaded_path: Path) -> None:
+        try:
+            uploaded_path = self._validated_uploaded_path(uploaded_path)
+        except ValueError:
+            return
+        try:
+            uploaded_path.unlink(missing_ok=True)
+        except OSError:
+            return
+        uploads_root = self._uploads_root().resolve(strict=False)
+        parent = uploaded_path.parent
+        while parent != uploads_root and parent.is_relative_to(uploads_root):
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
 
     async def live_session(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -125,6 +517,11 @@ class RemoteSessionService:
             config=self.config,
             request=request,
             on_progress=lambda event: event_queue.put(progress_to_payload(event)),
+            on_event=event_queue.put,
+            create_postprocess_task=lambda session_id: self._create_postprocess_task(
+                session_id,
+                speaker_enabled=request.speaker_enabled,
+            ),
         )
         metadata = runner.start()
         await websocket.send_json(
@@ -173,6 +570,7 @@ class RemoteSessionService:
             else {
                 "type": "completed",
                 "session_id": runner.session_id,
+                "postprocess_task": runner.postprocess_task_payload,
             }
         )
         await websocket.send_json(terminal)
@@ -219,6 +617,162 @@ class _RemoteCaptureState:
         self._paused = False
 
 
+class _FunAsrDraftTracker:
+    def __init__(self) -> None:
+        self._next_index = 1
+        self._current_segment_id: str | None = None
+        self._current_started_ms = 0
+        self._current_ended_ms = 0
+        self._current_text = ""
+        self._last_finalized_ms = 0
+        self._stream_base_ms = 0
+
+    @property
+    def has_open_segment(self) -> bool:
+        return self._current_segment_id is not None and bool(self._current_text)
+
+    def start_stream(self, base_ms: int) -> None:
+        self._stream_base_ms = max(0, int(base_ms))
+        if self._current_segment_id is None:
+            self._current_started_ms = max(self._last_finalized_ms, self._stream_base_ms)
+            self._current_ended_ms = self._current_started_ms
+
+    def build_partial_payload(
+        self,
+        text: str,
+        *,
+        current_ms: int,
+        bounds_ms: tuple[int, int] | None = None,
+    ) -> dict[str, object] | None:
+        cleaned = text.strip()
+        if not cleaned:
+            return None
+        started_ms, ended_ms = self._resolve_bounds(current_ms=current_ms, bounds_ms=bounds_ms)
+        self._ensure_current_segment(started_ms=started_ms)
+        if cleaned == self._current_text and ended_ms <= self._current_ended_ms:
+            return None
+        self._current_started_ms = min(self._current_started_ms, started_ms)
+        self._current_ended_ms = max(self._current_ended_ms, ended_ms)
+        self._current_text = cleaned
+        return {
+            "type": "segment_partial",
+            "segment_id": self._current_segment_id,
+            "started_ms": self._current_started_ms,
+            "ended_ms": self._current_ended_ms,
+            "text": cleaned,
+            "speaker_label": None,
+        }
+
+    def build_final_entry(
+        self,
+        text: str,
+        *,
+        current_ms: int,
+        bounds_ms: tuple[int, int] | None = None,
+    ) -> TranscriptEntry | None:
+        cleaned = text.strip()
+        if not cleaned:
+            return None
+        started_ms, ended_ms = self._resolve_bounds(current_ms=current_ms, bounds_ms=bounds_ms)
+        self._ensure_current_segment(started_ms=started_ms)
+        self._current_started_ms = min(self._current_started_ms, started_ms)
+        self._current_ended_ms = max(self._current_ended_ms, ended_ms)
+        entry = TranscriptEntry(
+            segment_id=str(self._current_segment_id),
+            started_ms=self._current_started_ms,
+            ended_ms=self._current_ended_ms,
+            text=cleaned,
+        )
+        self._last_finalized_ms = self._current_ended_ms
+        self._current_segment_id = None
+        self._current_started_ms = self._last_finalized_ms
+        self._current_ended_ms = self._last_finalized_ms
+        self._current_text = ""
+        return entry
+
+    def force_finalize(self) -> TranscriptEntry | None:
+        cleaned = self._current_text.strip()
+        if self._current_segment_id is None or not cleaned:
+            return None
+        ended_ms = max(self._current_ended_ms, self._current_started_ms + 1)
+        entry = TranscriptEntry(
+            segment_id=str(self._current_segment_id),
+            started_ms=self._current_started_ms,
+            ended_ms=ended_ms,
+            text=cleaned,
+        )
+        self._last_finalized_ms = ended_ms
+        self._current_segment_id = None
+        self._current_started_ms = ended_ms
+        self._current_ended_ms = ended_ms
+        self._current_text = ""
+        return entry
+
+    def _ensure_current_segment(self, *, started_ms: int | None = None) -> None:
+        if self._current_segment_id is not None:
+            return
+        self._current_segment_id = f"seg-{self._next_index:05d}"
+        self._next_index += 1
+        resolved_started_ms = max(
+            self._last_finalized_ms,
+            self._stream_base_ms,
+            started_ms if started_ms is not None else self._last_finalized_ms,
+        )
+        self._current_started_ms = resolved_started_ms
+        self._current_ended_ms = resolved_started_ms
+
+    def _resolve_bounds(
+        self,
+        *,
+        current_ms: int,
+        bounds_ms: tuple[int, int] | None,
+    ) -> tuple[int, int]:
+        if bounds_ms is not None:
+            start = self._stream_base_ms + max(0, int(bounds_ms[0]))
+            end = self._stream_base_ms + max(0, int(bounds_ms[1]))
+            start_ms = min(start, end)
+            end_ms = max(start, end)
+            return (start_ms, max(end_ms, start_ms + 1))
+        started_ms = (
+            self._current_started_ms
+            if self._current_segment_id is not None
+            else max(self._last_finalized_ms, self._stream_base_ms)
+        )
+        ended_ms = max(self._current_ended_ms, current_ms, started_ms + 1)
+        return (started_ms, ended_ms)
+
+
+class _FunAsrAudioBatcher:
+    def __init__(self, chunk_ms: int) -> None:
+        self._chunk_ms = max(1, chunk_ms)
+        self._buffer = bytearray()
+        self._duration_ms = 0
+
+    def push(self, frame: AudioFrame) -> bytes | None:
+        self._buffer.extend(frame.pcm16)
+        self._duration_ms += max(1, frame.ended_ms - frame.started_ms)
+        if self._duration_ms < self._chunk_ms:
+            return None
+        return self.flush()
+
+    def flush(self) -> bytes | None:
+        if not self._buffer:
+            return None
+        payload = bytes(self._buffer)
+        self._buffer.clear()
+        self._duration_ms = 0
+        return payload
+
+
+def _is_funasr_final_message(message: FunAsrMessage) -> bool:
+    mode = message.mode.strip().lower().replace("_", "-")
+    if mode in {"offline", "2pass-offline"}:
+        return True
+    if mode in {"online", "2pass-online"}:
+        return False
+    return message.is_final
+
+
 class RemoteLiveSessionRunner(SessionCoordinator):
     def __init__(
         self,
@@ -226,7 +780,14 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         config: AppConfig,
         request: LiveStartRequest,
         on_progress,
+        on_event=None,
+        create_postprocess_task=None,
     ) -> None:
+        if request.speaker_enabled is not None:
+            config = replace(
+                config,
+                speaker=replace(config.speaker, enabled=bool(request.speaker_enabled)),
+            )
         super().__init__(
             config=config,
             title=request.title,
@@ -237,6 +798,7 @@ class RemoteLiveSessionRunner(SessionCoordinator):
             auto_refine_after_live=request.auto_refine_after_live,
         )
         self.request = request
+        self.on_event = on_event
         self.frame_queue: queue.Queue[AudioFrame | object] = queue.Queue(
             maxsize=self.config.audio.queue_size
         )
@@ -248,6 +810,8 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         self.workspace: SessionWorkspace | None = None
         self.metadata: SessionMetadata | None = None
         self.failure_message: str | None = None
+        self.postprocess_task_payload: dict[str, object] | None = None
+        self._create_postprocess_task = create_postprocess_task
 
     @property
     def is_alive(self) -> bool:
@@ -286,12 +850,7 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         self._pcm_buffer.extend(pcm16)
         frame_bytes = max(
             2,
-            int(
-                self.config.audio.sample_rate
-                * self.config.audio.frame_duration_ms
-                / 1000
-            )
-            * 2,
+            int(self.config.audio.sample_rate * self.config.audio.frame_duration_ms / 1000) * 2,
         )
         frame_duration_ms = max(1, self.config.audio.frame_duration_ms)
         while len(self._pcm_buffer) >= frame_bytes:
@@ -307,7 +866,6 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                     pcm16=frame_pcm16,
                 )
             )
-        
 
     def run(self) -> int:
         assert self.workspace is not None
@@ -334,55 +892,26 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                 f"正在接收远端音频：{metadata.source_label}",
                 session_id=metadata.session_id,
             )
-            whisper_config = _runtime_whisper_config(self.config.whisper, self.language)
-            whisper_client = WhisperInferenceClient(whisper_config)
-            whisper_server = WhisperServerProcess(whisper_config, workspace.logs_txt)
-            segmenter = SpeechSegmenter(self.config.audio)
-
-            segment_thread = threading.Thread(
-                target=self._segment_loop,
-                name="remote-segmenter",
-                daemon=True,
-                args=(self.frame_queue, self.segment_queue, segmenter, workspace),
-            )
-            transcribe_thread = threading.Thread(
-                target=self._transcribe_loop,
-                name="remote-transcriber",
-                daemon=True,
-                args=(self.segment_queue, workspace, metadata, disabled_obsidian, whisper_client),
-            )
-            capture_finished = False
-            capture_announced = False
-
-            with whisper_server:
-                segment_thread.start()
-                transcribe_thread.start()
-                while True:
-                    self._drain_control_commands(
-                        capture=self._capture,
-                        frame_queue=self.frame_queue,
-                        workspace=workspace,
-                        metadata=metadata,
-                        logger=logger,
-                    )
-                    self._raise_thread_error_if_any()
-                    if self._stop_event.wait(0.1):
-                        capture_finished = True
-                        break
-                if capture_finished and not capture_announced:
-                    metadata = workspace.update_status("finalizing")
-                    _emit_progress(
-                        self.on_progress,
-                        "capture_finished",
-                        "录音已停止，后台继续转写、精修和整理。",
-                        session_id=metadata.session_id,
-                    )
-                    capture_announced = True
-                self.frame_queue.put(FRAME_STOP)
-                segment_thread.join()
-                transcribe_thread.join()
+            if self.config.funasr.enabled:
+                self._run_funasr_live_backend(workspace, metadata, logger)
+            else:
+                self._run_whisper_live_backend(
+                    workspace,
+                    metadata,
+                    logger,
+                    disabled_obsidian,
+                )
 
             self._raise_thread_error_if_any()
+            if self._create_postprocess_task is not None:
+                self.postprocess_task_payload = self._create_postprocess_task(metadata.session_id)
+                _emit_progress(
+                    self.on_progress,
+                    "postprocess_queued",
+                    "后台整理已转为远端任务。",
+                    session_id=metadata.session_id,
+                )
+                return 0
             metadata = _run_remote_postprocess(
                 self.config,
                 workspace,
@@ -408,6 +937,297 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                 on_progress=self.on_progress,
             )
             raise
+
+    def _run_whisper_live_backend(
+        self,
+        workspace: SessionWorkspace,
+        metadata: SessionMetadata,
+        logger: logging.Logger,
+        disabled_obsidian: ObsidianClient,
+    ) -> None:
+        whisper_config = _runtime_whisper_config(self.config.whisper, self.language)
+        whisper_client = WhisperInferenceClient(whisper_config)
+        whisper_server = WhisperServerProcess(whisper_config, workspace.logs_txt)
+        segmenter = SpeechSegmenter(self.config.audio)
+
+        segment_thread = threading.Thread(
+            target=self._segment_loop,
+            name="remote-segmenter",
+            daemon=True,
+            args=(self.frame_queue, self.segment_queue, segmenter, workspace),
+        )
+        transcribe_thread = threading.Thread(
+            target=self._transcribe_loop,
+            name="remote-transcriber",
+            daemon=True,
+            args=(self.segment_queue, workspace, metadata, disabled_obsidian, whisper_client),
+        )
+        capture_finished = False
+        capture_announced = False
+
+        with whisper_server:
+            segment_thread.start()
+            transcribe_thread.start()
+            while True:
+                self._drain_control_commands(
+                    capture=self._capture,
+                    frame_queue=self.frame_queue,
+                    workspace=workspace,
+                    metadata=metadata,
+                    logger=logger,
+                )
+                self._raise_thread_error_if_any()
+                if self._stop_event.wait(0.1):
+                    capture_finished = True
+                    break
+            if capture_finished and not capture_announced:
+                workspace.update_status("finalizing")
+                _emit_progress(
+                    self.on_progress,
+                    "capture_finished",
+                    "录音已停止，后台继续转写、精修和整理。",
+                    session_id=metadata.session_id,
+                )
+            self.frame_queue.put(FRAME_STOP)
+            segment_thread.join()
+            transcribe_thread.join()
+
+    def _run_funasr_live_backend(
+        self,
+        workspace: SessionWorkspace,
+        metadata: SessionMetadata,
+        logger: logging.Logger,
+    ) -> None:
+        tracker = _FunAsrDraftTracker()
+        chunker = _FunAsrAudioBatcher(chunk_ms=60)
+        current_ms = 0
+        tracker.start_stream(current_ms)
+        connection = self._open_funasr_connection(metadata.session_id)
+
+        with _open_session_audio_writer(
+            workspace.session_live_wav,
+            self.config.audio.sample_rate,
+            enabled=self.config.audio.save_session_wav,
+        ) as session_audio:
+            while True:
+                self._drain_control_commands(
+                    capture=self._capture,
+                    frame_queue=self.frame_queue,
+                    workspace=workspace,
+                    metadata=metadata,
+                    logger=logger,
+                )
+                self._drain_funasr_messages(connection, tracker, workspace, metadata, current_ms)
+                try:
+                    if self._stop_event.is_set():
+                        item = self.frame_queue.get_nowait()
+                    else:
+                        item = self.frame_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if self._stop_event.is_set():
+                        break
+                    continue
+                if item is FRAME_PAUSE:
+                    self._flush_funasr_stream(
+                        connection,
+                        chunker,
+                        tracker,
+                        workspace,
+                        metadata,
+                        current_ms,
+                    )
+                    if connection is not None:
+                        connection.close()
+                    connection = None
+                    continue
+                if item is FRAME_RESUME:
+                    if connection is None:
+                        tracker.start_stream(current_ms)
+                        connection = self._open_funasr_connection(metadata.session_id)
+                    continue
+                if item is FRAME_STOP:
+                    break
+                assert isinstance(item, AudioFrame)
+                current_ms = item.ended_ms
+                if session_audio is not None:
+                    session_audio.write(item.pcm16)
+                if connection is None:
+                    tracker.start_stream(current_ms)
+                    connection = self._open_funasr_connection(metadata.session_id)
+                payload = chunker.push(item)
+                if payload and connection is not None:
+                    connection.send_audio(payload)
+                    self._drain_funasr_messages(
+                        connection,
+                        tracker,
+                        workspace,
+                        metadata,
+                        current_ms,
+                    )
+
+            workspace.update_status("finalizing")
+            _emit_progress(
+                self.on_progress,
+                "capture_finished",
+                "录音已停止，后台继续转写、精修和整理。",
+                session_id=metadata.session_id,
+            )
+            self._flush_funasr_stream(
+                connection,
+                chunker,
+                tracker,
+                workspace,
+                metadata,
+                current_ms,
+            )
+            if connection is not None:
+                connection.close()
+
+    def _open_funasr_connection(self, wav_name: str):
+        connection = FunAsrWebSocketClient(self.config.funasr).connect_live()
+        connection.start_stream(
+            wav_name=wav_name,
+            sample_rate=self.config.audio.sample_rate,
+        )
+        return connection
+
+    def _flush_funasr_stream(
+        self,
+        connection,
+        chunker: _FunAsrAudioBatcher,
+        tracker: _FunAsrDraftTracker,
+        workspace: SessionWorkspace,
+        metadata: SessionMetadata,
+        current_ms: int,
+    ) -> None:
+        if connection is None:
+            return
+        payload = chunker.flush()
+        awaiting_result = bool(payload) or tracker.has_open_segment
+        if payload:
+            connection.send_audio(payload)
+            self._drain_funasr_messages(connection, tracker, workspace, metadata, current_ms)
+            awaiting_result = tracker.has_open_segment
+        connection.send_stop()
+        deadline = time.monotonic() + min(max(self.config.remote.timeout_seconds, 1), 8)
+        while time.monotonic() < deadline:
+            try:
+                message = connection.recv_message(timeout=0.2)
+            except TimeoutError:
+                if not awaiting_result:
+                    return
+                continue
+            self._handle_funasr_message(message, tracker, workspace, metadata, current_ms)
+            awaiting_result = tracker.has_open_segment
+            if not awaiting_result:
+                return
+        forced_entry = tracker.force_finalize()
+        if forced_entry is not None:
+            self._commit_funasr_final_entry(forced_entry, workspace, metadata)
+
+    def _drain_funasr_messages(
+        self,
+        connection,
+        tracker: _FunAsrDraftTracker,
+        workspace: SessionWorkspace,
+        metadata: SessionMetadata,
+        current_ms: int,
+    ) -> None:
+        if connection is None:
+            return
+        while True:
+            try:
+                message = connection.recv_message(timeout=0.01)
+            except TimeoutError:
+                return
+            self._handle_funasr_message(message, tracker, workspace, metadata, current_ms)
+
+    def _handle_funasr_message(
+        self,
+        message: FunAsrMessage,
+        tracker: _FunAsrDraftTracker,
+        workspace: SessionWorkspace,
+        metadata: SessionMetadata,
+        current_ms: int,
+    ) -> None:
+        text = message.text.strip()
+        if not text:
+            return
+        if _is_funasr_final_message(message):
+            entry = tracker.build_final_entry(
+                text,
+                current_ms=current_ms,
+                bounds_ms=message.bounds_ms,
+            )
+            if entry is None:
+                return
+            self._commit_funasr_final_entry(entry, workspace, metadata)
+            return
+        payload = tracker.build_partial_payload(
+            text,
+            current_ms=current_ms,
+            bounds_ms=message.bounds_ms,
+        )
+        if payload is None:
+            return
+        self._persist_live_entry(
+            workspace,
+            metadata,
+            TranscriptEntry(
+                segment_id=str(payload["segment_id"]),
+                started_ms=int(payload["started_ms"]),
+                ended_ms=int(payload["ended_ms"]),
+                text=str(payload["text"]),
+            ),
+        )
+        if self.on_event is not None:
+            self.on_event(dict(payload))
+
+    def _commit_funasr_final_entry(
+        self,
+        entry: TranscriptEntry,
+        workspace: SessionWorkspace,
+        metadata: SessionMetadata,
+    ) -> None:
+        self._upsert_final_entry(entry)
+        self._persist_live_entry(workspace, metadata, entry)
+        _emit_progress(
+            self.on_progress,
+            "segment_transcribed",
+            f"片段 {entry.segment_id} 已转写",
+            session_id=metadata.session_id,
+            current=len(self.entries),
+        )
+
+    def _persist_live_entry(
+        self,
+        workspace: SessionWorkspace,
+        metadata: SessionMetadata,
+        entry: TranscriptEntry,
+    ) -> None:
+        workspace.record_segment_text(
+            entry.segment_id,
+            entry.started_ms,
+            entry.ended_ms,
+            entry.text,
+            speaker_label=entry.speaker_label,
+        )
+        content = build_transcript_note(
+            metadata,
+            workspace.transcript_entries(),
+            status="live",
+        )
+        workspace.write_transcript(content)
+
+    def _upsert_final_entry(self, entry: TranscriptEntry) -> None:
+        for index, current in enumerate(self.entries):
+            if current.segment_id != entry.segment_id:
+                continue
+            self.entries[index] = entry
+            break
+        else:
+            self.entries.append(entry)
+        self.entries.sort(key=lambda item: (item.started_ms, item.segment_id))
 
 
 def _run_remote_postprocess(
