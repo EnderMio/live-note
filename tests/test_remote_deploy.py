@@ -8,6 +8,7 @@ from pathlib import Path
 
 from live_note.remote.deploy import (
     RemoteDeployOptions,
+    _resolve_python_bin,
     build_remote_deploy_plan,
     deploy_remote_service,
 )
@@ -58,6 +59,19 @@ class RemoteDeployTests(unittest.TestCase):
         self.assertIn("config.remote.toml", plist_payload["ProgramArguments"][4])
         self.assertIn("launchd.out", plist_payload["StandardOutPath"])
 
+    def test_build_plan_can_install_pyannote_speaker_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            options = RemoteDeployOptions(
+                host="ender@172.21.0.159",
+                speaker_pyannote=True,
+            )
+
+            commands = build_remote_deploy_plan(root, options)
+
+        install_command = next(item for item in commands if item.label == "install_dependencies")
+        self.assertIn(".[dev,speaker,speaker-pyannote]", install_command.argv[2])
+
     def test_deploy_remote_service_executes_plan_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -84,3 +98,80 @@ class RemoteDeployTests(unittest.TestCase):
         self.assertIn("--delete", rsync_argv)
         self.assertTrue(rsync_argv[-2].endswith("/"))
         self.assertEqual("ender@172.21.0.159:~/live-note/", rsync_argv[-1])
+
+    def test_build_plan_can_install_optional_funasr_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            options = RemoteDeployOptions(
+                host="ender@172.21.0.159",
+                funasr=True,
+                funasr_dir="~/live-note-funasr",
+                funasr_label="com.live-note.funasr",
+                funasr_port=10095,
+            )
+
+            commands = build_remote_deploy_plan(root, options)
+
+        labels = [item.label for item in commands]
+        self.assertEqual(
+            [
+                "prepare_directories",
+                "sync_code",
+                "install_dependencies",
+                "prepare_config",
+                "install_funasr_runtime",
+                "install_funasr_launch_agent",
+                "restart_funasr_launch_agent",
+                "install_launch_agent",
+                "restart_launch_agent",
+            ],
+            labels,
+        )
+        prepare_command = next(item for item in commands if item.label == "prepare_directories")
+        self.assertIn("live-note-funasr", prepare_command.argv[2])
+        runtime_command = next(item for item in commands if item.label == "install_funasr_runtime")
+        self.assertIn("https://github.com/alibaba/FunASR.git", runtime_command.argv[2])
+        self.assertNotIn("pull --ff-only", runtime_command.argv[2])
+        self.assertIn("pip install --upgrade pip setuptools wheel", runtime_command.argv[2])
+        self.assertIn(
+            "pip install -U modelscope funasr torch torchaudio",
+            runtime_command.argv[2],
+        )
+        self.assertIn("requirements_server.txt", runtime_command.argv[2])
+        launch_command = next(
+            item for item in commands if item.label == "install_funasr_launch_agent"
+        )
+        encoded = launch_command.argv[2].split("b64decode(", 1)[1].split(")", 1)[0].strip("'\"")
+        plist_payload = plistlib.loads(base64.b64decode(encoded))
+        self.assertEqual("com.live-note.funasr", plist_payload["Label"])
+        self.assertEqual("127.0.0.1", plist_payload["ProgramArguments"][3])
+        self.assertEqual("10095", plist_payload["ProgramArguments"][5])
+        self.assertTrue(plist_payload["ProgramArguments"][1].endswith("funasr_wss_server.py"))
+        self.assertIn("--certfile", plist_payload["ProgramArguments"])
+        self.assertIn("--keyfile", plist_payload["ProgramArguments"])
+
+    def test_resolve_python_bin_prefers_existing_remote_venv_base_python(self) -> None:
+        options = RemoteDeployOptions(
+            host="ender@172.21.0.159",
+            python_bin="python3",
+        )
+
+        resolved = _resolve_python_bin(
+            options,
+            probe=lambda _: "/opt/miniconda3/bin/python3.13",
+        )
+
+        self.assertEqual("/opt/miniconda3/bin/python3.13", resolved.python_bin)
+
+    def test_resolve_python_bin_keeps_explicit_python_choice(self) -> None:
+        options = RemoteDeployOptions(
+            host="ender@172.21.0.159",
+            python_bin="/opt/homebrew/bin/python3.13",
+        )
+
+        resolved = _resolve_python_bin(
+            options,
+            probe=lambda _: "/opt/miniconda3/bin/python3.13",
+        )
+
+        self.assertEqual("/opt/homebrew/bin/python3.13", resolved.python_bin)

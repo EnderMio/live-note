@@ -13,6 +13,7 @@ from live_note.app.coordinator import (
     retranscribe_session,
 )
 from live_note.app.remote_coordinator import RemoteLiveCoordinator
+from live_note.app.remote_import import RemoteImportCoordinator
 from live_note.app.services import AppService
 from live_note.audio.capture import AudioCaptureError, list_input_devices
 from live_note.config import load_config
@@ -69,6 +70,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--speaker",
         action="store_true",
         help="同时安装说话人区分依赖",
+    )
+    remote_deploy_parser.add_argument(
+        "--speaker-pyannote",
+        action="store_true",
+        help="同时安装 pyannote 说话人区分依赖",
+    )
+    remote_deploy_parser.add_argument(
+        "--funasr",
+        action="store_true",
+        help="同时安装 FunASR websocket runtime，并注册独立 launchd 服务",
+    )
+    remote_deploy_parser.add_argument(
+        "--funasr-dir",
+        default="~/live-note-funasr",
+        help="远端 FunASR runtime 目录",
+    )
+    remote_deploy_parser.add_argument(
+        "--funasr-label",
+        default="com.live-note.funasr",
+        help="FunASR launchd 服务标识",
+    )
+    remote_deploy_parser.add_argument(
+        "--funasr-port",
+        type=int,
+        default=10095,
+        help="FunASR websocket 监听端口",
     )
     remote_deploy_parser.add_argument(
         "--skip-deps",
@@ -164,7 +191,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return runner.run()
     if args.command == "import":
-        runner = FileImportCoordinator(
+        coordinator_cls = (
+            RemoteImportCoordinator
+            if getattr(getattr(config, "remote", None), "enabled", False)
+            else FileImportCoordinator
+        )
+        runner = coordinator_cls(
             config=config,
             file_path=args.file,
             title=args.title,
@@ -237,6 +269,11 @@ def launch_remote_deploy(args: argparse.Namespace) -> int:
             remote_home=args.remote_home,
             python_bin=args.python_bin,
             speaker=args.speaker,
+            speaker_pyannote=args.speaker_pyannote,
+            funasr=args.funasr,
+            funasr_dir=args.funasr_dir,
+            funasr_label=args.funasr_label,
+            funasr_port=args.funasr_port,
             skip_deps=args.skip_deps,
             start_service=not args.no_start,
             dry_run=args.dry_run,

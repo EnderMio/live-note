@@ -6,7 +6,7 @@ import plistlib
 import shlex
 import subprocess
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -22,6 +22,14 @@ class RemoteDeployOptions:
     ssh_bin: str = "ssh"
     rsync_bin: str = "rsync"
     speaker: bool = False
+    speaker_pyannote: bool = False
+    funasr: bool = False
+    funasr_dir: str = "~/live-note-funasr"
+    funasr_label: str = "com.live-note.funasr"
+    funasr_repo_url: str = "https://github.com/alibaba/FunASR.git"
+    funasr_host: str = "127.0.0.1"
+    funasr_port: int = 10095
+    funasr_ncpu: int = 4
     skip_deps: bool = False
     start_service: bool = True
     dry_run: bool = False
@@ -43,18 +51,27 @@ def build_remote_deploy_plan(
     config_path_abs = _resolve_remote_path(options.config_path, remote_home)
     launch_agent_path = f"{remote_home}/Library/LaunchAgents/{options.label}.plist"
     logs_dir = f"{remote_dir_abs}/logs"
+    funasr_dir_abs = _resolve_remote_path(options.funasr_dir, remote_home)
+    funasr_repo_dir = f"{funasr_dir_abs}/FunASR"
+    funasr_venv_dir = f"{funasr_dir_abs}/.venv"
+    funasr_logs_dir = f"{funasr_dir_abs}/logs"
+    funasr_launch_agent_path = f"{remote_home}/Library/LaunchAgents/{options.funasr_label}.plist"
     project_root_abs = project_root.resolve()
+    prepare_directories = [
+        remote_dir_abs,
+        data_dir_abs,
+        logs_dir,
+        f"{remote_home}/Library/LaunchAgents",
+    ]
+    if options.funasr:
+        prepare_directories.extend([funasr_dir_abs, funasr_logs_dir])
 
     commands = [
         DeployCommand(
             label="prepare_directories",
             argv=_ssh_shell_command(
                 options,
-                "mkdir -p "
-                f"{shlex.quote(remote_dir_abs)} "
-                f"{shlex.quote(data_dir_abs)} "
-                f"{shlex.quote(logs_dir)} "
-                f"{shlex.quote(f'{remote_home}/Library/LaunchAgents')}",
+                "mkdir -p " + " ".join(shlex.quote(item) for item in prepare_directories),
             ),
         ),
         DeployCommand(
@@ -80,7 +97,12 @@ def build_remote_deploy_plan(
     ]
 
     if not options.skip_deps:
-        install_target = ".[dev,speaker]" if options.speaker else ".[dev]"
+        install_extras = ["dev"]
+        if options.speaker:
+            install_extras.append("speaker")
+        if options.speaker_pyannote:
+            install_extras.extend(["speaker", "speaker-pyannote"])
+        install_target = f".[{','.join(dict.fromkeys(install_extras))}]"
         commands.append(
             DeployCommand(
                 label="install_dependencies",
@@ -114,6 +136,103 @@ def build_remote_deploy_plan(
             ),
         )
     )
+
+    if options.funasr:
+        commands.append(
+            DeployCommand(
+                label="install_funasr_runtime",
+                argv=_ssh_shell_command(
+                    options,
+                    " && ".join(
+                        [
+                            f"mkdir -p {shlex.quote(funasr_dir_abs)}",
+                            (
+                                f"if [ ! -d {shlex.quote(f'{funasr_repo_dir}/.git')} ]; then "
+                                f"git clone --depth 1 "
+                                f"{shlex.quote(options.funasr_repo_url)} "
+                                f"{shlex.quote(funasr_repo_dir)}; fi"
+                            ),
+                            (
+                                f"{shlex.quote(options.python_bin)} "
+                                f"-m venv {shlex.quote(funasr_venv_dir)}"
+                            ),
+                            (
+                                f"{shlex.quote(f'{funasr_venv_dir}/bin/pip')} install "
+                                "--upgrade pip setuptools wheel"
+                            ),
+                            (
+                                f"{shlex.quote(f'{funasr_venv_dir}/bin/pip')} install "
+                                "-U modelscope funasr torch torchaudio"
+                            ),
+                            f"cd {shlex.quote(f'{funasr_repo_dir}/runtime/python/websocket')}",
+                            (
+                                f"{shlex.quote(f'{funasr_venv_dir}/bin/pip')} install "
+                                "-r requirements_server.txt"
+                            ),
+                        ]
+                    ),
+                ),
+            )
+        )
+
+        funasr_plist_payload = _funasr_launch_agent_plist(
+            label=options.funasr_label,
+            python_path=f"{funasr_venv_dir}/bin/python",
+            script_path=f"{funasr_repo_dir}/runtime/python/websocket/funasr_wss_server.py",
+            working_directory=f"{funasr_repo_dir}/runtime/python/websocket",
+            host=options.funasr_host,
+            port=options.funasr_port,
+            ncpu=options.funasr_ncpu,
+            stdout_path=f"{funasr_logs_dir}/launchd.out",
+            stderr_path=f"{funasr_logs_dir}/launchd.err",
+        )
+        funasr_plist_b64 = base64.b64encode(funasr_plist_payload).decode("ascii")
+        commands.append(
+            DeployCommand(
+                label="install_funasr_launch_agent",
+                argv=_ssh_shell_command(
+                    options,
+                    "\n".join(
+                        [
+                            f"{shlex.quote(options.python_bin)} - <<'PY'",
+                            "from base64 import b64decode",
+                            "from pathlib import Path",
+                            f"target = Path({funasr_launch_agent_path!r})",
+                            "target.parent.mkdir(parents=True, exist_ok=True)",
+                            f"target.write_bytes(b64decode({funasr_plist_b64!r}))",
+                            "PY",
+                        ]
+                    ),
+                ),
+            )
+        )
+
+        if options.start_service:
+            funasr_bootout_command = (
+                f"launchctl bootout gui/$(id -u) {shlex.quote(funasr_launch_agent_path)} "
+                ">/dev/null 2>&1 || true"
+            )
+            commands.append(
+                DeployCommand(
+                    label="restart_funasr_launch_agent",
+                    argv=_ssh_shell_command(
+                        options,
+                        "\n".join(
+                            [
+                                funasr_bootout_command,
+                                (
+                                    "launchctl bootstrap gui/$(id -u) "
+                                    f"{shlex.quote(funasr_launch_agent_path)}"
+                                ),
+                                (
+                                    "launchctl kickstart -k "
+                                    f"gui/$(id -u)/{shlex.quote(options.funasr_label)}"
+                                ),
+                            ]
+                        ),
+                    ),
+                )
+            )
 
     plist_payload = _launch_agent_plist(
         label=options.label,
@@ -173,15 +292,60 @@ def deploy_remote_service(
     options: RemoteDeployOptions,
     runner: Callable[[DeployCommand], None] | None = None,
 ) -> int:
-    commands = build_remote_deploy_plan(project_root, options)
+    resolved_options = options if options.dry_run else _resolve_python_bin(options)
+    commands = build_remote_deploy_plan(project_root, resolved_options)
     execute = runner or _run_command
     for command in commands:
-        if options.dry_run:
+        if resolved_options.dry_run:
             print(f"[dry-run] {command.label}")
             print(" ".join(shlex.quote(part) for part in command.argv))
             continue
         execute(command)
     return 0
+
+
+def _resolve_python_bin(
+    options: RemoteDeployOptions,
+    *,
+    probe: Callable[[RemoteDeployOptions], str | None] | None = None,
+) -> RemoteDeployOptions:
+    if options.python_bin.strip() != "python3":
+        return options
+    python_bin = (probe or _probe_existing_remote_python_bin)(options)
+    if not python_bin:
+        return options
+    return replace(options, python_bin=python_bin)
+
+
+def _probe_existing_remote_python_bin(options: RemoteDeployOptions) -> str | None:
+    remote_home = _resolve_remote_home(options)
+    remote_dir_abs = _resolve_remote_path(options.remote_dir, remote_home)
+    command = _ssh_shell_command(
+        options,
+        "\n".join(
+            [
+                f"if [ ! -x {shlex.quote(f'{remote_dir_abs}/.venv/bin/python')} ]; then",
+                "  exit 0",
+                "fi",
+                f"{shlex.quote(f'{remote_dir_abs}/.venv/bin/python')} - <<'PY'",
+                "import sys",
+                'print(getattr(sys, "_base_executable", "") or sys.executable)',
+                "PY",
+            ]
+        ),
+    )
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return None
+    candidate = completed.stdout.strip()
+    if not candidate:
+        return None
+    return candidate.splitlines()[-1].strip() or None
 
 
 def _run_command(command: DeployCommand) -> None:
@@ -239,6 +403,48 @@ def _launch_agent_plist(
             "EnvironmentVariables": {
                 "PYTHONPATH": "src",
             },
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "StandardOutPath": stdout_path,
+            "StandardErrorPath": stderr_path,
+        }
+    )
+
+
+def _funasr_launch_agent_plist(
+    *,
+    label: str,
+    python_path: str,
+    script_path: str,
+    working_directory: str,
+    host: str,
+    port: int,
+    ncpu: int,
+    stdout_path: str,
+    stderr_path: str,
+) -> bytes:
+    return plistlib.dumps(
+        {
+            "Label": label,
+            "ProgramArguments": [
+                python_path,
+                script_path,
+                "--host",
+                host,
+                "--port",
+                str(port),
+                "--certfile",
+                "",
+                "--keyfile",
+                "",
+                "--ngpu",
+                "0",
+                "--device",
+                "cpu",
+                "--ncpu",
+                str(max(1, int(ncpu))),
+            ],
+            "WorkingDirectory": working_directory,
             "RunAtLoad": True,
             "KeepAlive": True,
             "StandardOutPath": stdout_path,
