@@ -27,6 +27,9 @@ speaker = [
   "numpy>=2.0.0",
   "sherpa-onnx",
 ]
+speaker-pyannote = [
+  "pyannote.audio",
+]
 
 [project.scripts]
 live-note = "live_note.app.cli:main"

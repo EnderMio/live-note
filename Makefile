@@ -2,7 +2,7 @@ PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 PYTHONPATH := src
 ARGS ?=
 
-.PHONY: setup setup-speaker dev gui serve deploy-remote doctor devices import finalize retranscribe refine merge test lint
+.PHONY: setup setup-speaker setup-speaker-pyannote dev gui serve deploy-remote doctor devices import finalize retranscribe refine merge test lint
 
 setup:
 	$(PYTHON) -m venv .venv
@@ -13,6 +13,11 @@ setup-speaker:
 	$(PYTHON) -m venv .venv
 	.venv/bin/pip install --upgrade pip
 	.venv/bin/pip install -e ".[dev,speaker]"
+
+setup-speaker-pyannote:
+	$(PYTHON) -m venv .venv
+	.venv/bin/pip install --upgrade pip
+	.venv/bin/pip install -e ".[dev,speaker,speaker-pyannote]"
 
 dev:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note start $(ARGS)
