@@ -51,12 +51,25 @@ from .session_outputs import (
     try_sync_note,
     write_initial_transcript,
 )
+from .task_errors import TaskCancelledError
 
 FRAME_STOP = object()
 FRAME_PAUSE = object()
 FRAME_RESUME = object()
 SEGMENT_STOP = object()
 SEGMENT_CONTEXT_RESET = object()
+
+
+def apply_speaker_labels(*args, **kwargs):
+    from live_note.remote.speaker import apply_speaker_labels as _apply_speaker_labels
+
+    return _apply_speaker_labels(*args, **kwargs)
+
+
+def _import_chunk_seconds(config: AppConfig) -> int:
+    if config.speaker.enabled:
+        return min(config.importer.chunk_seconds, 15)
+    return config.importer.chunk_seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,6 +354,13 @@ class SessionCoordinator:
                         transcript_source=previous_source,
                         refine_status="failed",
                     )
+            if self.config.speaker.enabled:
+                metadata = apply_speaker_labels(
+                    self.config,
+                    workspace,
+                    metadata,
+                    on_progress=self.on_progress,
+                )
             publish_final_outputs(
                 workspace,
                 metadata,
@@ -542,6 +562,7 @@ class FileImportCoordinator:
         kind: str,
         language: str | None = None,
         on_progress: ProgressCallback | None = None,
+        cancel_event: threading.Event | None = None,
     ):
         self.config = config
         self.file_path = Path(file_path).expanduser().resolve()
@@ -549,6 +570,7 @@ class FileImportCoordinator:
         self.kind = kind
         self.language = language or config.whisper.language
         self.on_progress = on_progress
+        self.cancel_event = cancel_event
         self.entries: list[TranscriptEntry] = []
 
     def run(self) -> int:
@@ -565,6 +587,7 @@ class FileImportCoordinator:
         logger = workspace.session_logger()
         try:
             _attach_console_logging()
+            self._raise_if_cancelled(workspace, logger)
             _emit_progress(
                 self.on_progress,
                 "starting",
@@ -585,6 +608,7 @@ class FileImportCoordinator:
                 f"正在转换媒体文件：{self.file_path.name}",
                 session_id=metadata.session_id,
             )
+            self._raise_if_cancelled(workspace, logger, metadata.session_id)
 
             normalized_path = workspace.root / "source.normalized.wav"
             try:
@@ -600,10 +624,11 @@ class FileImportCoordinator:
                     "正在切分音频片段。",
                     session_id=metadata.session_id,
                 )
+                self._raise_if_cancelled(workspace, logger, metadata.session_id)
                 chunks = split_wav_file(
                     input_path=normalized_path,
                     output_dir=workspace.segments_dir,
-                    chunk_seconds=self.config.importer.chunk_seconds,
+                    chunk_seconds=_import_chunk_seconds(self.config),
                 )
                 if not chunks:
                     raise AudioImportError("转换后的音频为空，无法转写。")
@@ -617,6 +642,7 @@ class FileImportCoordinator:
 
                 with WhisperServerProcess(whisper_config, workspace.logs_txt):
                     for index, chunk in enumerate(chunks, start=1):
+                        self._raise_if_cancelled(workspace, logger, metadata.session_id)
                         _emit_progress(
                             self.on_progress,
                             "transcribing",
@@ -651,25 +677,40 @@ class FileImportCoordinator:
                                 current=index,
                                 total=len(chunks),
                             )
+                self._raise_if_cancelled(workspace, logger, metadata.session_id)
+                metadata = apply_speaker_labels(
+                    self.config,
+                    workspace,
+                    metadata,
+                    audio_path=normalized_path,
+                    on_progress=self.on_progress,
+                    cancel_callback=lambda: self._raise_if_cancelled(
+                        workspace,
+                        logger,
+                        metadata.session_id,
+                    ),
+                )
+                self._raise_if_cancelled(workspace, logger, metadata.session_id)
+                publish_final_outputs(
+                    workspace,
+                    metadata,
+                    obsidian,
+                    llm_client,
+                    logger,
+                    on_progress=self.on_progress,
+                )
+                _emit_progress(
+                    self.on_progress,
+                    "done",
+                    "导入会话已完成。",
+                    session_id=metadata.session_id,
+                )
+                return 0
             finally:
                 if normalized_path.exists() and not self.config.importer.keep_normalized_audio:
                     normalized_path.unlink()
-
-            publish_final_outputs(
-                workspace,
-                metadata,
-                obsidian,
-                llm_client,
-                logger,
-                on_progress=self.on_progress,
-            )
-            _emit_progress(
-                self.on_progress,
-                "done",
-                "导入会话已完成。",
-                session_id=metadata.session_id,
-            )
-            return 0
+        except TaskCancelledError:
+            raise
         except BaseException as exc:
             _mark_session_failed(
                 workspace=workspace,
@@ -679,6 +720,24 @@ class FileImportCoordinator:
                 on_progress=self.on_progress,
             )
             raise
+
+    def _raise_if_cancelled(
+        self,
+        workspace: SessionWorkspace,
+        logger: logging.Logger,
+        session_id: str | None = None,
+    ) -> None:
+        if self.cancel_event is None or not self.cancel_event.is_set():
+            return
+        workspace.update_status("cancelled")
+        logger.info("导入会话已取消。")
+        _emit_progress(
+            self.on_progress,
+            "cancelled",
+            "导入任务已取消。",
+            session_id=session_id,
+        )
+        raise TaskCancelledError("导入任务已取消。")
 
 
 def finalize_session(

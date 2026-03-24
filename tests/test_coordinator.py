@@ -7,6 +7,7 @@ import unittest
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from live_note.app.coordinator import (
@@ -18,6 +19,7 @@ from live_note.app.coordinator import (
     finalize_session,
 )
 from live_note.app.journal import SessionWorkspace, list_sessions
+from live_note.app.task_errors import TaskCancelledError
 from live_note.audio.capture import InputDevice
 from live_note.audio.convert import AudioImportError
 from live_note.config import (
@@ -27,6 +29,7 @@ from live_note.config import (
     LlmConfig,
     ObsidianConfig,
     RefineConfig,
+    SpeakerConfig,
     WhisperConfig,
 )
 from live_note.domain import PendingSegment, SessionMetadata, TranscriptEntry
@@ -172,6 +175,121 @@ class CoordinatorFailureTests(unittest.TestCase):
                 worker.join(timeout=2)
                 self.assertFalse(worker.is_alive(), "释放分段线程后会话应完成退出。")
 
+    def test_live_coordinator_runs_speaker_diarization_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = replace(
+                _sample_config(root),
+                refine=RefineConfig(enabled=False, auto_after_live=False),
+                speaker=SpeakerConfig(
+                    enabled=True,
+                    segmentation_model=Path("/models/segmentation.onnx"),
+                    embedding_model=Path("/models/embedding.onnx"),
+                ),
+            )
+            runner = SessionCoordinator(
+                config=config,
+                title="产品周会",
+                source="1",
+                kind="meeting",
+            )
+
+            class _FakeCapture:
+                def __init__(self, *_args, **_kwargs) -> None:
+                    self._stopped = False
+
+                @property
+                def error(self) -> Exception | None:
+                    return None
+
+                @property
+                def is_alive(self) -> bool:
+                    return not self._stopped
+
+                @property
+                def is_paused(self) -> bool:
+                    return False
+
+                def start(self) -> None:
+                    return None
+
+                def stop(self) -> None:
+                    self._stopped = True
+
+                def pause(self) -> None:
+                    return None
+
+                def resume(self) -> None:
+                    return None
+
+                def join(self, timeout: float | None = None) -> None:
+                    del timeout
+
+            def fake_segment_loop(
+                _self,
+                frame_queue,
+                segment_queue,
+                segmenter,
+                workspace,
+            ) -> None:
+                del _self, segmenter, workspace
+                while True:
+                    if frame_queue.get() is FRAME_STOP:
+                        break
+                segment_queue.put(SEGMENT_STOP)
+
+            def fake_transcribe_loop(
+                _self,
+                segment_queue,
+                workspace,
+                metadata,
+                obsidian,
+                whisper_client,
+            ) -> None:
+                del _self, workspace, metadata, obsidian, whisper_client
+                while True:
+                    if segment_queue.get() is SEGMENT_STOP:
+                        return
+
+            def fake_apply_speaker_labels(_config, workspace, _metadata, **_kwargs):
+                return workspace.update_session(speaker_status="done")
+
+            with (
+                patch(
+                    "live_note.app.coordinator.resolve_input_device",
+                    return_value=InputDevice(1, "BlackHole 2ch", 2, 48000),
+                ),
+                patch("live_note.app.coordinator._attach_console_logging"),
+                patch(
+                    "live_note.app.coordinator.ObsidianClient",
+                    return_value=_FakeObsidianClient(),
+                ),
+                patch("live_note.app.coordinator.OpenAiCompatibleClient"),
+                patch("live_note.app.coordinator.WhisperInferenceClient"),
+                patch("live_note.app.coordinator.WhisperServerProcess", return_value=nullcontext()),
+                patch("live_note.app.coordinator.write_initial_transcript"),
+                patch("live_note.app.coordinator.publish_final_outputs"),
+                patch("live_note.app.coordinator.SpeechSegmenter"),
+                patch("live_note.app.coordinator.AudioCaptureService", _FakeCapture),
+                patch.object(SessionCoordinator, "_segment_loop", fake_segment_loop),
+                patch.object(SessionCoordinator, "_transcribe_loop", fake_transcribe_loop),
+                patch(
+                    "live_note.app.coordinator.apply_speaker_labels",
+                    side_effect=fake_apply_speaker_labels,
+                    create=True,
+                ) as apply_mock,
+            ):
+                worker = threading.Thread(target=runner.run, daemon=True)
+                worker.start()
+                runner.request_stop()
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive(), "会话停止后应完成退出。")
+
+            metadata = _load_single_session_metadata(root)
+
+        apply_mock.assert_called_once()
+        self.assertEqual("done", metadata.speaker_status)
+
     def test_live_transcribe_loop_resets_prompt_context_after_pause_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -295,6 +413,280 @@ class CoordinatorFailureTests(unittest.TestCase):
             metadata = _load_single_session_metadata(root)
 
         self.assertEqual("failed", metadata.status)
+
+    def test_import_coordinator_marks_session_cancelled_when_cancel_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            media_path = root / "sample.mp3"
+            media_path.write_bytes(b"fake-audio")
+            config = _sample_config(root)
+            cancel_event = threading.Event()
+            runner = FileImportCoordinator(
+                config=config,
+                file_path=str(media_path),
+                title="课程录音",
+                kind="lecture",
+                cancel_event=cancel_event,
+            )
+
+            def process_and_cancel(**_kwargs):
+                cancel_event.set()
+                return True
+
+            def fake_split_wav_file(*, output_dir, **_kwargs):
+                return [
+                    SimpleNamespace(
+                        segment_id="seg-00001",
+                        started_ms=0,
+                        ended_ms=1000,
+                        wav_path=output_dir / "seg-00001.wav",
+                    ),
+                    SimpleNamespace(
+                        segment_id="seg-00002",
+                        started_ms=1000,
+                        ended_ms=2000,
+                        wav_path=output_dir / "seg-00002.wav",
+                    ),
+                ]
+
+            with (
+                patch("live_note.app.coordinator._attach_console_logging"),
+                patch(
+                    "live_note.app.coordinator.ObsidianClient",
+                    return_value=_FakeObsidianClient(),
+                ),
+                patch("live_note.app.coordinator.OpenAiCompatibleClient"),
+                patch("live_note.app.coordinator.WhisperInferenceClient"),
+                patch("live_note.app.coordinator.convert_audio_to_wav"),
+                patch("live_note.app.coordinator.split_wav_file", side_effect=fake_split_wav_file),
+                patch("live_note.app.coordinator.WhisperServerProcess"),
+                patch(
+                    "live_note.app.coordinator._process_segment",
+                    side_effect=process_and_cancel,
+                ),
+            ):
+                with self.assertRaisesRegex(TaskCancelledError, "取消"):
+                    runner.run()
+
+            metadata = _load_single_session_metadata(root)
+
+        self.assertEqual("cancelled", metadata.status)
+
+    def test_import_coordinator_runs_speaker_diarization_with_normalized_audio_when_enabled(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            media_path = root / "sample.mp3"
+            media_path.write_bytes(b"fake-audio")
+            config = replace(
+                _sample_config(root),
+                speaker=SpeakerConfig(
+                    enabled=True,
+                    segmentation_model=Path("/models/segmentation.onnx"),
+                    embedding_model=Path("/models/embedding.onnx"),
+                ),
+            )
+            runner = FileImportCoordinator(
+                config=config,
+                file_path=str(media_path),
+                title="课程录音",
+                kind="lecture",
+            )
+
+            def fake_convert_audio_to_wav(*, output_path, **_kwargs):
+                output_path.write_bytes(b"RIFF")
+                return output_path
+
+            def fake_split_wav_file(*, output_dir, **_kwargs):
+                self.assertEqual(15, _kwargs["chunk_seconds"])
+                chunk_path = output_dir / "seg-00001.wav"
+                chunk_path.parent.mkdir(parents=True, exist_ok=True)
+                chunk_path.write_bytes(b"RIFF")
+                return [
+                    SimpleNamespace(
+                        segment_id="seg-00001",
+                        started_ms=0,
+                        ended_ms=1000,
+                        wav_path=chunk_path,
+                    )
+                ]
+
+            def fake_apply_speaker_labels(_config, workspace, metadata, *, audio_path, **_kwargs):
+                self.assertEqual(workspace.root / "source.normalized.wav", audio_path)
+                self.assertTrue(audio_path.exists())
+                return workspace.update_session(speaker_status="done")
+
+            with (
+                patch("live_note.app.coordinator._attach_console_logging"),
+                patch(
+                    "live_note.app.coordinator.ObsidianClient",
+                    return_value=_FakeObsidianClient(),
+                ),
+                patch("live_note.app.coordinator.OpenAiCompatibleClient"),
+                patch("live_note.app.coordinator.WhisperInferenceClient"),
+                patch(
+                    "live_note.app.coordinator.convert_audio_to_wav",
+                    side_effect=fake_convert_audio_to_wav,
+                ),
+                patch("live_note.app.coordinator.split_wav_file", side_effect=fake_split_wav_file),
+                patch("live_note.app.coordinator.WhisperServerProcess", return_value=nullcontext()),
+                patch("live_note.app.coordinator._process_segment", return_value=True),
+                patch(
+                    "live_note.app.coordinator.apply_speaker_labels",
+                    side_effect=fake_apply_speaker_labels,
+                    create=True,
+                ) as apply_mock,
+                patch("live_note.app.coordinator.publish_final_outputs"),
+            ):
+                exit_code = runner.run()
+
+            metadata = _load_single_session_metadata(root)
+
+        self.assertEqual(0, exit_code)
+        apply_mock.assert_called_once()
+        self.assertEqual("done", metadata.speaker_status)
+
+    def test_import_coordinator_marks_session_cancelled_when_speaker_stage_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            media_path = root / "sample.mp3"
+            media_path.write_bytes(b"fake-audio")
+            cancel_event = threading.Event()
+            config = replace(
+                _sample_config(root),
+                speaker=SpeakerConfig(
+                    enabled=True,
+                    segmentation_model=Path("/models/segmentation.onnx"),
+                    embedding_model=Path("/models/embedding.onnx"),
+                ),
+            )
+            runner = FileImportCoordinator(
+                config=config,
+                file_path=str(media_path),
+                title="课程录音",
+                kind="lecture",
+                cancel_event=cancel_event,
+            )
+
+            def fake_apply_speaker_labels(
+                _config,
+                _workspace,
+                _metadata,
+                *,
+                cancel_callback=None,
+                **_kwargs,
+            ):
+                cancel_event.set()
+                assert cancel_callback is not None
+                cancel_callback()
+                raise AssertionError("应在 cancel_callback 内直接抛出取消")
+
+            with (
+                patch("live_note.app.coordinator._attach_console_logging"),
+                patch(
+                    "live_note.app.coordinator.ObsidianClient",
+                    return_value=_FakeObsidianClient(),
+                ),
+                patch("live_note.app.coordinator.OpenAiCompatibleClient"),
+                patch("live_note.app.coordinator.WhisperInferenceClient"),
+                patch("live_note.app.coordinator.convert_audio_to_wav"),
+                patch(
+                    "live_note.app.coordinator.split_wav_file",
+                    side_effect=lambda *, output_dir, **_kwargs: [
+                        SimpleNamespace(
+                            segment_id="seg-00001",
+                            started_ms=0,
+                            ended_ms=1000,
+                            wav_path=output_dir / "seg-00001.wav",
+                        )
+                    ],
+                ),
+                patch("live_note.app.coordinator.WhisperServerProcess", return_value=nullcontext()),
+                patch("live_note.app.coordinator._process_segment", return_value=True),
+                patch(
+                    "live_note.app.coordinator.apply_speaker_labels",
+                    side_effect=fake_apply_speaker_labels,
+                    create=True,
+                ),
+            ):
+                with self.assertRaisesRegex(TaskCancelledError, "取消"):
+                    runner.run()
+
+            metadata = _load_single_session_metadata(root)
+
+        self.assertEqual("cancelled", metadata.status)
+
+    def test_import_coordinator_keeps_success_when_speaker_diarization_falls_back_to_failed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            media_path = root / "sample.mp3"
+            media_path.write_bytes(b"fake-audio")
+            config = replace(
+                _sample_config(root),
+                speaker=SpeakerConfig(
+                    enabled=True,
+                    segmentation_model=Path("/models/segmentation.onnx"),
+                    embedding_model=Path("/models/embedding.onnx"),
+                ),
+            )
+            runner = FileImportCoordinator(
+                config=config,
+                file_path=str(media_path),
+                title="课程录音",
+                kind="lecture",
+            )
+
+            def fake_convert_audio_to_wav(*, output_path, **_kwargs):
+                output_path.write_bytes(b"RIFF")
+                return output_path
+
+            def fake_split_wav_file(*, output_dir, **_kwargs):
+                chunk_path = output_dir / "seg-00001.wav"
+                chunk_path.parent.mkdir(parents=True, exist_ok=True)
+                chunk_path.write_bytes(b"RIFF")
+                return [
+                    SimpleNamespace(
+                        segment_id="seg-00001",
+                        started_ms=0,
+                        ended_ms=1000,
+                        wav_path=chunk_path,
+                    )
+                ]
+
+            with (
+                patch("live_note.app.coordinator._attach_console_logging"),
+                patch(
+                    "live_note.app.coordinator.ObsidianClient",
+                    return_value=_FakeObsidianClient(),
+                ),
+                patch("live_note.app.coordinator.OpenAiCompatibleClient"),
+                patch("live_note.app.coordinator.WhisperInferenceClient"),
+                patch(
+                    "live_note.app.coordinator.convert_audio_to_wav",
+                    side_effect=fake_convert_audio_to_wav,
+                ),
+                patch("live_note.app.coordinator.split_wav_file", side_effect=fake_split_wav_file),
+                patch("live_note.app.coordinator.WhisperServerProcess", return_value=nullcontext()),
+                patch("live_note.app.coordinator._process_segment", return_value=True),
+                patch(
+                    "live_note.app.coordinator.apply_speaker_labels",
+                    side_effect=lambda _config, workspace, _metadata, **_kwargs: (
+                        workspace.update_session(speaker_status="failed")
+                    ),
+                    create=True,
+                ) as apply_mock,
+                patch("live_note.app.coordinator.publish_final_outputs"),
+            ):
+                exit_code = runner.run()
+
+            metadata = _load_single_session_metadata(root)
+
+        self.assertEqual(0, exit_code)
+        apply_mock.assert_called_once()
+        self.assertEqual("failed", metadata.speaker_status)
 
     def test_finalize_session_skips_whisper_runtime_when_no_segments_are_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
