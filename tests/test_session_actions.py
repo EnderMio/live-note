@@ -21,6 +21,7 @@ class SessionActionsTests(unittest.TestCase):
             title="课程录音",
             kind="lecture",
             language="zh",
+            speaker_enabled=True,
         )
 
         self.assertEqual("文件导入", request.label)
@@ -29,6 +30,7 @@ class SessionActionsTests(unittest.TestCase):
         self.assertEqual("课程录音", request.payload["title"])
         self.assertEqual("lecture", request.payload["kind"])
         self.assertEqual("zh", request.payload["language"])
+        self.assertTrue(request.payload["speaker_enabled"])
 
     def test_build_session_task_request_uses_session_action_channel(self) -> None:
         request = build_session_task_request(

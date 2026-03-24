@@ -35,6 +35,7 @@ def build_import_task_request(
     title: str | None,
     kind: str,
     language: str | None,
+    speaker_enabled: bool | None = None,
 ) -> TaskRequest:
     return TaskRequest(
         label="文件导入",
@@ -44,6 +45,7 @@ def build_import_task_request(
             "title": title or None,
             "kind": kind,
             "language": language,
+            "speaker_enabled": speaker_enabled,
         },
     )
 
