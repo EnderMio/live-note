@@ -142,3 +142,181 @@ class RemoteClientTests(unittest.TestCase):
             "http://remote.example.com/api/v1/sessions/20260318-143616-%E8%BF%9C%E7%A8%8B%E8%BD%AC%E5%86%99%E6%B5%8B%E8%AF%95%E8%82%A1%E7%A5%A8%E8%AF%BE/actions/refine",
             request.full_url,
         )
+
+    def test_create_import_task_posts_audio_bytes_and_encoded_query(self) -> None:
+        config = RemoteConfig(
+            enabled=True,
+            base_url="https://remote.example.com",
+            api_token="secret-token",
+            timeout_seconds=12,
+        )
+        client = RemoteClient(config)
+
+        with patch("pathlib.Path.read_bytes", return_value=b"audio-bytes"):
+            with patch("live_note.remote.client.urlopen") as urlopen_mock:
+                urlopen_mock.return_value = _FakeHttpResponse(
+                    '{"task_id":"import-1","status":"queued"}'
+                )
+
+                payload = client.create_import_task(
+                    "/tmp/第1课.mp3",
+                    title="股票课 01",
+                    kind="lecture",
+                    language="zh",
+                    speaker_enabled=True,
+                    request_id="req-import-1",
+                )
+
+        request = urlopen_mock.call_args.args[0]
+        self.assertEqual("POST", request.get_method())
+        self.assertEqual(b"audio-bytes", request.data)
+        self.assertEqual("application/octet-stream", request.headers["Content-type"])
+        self.assertEqual("Bearer secret-token", request.headers["Authorization"])
+        self.assertIn("/api/v1/imports?", request.full_url)
+        self.assertIn("kind=lecture", request.full_url)
+        self.assertIn("language=zh", request.full_url)
+        self.assertIn("speaker_enabled=1", request.full_url)
+        self.assertIn("request_id=req-import-1", request.full_url)
+        self.assertIn("title=%E8%82%A1%E7%A5%A8%E8%AF%BE+01", request.full_url)
+        self.assertIn("filename=%E7%AC%AC1%E8%AF%BE.mp3", request.full_url)
+        self.assertEqual({"task_id": "import-1", "status": "queued"}, payload)
+
+    def test_create_import_task_uses_upload_timeout_when_configured(self) -> None:
+        config = RemoteConfig(
+            enabled=True,
+            base_url="https://remote.example.com",
+            api_token="secret-token",
+            timeout_seconds=12,
+            upload_timeout_seconds=180,
+        )
+        client = RemoteClient(config)
+
+        with patch("pathlib.Path.read_bytes", return_value=b"audio-bytes"):
+            with patch("live_note.remote.client.urlopen") as urlopen_mock:
+                urlopen_mock.return_value = _FakeHttpResponse(
+                    '{"task_id":"import-1","status":"queued"}'
+                )
+
+                client.create_import_task(
+                    "/tmp/第1课.mp3",
+                    title="股票课 01",
+                    kind="lecture",
+                    language="zh",
+                    request_id="req-import-1",
+                )
+
+        self.assertEqual(180, urlopen_mock.call_args.kwargs["timeout"])
+
+    def test_get_import_task_quotes_non_ascii_task_id(self) -> None:
+        config = RemoteConfig(
+            enabled=True,
+            base_url="http://remote.example.com",
+            timeout_seconds=12,
+        )
+        client = RemoteClient(config)
+
+        with patch("live_note.remote.client.urlopen") as urlopen_mock:
+            urlopen_mock.return_value = _FakeHttpResponse('{"task_id":"ok"}')
+
+            client.get_import_task("导入任务-01")
+
+        request = urlopen_mock.call_args.args[0]
+        self.assertEqual(
+            "http://remote.example.com/api/v1/imports/%E5%AF%BC%E5%85%A5%E4%BB%BB%E5%8A%A1-01",
+            request.full_url,
+        )
+
+    def test_cancel_import_task_quotes_non_ascii_task_id(self) -> None:
+        config = RemoteConfig(
+            enabled=True,
+            base_url="http://remote.example.com",
+            timeout_seconds=12,
+        )
+        client = RemoteClient(config)
+
+        with patch("live_note.remote.client.urlopen") as urlopen_mock:
+            urlopen_mock.return_value = _FakeHttpResponse('{"status":"cancelled"}')
+
+            client.cancel_import_task("导入任务-01")
+
+        request = urlopen_mock.call_args.args[0]
+        self.assertEqual(
+            "http://remote.example.com/api/v1/imports/%E5%AF%BC%E5%85%A5%E4%BB%BB%E5%8A%A1-01/actions/cancel",
+            request.full_url,
+        )
+
+    def test_list_tasks_requests_generic_tasks_endpoint(self) -> None:
+        config = RemoteConfig(
+            enabled=True,
+            base_url="http://remote.example.com",
+            timeout_seconds=12,
+        )
+        client = RemoteClient(config)
+
+        with patch("live_note.remote.client.urlopen") as urlopen_mock:
+            urlopen_mock.return_value = _FakeHttpResponse(
+                '{"server_id":"server-1","active":[],"recent":[]}'
+            )
+
+            payload = client.list_tasks()
+
+        request = urlopen_mock.call_args.args[0]
+        self.assertEqual("http://remote.example.com/api/v1/tasks", request.full_url)
+        self.assertEqual("server-1", payload["server_id"])
+
+    def test_get_task_quotes_non_ascii_task_id(self) -> None:
+        config = RemoteConfig(
+            enabled=True,
+            base_url="http://remote.example.com",
+            timeout_seconds=12,
+        )
+        client = RemoteClient(config)
+
+        with patch("live_note.remote.client.urlopen") as urlopen_mock:
+            urlopen_mock.return_value = _FakeHttpResponse('{"task_id":"ok"}')
+
+            client.get_task("远端任务-01")
+
+        request = urlopen_mock.call_args.args[0]
+        self.assertEqual(
+            "http://remote.example.com/api/v1/tasks/%E8%BF%9C%E7%AB%AF%E4%BB%BB%E5%8A%A1-01",
+            request.full_url,
+        )
+
+    def test_cancel_task_quotes_non_ascii_task_id(self) -> None:
+        config = RemoteConfig(
+            enabled=True,
+            base_url="http://remote.example.com",
+            timeout_seconds=12,
+        )
+        client = RemoteClient(config)
+
+        with patch("live_note.remote.client.urlopen") as urlopen_mock:
+            urlopen_mock.return_value = _FakeHttpResponse('{"status":"cancelled"}')
+
+            client.cancel_task("远端任务-01")
+
+        request = urlopen_mock.call_args.args[0]
+        self.assertEqual(
+            "http://remote.example.com/api/v1/tasks/%E8%BF%9C%E7%AB%AF%E4%BB%BB%E5%8A%A1-01/actions/cancel",
+            request.full_url,
+        )
+
+    def test_retranscribe_session_quotes_non_ascii_session_id(self) -> None:
+        config = RemoteConfig(
+            enabled=True,
+            base_url="http://remote.example.com",
+            timeout_seconds=12,
+        )
+        client = RemoteClient(config)
+
+        with patch("live_note.remote.client.urlopen") as urlopen_mock:
+            urlopen_mock.return_value = _FakeHttpResponse('{"accepted":true}')
+
+            client.retranscribe_session("20260318-143616-远程转写测试股票课", request_id="req-rt-1")
+
+        request = urlopen_mock.call_args.args[0]
+        self.assertEqual(
+            "http://remote.example.com/api/v1/sessions/20260318-143616-%E8%BF%9C%E7%A8%8B%E8%BD%AC%E5%86%99%E6%B5%8B%E8%AF%95%E8%82%A1%E7%A5%A8%E8%AF%BE/actions/retranscribe?request_id=req-rt-1",
+            request.full_url,
+        )

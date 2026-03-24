@@ -30,12 +30,16 @@ class RemoteServerTests(unittest.TestCase):
                 speaker_label="Speaker 1",
             )
             workspace.session_live_wav.write_bytes(b"RIFF")
+            workspace.write_transcript("# 原文\n")
+            workspace.write_structured("# 整理\n")
 
             payload = build_session_artifacts_payload(workspace)
 
         self.assertEqual("session-1", payload["metadata"]["session_id"])
         self.assertTrue(payload["has_session_audio"])
         self.assertEqual("Speaker 1", payload["entries"][0]["speaker_label"])
+        self.assertEqual("# 原文\n", payload["transcript_content"])
+        self.assertEqual("# 整理\n", payload["structured_content"])
 
 
 def _sample_metadata(session_dir: Path) -> SessionMetadata:
