@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import tkinter as tk
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import Tk, filedialog, messagebox, ttk
 from urllib.parse import urlparse
@@ -24,12 +25,14 @@ from .session_actions import (
     can_merge_summaries,
     supports_refine,
 )
+from .task_errors import TaskCancelledError
 from .task_queue import QueuedTaskRecord, QueueLoadResult, TaskQueueStore
 from .task_queue_runtime import TaskQueueRuntime
 from .task_state import GuiTaskState
 
 KIND_CHOICES = ["generic", "meeting", "lecture"]
 LLM_WIRE_API_CHOICES = ["chat_completions", "responses"]
+SPEAKER_BACKEND_CHOICES = ["sherpa_onnx", "pyannote"]
 SESSION_LANGUAGE_CHOICES = [
     "沿用默认设置",
     "自动识别 / 中英混合 / 多语言（auto）",
@@ -48,6 +51,40 @@ LANGUAGE_LABEL_TO_CODE = {
     "韩文（ko）": "ko",
 }
 LANGUAGE_CODE_TO_LABEL = {code: label for label, code in LANGUAGE_LABEL_TO_CODE.items() if code}
+PROGRESS_ANIMATION_INTERVAL_MS = 96
+POLL_ACTIVE_INTERVAL_MS = 120
+POLL_IDLE_INTERVAL_MS = 400
+REMOTE_TASK_POLL_ACTIVE_MS = 1500
+REMOTE_TASK_POLL_BACKGROUND_MS = 5000
+REMOTE_TASK_POLL_IDLE_MS = 15000
+
+
+@dataclass(frozen=True, slots=True)
+class GuiPalette:
+    app_bg: str
+    surface_bg: str
+    surface_alt_bg: str
+    field_bg: str
+    border: str
+    text_primary: str
+    text_secondary: str
+    text_tertiary: str
+    accent: str
+    accent_active: str
+    accent_text: str
+    selection_bg: str
+    progress_trough: str
+
+
+@dataclass(frozen=True, slots=True)
+class GuiMetrics:
+    header_padding: tuple[int, int]
+    page_padding: int
+    section_padding: int
+    section_gap: int
+    inline_gap: int
+    field_row_gap: int
+    log_height: int
 
 
 class _NoopScheduler:
@@ -56,6 +93,246 @@ class _NoopScheduler:
 
     def after_cancel(self, _after_id: str) -> None:
         return None
+
+
+def _default_gui_palette() -> GuiPalette:
+    return GuiPalette(
+        app_bg="#EEF2F7",
+        surface_bg="#FBFCFE",
+        surface_alt_bg="#F4F7FB",
+        field_bg="#FFFFFF",
+        border="#D7DEE8",
+        text_primary="#1F2937",
+        text_secondary="#5B6677",
+        text_tertiary="#7B8797",
+        accent="#2563EB",
+        accent_active="#1D4ED8",
+        accent_text="#FFFFFF",
+        selection_bg="#E7EEF8",
+        progress_trough="#DCE6F2",
+    )
+
+
+def _default_gui_metrics() -> GuiMetrics:
+    return GuiMetrics(
+        header_padding=(20, 12),
+        page_padding=14,
+        section_padding=14,
+        section_gap=12,
+        inline_gap=8,
+        field_row_gap=8,
+        log_height=11,
+    )
+
+
+def _body_font(weight: str | None = None, size: int = 11) -> tuple[str, int] | tuple[str, int, str]:
+    family = "SF Pro Text" if sys.platform == "darwin" else "TkDefaultFont"
+    if weight:
+        return (family, size, weight)
+    return (family, size)
+
+
+def _apply_visual_theme(root: Tk) -> tuple[GuiPalette, GuiMetrics]:
+    palette = _default_gui_palette()
+    metrics = _default_gui_metrics()
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    root.configure(bg=palette.app_bg)
+
+    style.configure("TFrame", background=palette.surface_bg)
+    style.configure("Header.TFrame", background=palette.app_bg)
+    style.configure("Toolbar.TFrame", background=palette.surface_bg)
+    style.configure("TLabel", background=palette.surface_bg, foreground=palette.text_primary)
+    style.configure(
+        "Header.TLabel",
+        background=palette.app_bg,
+        foreground=palette.text_secondary,
+        font=_body_font(size=11),
+    )
+    style.configure(
+        "BrandTitle.TLabel",
+        background=palette.app_bg,
+        foreground=palette.text_primary,
+        font=_body_font("bold", 20),
+    )
+    style.configure(
+        "Status.TLabel",
+        background=palette.app_bg,
+        foreground=palette.text_secondary,
+        font=_body_font("bold", 11),
+    )
+    style.configure(
+        "SectionTitle.TLabel",
+        background=palette.surface_bg,
+        foreground=palette.text_primary,
+        font=_body_font("bold", 11),
+    )
+    style.configure(
+        "Hint.TLabel",
+        background=palette.surface_bg,
+        foreground=palette.text_tertiary,
+        font=_body_font(size=10),
+    )
+    style.configure(
+        "Subtle.TLabel",
+        background=palette.surface_bg,
+        foreground=palette.text_secondary,
+        font=_body_font(size=11),
+    )
+
+    style.configure(
+        "App.TNotebook",
+        background=palette.app_bg,
+        borderwidth=0,
+        tabmargins=(0, 0, 0, 0),
+    )
+    style.configure(
+        "App.TNotebook.Tab",
+        background=palette.surface_alt_bg,
+        foreground=palette.text_secondary,
+        borderwidth=0,
+        padding=(14, 8),
+        font=_body_font(size=11),
+    )
+    style.map(
+        "App.TNotebook.Tab",
+        background=[
+            ("selected", palette.surface_bg),
+            ("active", palette.surface_bg),
+        ],
+        foreground=[
+            ("selected", palette.text_primary),
+            ("active", palette.text_primary),
+        ],
+    )
+
+    style.configure(
+        "Section.TLabelframe",
+        background=palette.surface_bg,
+        bordercolor=palette.border,
+        borderwidth=1,
+        relief="solid",
+    )
+    style.configure(
+        "Section.TLabelframe.Label",
+        background=palette.surface_bg,
+        foreground=palette.text_primary,
+        font=_body_font("bold", 11),
+    )
+
+    style.configure(
+        "TButton",
+        background=palette.surface_alt_bg,
+        foreground=palette.text_primary,
+        bordercolor=palette.border,
+        borderwidth=1,
+        focusthickness=0,
+        focuscolor=palette.surface_alt_bg,
+        padding=(12, 7),
+        font=_body_font(size=11),
+    )
+    style.map(
+        "TButton",
+        background=[("active", palette.field_bg), ("pressed", palette.field_bg)],
+        bordercolor=[("active", palette.border)],
+    )
+    style.configure(
+        "Primary.TButton",
+        background=palette.accent,
+        foreground=palette.accent_text,
+        bordercolor=palette.accent,
+        focuscolor=palette.accent,
+        padding=(14, 7),
+        font=_body_font("bold", 11),
+    )
+    style.map(
+        "Primary.TButton",
+        background=[("active", palette.accent_active), ("pressed", palette.accent_active)],
+        bordercolor=[("active", palette.accent_active)],
+    )
+
+    style.configure(
+        "TCheckbutton",
+        background=palette.surface_bg,
+        foreground=palette.text_primary,
+        font=_body_font(size=11),
+    )
+    style.map(
+        "TCheckbutton",
+        background=[("active", palette.surface_bg)],
+        foreground=[("disabled", palette.text_tertiary)],
+    )
+
+    style.configure(
+        "TEntry",
+        fieldbackground=palette.field_bg,
+        foreground=palette.text_primary,
+        bordercolor=palette.border,
+        lightcolor=palette.border,
+        darkcolor=palette.border,
+        insertcolor=palette.text_primary,
+        padding=(8, 6),
+    )
+    style.configure(
+        "TCombobox",
+        fieldbackground=palette.field_bg,
+        foreground=palette.text_primary,
+        bordercolor=palette.border,
+        lightcolor=palette.border,
+        darkcolor=palette.border,
+        padding=(8, 6),
+        arrowsize=14,
+    )
+    style.map(
+        "TCombobox",
+        fieldbackground=[("readonly", palette.field_bg)],
+        background=[("readonly", palette.field_bg)],
+        foreground=[("readonly", palette.text_primary)],
+        selectbackground=[("readonly", palette.selection_bg)],
+        selectforeground=[("readonly", palette.text_primary)],
+    )
+
+    style.configure(
+        "App.Treeview",
+        background=palette.field_bg,
+        fieldbackground=palette.field_bg,
+        foreground=palette.text_primary,
+        bordercolor=palette.border,
+        rowheight=28,
+        relief="solid",
+    )
+    style.map(
+        "App.Treeview",
+        background=[("selected", palette.selection_bg)],
+        foreground=[("selected", palette.text_primary)],
+    )
+    style.configure(
+        "App.Treeview.Heading",
+        background=palette.surface_alt_bg,
+        foreground=palette.text_secondary,
+        bordercolor=palette.border,
+        relief="flat",
+        padding=(8, 7),
+        font=_body_font("bold", 10),
+    )
+
+    style.configure(
+        "App.Horizontal.TProgressbar",
+        background=palette.accent,
+        troughcolor=palette.progress_trough,
+        borderwidth=0,
+        lightcolor=palette.accent,
+        darkcolor=palette.accent,
+    )
+    style.configure(
+        "App.Vertical.TScrollbar",
+        background=palette.surface_alt_bg,
+        troughcolor=palette.app_bg,
+        bordercolor=palette.app_bg,
+        arrowcolor=palette.text_secondary,
+    )
+
+    return palette, metrics
 
 
 def launch_gui(config_path: Path | None = None) -> int:
@@ -80,16 +357,19 @@ class LiveNoteGui:
         self.queue_worker: threading.Thread | None = None
         self.live_devices: list[InputDevice] = []
         self.history_rows: dict[str, SessionSummary] = {}
+        self.remote_task_rows: dict[str, object] = {}
 
         self.status_var = tk.StringVar(value="准备就绪")
         self.execution_target_var = tk.StringVar(value="当前转写：本机")
         self.history_detail_var = tk.StringVar(value="选择一条历史会话查看详情。")
         self.task_progress_var = tk.StringVar(value="当前没有任务。")
+        self.remote_task_status_var = tk.StringVar(value="当前没有远端任务。")
 
         self.live_title_var = tk.StringVar()
         self.live_kind_var = tk.StringVar(value="generic")
         self.live_language_var = tk.StringVar(value="沿用默认设置")
         self.live_auto_refine_var = tk.BooleanVar(value=True)
+        self.live_speaker_enabled_var = tk.BooleanVar(value=False)
         self.live_stop_after_minutes_var = tk.StringVar(value="")
         self.live_device_var = tk.StringVar()
         self._live_control = LiveRecordingController(
@@ -101,6 +381,7 @@ class LiveNoteGui:
         self.import_title_var = tk.StringVar()
         self.import_kind_var = tk.StringVar(value="generic")
         self.import_language_var = tk.StringVar(value="沿用默认设置")
+        self.import_speaker_enabled_var = tk.BooleanVar(value=False)
 
         self.ffmpeg_var = tk.StringVar()
         self.whisper_binary_var = tk.StringVar()
@@ -133,17 +414,23 @@ class LiveNoteGui:
         self.serve_host_var = tk.StringVar(value="127.0.0.1")
         self.serve_port_var = tk.StringVar(value="8765")
         self.serve_api_token_var = tk.StringVar()
+        self.funasr_enabled_var = tk.BooleanVar(value=False)
         self.funasr_base_url_var = tk.StringVar(value="ws://127.0.0.1:10095")
         self.funasr_mode_var = tk.StringVar(value="2pass")
         self.funasr_use_itn_var = tk.BooleanVar(value=True)
         self.speaker_enabled_var = tk.BooleanVar(value=False)
+        self.speaker_backend_var = tk.StringVar(value="sherpa_onnx")
         self.speaker_segmentation_model_var = tk.StringVar()
         self.speaker_embedding_model_var = tk.StringVar()
         self.speaker_cluster_threshold_var = tk.StringVar(value="0.5")
+        self.speaker_pyannote_model_var = tk.StringVar(
+            value="pyannote/speaker-diarization-community-1"
+        )
+        self.gui_palette, self.gui_metrics = _apply_visual_theme(self.root)
 
         self.root.title("live-note")
-        self.root.geometry("1100x760")
-        self.root.minsize(980, 680)
+        self.root.geometry("1060x720")
+        self.root.minsize(940, 640)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._apply_branding()
 
@@ -154,8 +441,10 @@ class LiveNoteGui:
         self._load_task_queue_state()
         self._refresh_devices()
         self._refresh_history()
+        self._refresh_remote_tasks()
         self._refresh_doctor_checks()
-        self.root.after(150, self._poll_events)
+        self.root.after(self._next_poll_interval_ms(), self._poll_events)
+        self.root.after(self._next_remote_task_poll_interval_ms(), self._poll_remote_tasks)
         if not self.service.config_exists():
             self.root.after(250, self._show_first_run_wizard)
 
@@ -179,6 +468,12 @@ class LiveNoteGui:
             )
             self._live_control = controller
         return controller
+
+    def _theme_palette(self) -> GuiPalette:
+        return getattr(self, "gui_palette", _default_gui_palette())
+
+    def _theme_metrics(self) -> GuiMetrics:
+        return getattr(self, "gui_metrics", _default_gui_metrics())
 
     @property
     def busy(self) -> bool:
@@ -275,14 +570,15 @@ class LiveNoteGui:
             self.header_logo_image = None
 
     def _build_ui(self) -> None:
+        metrics = self._theme_metrics()
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-        header = ttk.Frame(self.root, padding=(18, 14))
+        header = ttk.Frame(self.root, padding=metrics.header_padding, style="Header.TFrame")
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)
 
-        brand_frame = ttk.Frame(header)
+        brand_frame = ttk.Frame(header, style="Header.TFrame")
         brand_frame.grid(row=0, column=0, rowspan=2, sticky="w")
         brand_frame.columnconfigure(1, weight=1)
         if self.header_logo_image is not None:
@@ -292,28 +588,39 @@ class LiveNoteGui:
         ttk.Label(
             brand_frame,
             text="live-note",
-            font=("SF Pro Text", 22, "bold"),
+            style="BrandTitle.TLabel",
         ).grid(row=0, column=1, sticky="w")
         ttk.Label(
             brand_frame,
             text="本地优先的课程 / 会议 / 音频内容记录器",
-        ).grid(row=1, column=1, sticky="w", pady=(4, 0))
+            style="Header.TLabel",
+        ).grid(row=1, column=1, sticky="w", pady=(2, 0))
         ttk.Label(
             brand_frame,
             textvariable=self.execution_target_var,
-        ).grid(row=2, column=1, sticky="w", pady=(4, 0))
+            style="Header.TLabel",
+        ).grid(row=2, column=1, sticky="w", pady=(2, 0))
         ttk.Label(
             header,
             textvariable=self.status_var,
             anchor="e",
+            style="Status.TLabel",
         ).grid(row=0, column=1, rowspan=3, sticky="e")
 
-        notebook = ttk.Notebook(self.root)
-        notebook.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        notebook = ttk.Notebook(self.root, style="App.TNotebook")
+        self.main_notebook = notebook
+        notebook.grid(
+            row=1,
+            column=0,
+            sticky="nsew",
+            padx=metrics.page_padding,
+            pady=(0, metrics.page_padding),
+        )
 
-        new_session_tab = ttk.Frame(notebook, padding=16)
-        history_tab = ttk.Frame(notebook, padding=16)
-        settings_tab = ttk.Frame(notebook, padding=16)
+        new_session_tab = ttk.Frame(notebook, padding=metrics.page_padding)
+        history_tab = ttk.Frame(notebook, padding=metrics.page_padding)
+        self.history_tab = history_tab
+        settings_tab = ttk.Frame(notebook, padding=metrics.page_padding)
         notebook.add(new_session_tab, text="新建会话")
         notebook.add(history_tab, text="历史会话")
         notebook.add(settings_tab, text="设置与诊断")
@@ -323,37 +630,67 @@ class LiveNoteGui:
         self._build_settings_tab(settings_tab)
 
     def _build_new_session_tab(self, parent: ttk.Frame) -> None:
+        metrics = self._theme_metrics()
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
 
-        session_tabs = ttk.Notebook(parent)
+        session_tabs = ttk.Notebook(parent, style="App.TNotebook")
         session_tabs.grid(row=0, column=0, sticky="ew")
 
-        live_tab = ttk.Frame(session_tabs, padding=12)
-        import_tab = ttk.Frame(session_tabs, padding=12)
+        live_tab = ttk.Frame(session_tabs, padding=metrics.section_padding)
+        import_tab = ttk.Frame(session_tabs, padding=metrics.section_padding)
         session_tabs.add(live_tab, text="实时录音")
         session_tabs.add(import_tab, text="导入文件")
 
         self._build_live_tab(live_tab)
         self._build_import_tab(import_tab)
 
-        activity = ttk.LabelFrame(parent, text="运行状态", padding=12)
-        activity.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
+        activity = ttk.LabelFrame(
+            parent,
+            text="运行状态",
+            padding=metrics.section_padding,
+            style="Section.TLabelframe",
+        )
+        activity.grid(row=1, column=0, sticky="nsew", pady=(metrics.section_gap, 0))
         activity.columnconfigure(0, weight=1)
         activity.rowconfigure(1, weight=1)
 
-        self.progress = ttk.Progressbar(activity, mode="determinate")
+        self.progress = ttk.Progressbar(
+            activity,
+            mode="determinate",
+            style="App.Horizontal.TProgressbar",
+        )
         self.progress.grid(row=0, column=0, sticky="ew")
 
-        self.log_text = tk.Text(activity, height=12, wrap="word", state="disabled")
-        self.log_text.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        self.log_text = tk.Text(
+            activity,
+            height=metrics.log_height,
+            wrap="word",
+            state="disabled",
+            relief="flat",
+            borderwidth=1,
+            highlightthickness=1,
+            background=self._theme_palette().field_bg,
+            foreground=self._theme_palette().text_primary,
+            highlightbackground=self._theme_palette().border,
+            highlightcolor=self._theme_palette().border,
+            padx=10,
+            pady=10,
+        )
+        self.log_text.grid(row=1, column=0, sticky="nsew", pady=(metrics.section_gap, 0))
 
     def _build_live_tab(self, parent: ttk.Frame) -> None:
+        metrics = self._theme_metrics()
         parent.columnconfigure(1, weight=1)
 
         _entry_row(parent, 0, "会话标题", self.live_title_var, "例如：产品周会")
 
-        ttk.Label(parent, text="输入设备").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(parent, text="输入设备", style="SectionTitle.TLabel").grid(
+            row=1,
+            column=0,
+            sticky="w",
+            pady=(10, 0),
+        )
         device_frame = ttk.Frame(parent)
         device_frame.grid(row=1, column=1, sticky="ew", pady=(10, 0))
         device_frame.columnconfigure(0, weight=1)
@@ -369,8 +706,13 @@ class LiveNoteGui:
             command=self._refresh_devices,
         ).grid(row=0, column=1, padx=(8, 0))
 
-        advanced = ttk.LabelFrame(parent, text="高级选项", padding=12)
-        advanced.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        advanced = ttk.LabelFrame(
+            parent,
+            text="高级选项",
+            padding=metrics.section_padding,
+            style="Section.TLabelframe",
+        )
+        advanced.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(metrics.section_gap, 0))
         advanced.columnconfigure(1, weight=1)
 
         _combobox_row(advanced, 0, "内容类型", self.live_kind_var, KIND_CHOICES)
@@ -398,7 +740,18 @@ class LiveNoteGui:
             column=0,
             columnspan=2,
             sticky="w",
-            pady=(10, 0),
+            pady=(metrics.field_row_gap, 0),
+        )
+        ttk.Checkbutton(
+            advanced,
+            text="本次启用说话人区分",
+            variable=self.live_speaker_enabled_var,
+        ).grid(
+            row=4,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(metrics.field_row_gap, 0),
         )
         ttk.Label(
             advanced,
@@ -406,15 +759,17 @@ class LiveNoteGui:
                 "关闭 Obsidian 同步时仅保留本地 Markdown；关闭 LLM 整理时会生成待整理模板。"
                 "自动离线精修需要同时启用“保存整场 WAV”和“离线精修”。"
             ),
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            style="Hint.TLabel",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(metrics.field_row_gap, 0))
         self._update_live_auto_refine_state()
 
         actions = ttk.Frame(parent)
-        actions.grid(row=3, column=0, columnspan=2, sticky="w", pady=(18, 0))
+        actions.grid(row=3, column=0, columnspan=2, sticky="w", pady=(metrics.section_gap + 2, 0))
         self.start_live_button = ttk.Button(
             actions,
             text="开始并生成",
             command=self._start_live_session,
+            style="Primary.TButton",
         )
         self.start_live_button.grid(row=0, column=0)
         self.stop_live_button = ttk.Button(
@@ -433,9 +788,14 @@ class LiveNoteGui:
         self.pause_live_button.grid(row=0, column=2, padx=(8, 0))
 
     def _build_import_tab(self, parent: ttk.Frame) -> None:
+        metrics = self._theme_metrics()
         parent.columnconfigure(1, weight=1)
 
-        ttk.Label(parent, text="媒体文件").grid(row=0, column=0, sticky="w")
+        ttk.Label(parent, text="媒体文件", style="SectionTitle.TLabel").grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
         file_frame = ttk.Frame(parent)
         file_frame.grid(row=0, column=1, sticky="ew")
         file_frame.columnconfigure(0, weight=1)
@@ -448,8 +808,13 @@ class LiveNoteGui:
 
         _entry_row(parent, 1, "会话标题", self.import_title_var, "留空时使用文件名")
 
-        advanced = ttk.LabelFrame(parent, text="高级选项", padding=12)
-        advanced.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        advanced = ttk.LabelFrame(
+            parent,
+            text="高级选项",
+            padding=metrics.section_padding,
+            style="Section.TLabelframe",
+        )
+        advanced.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(metrics.section_gap, 0))
         advanced.columnconfigure(1, weight=1)
 
         _combobox_row(advanced, 0, "内容类型", self.import_kind_var, KIND_CHOICES)
@@ -460,25 +825,44 @@ class LiveNoteGui:
             self.import_language_var,
             include_blank=True,
         )
+        ttk.Checkbutton(
+            advanced,
+            text="本次启用说话人区分",
+            variable=self.import_speaker_enabled_var,
+        ).grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(metrics.field_row_gap, 0),
+        )
         ttk.Label(
             advanced,
             text=(
                 "支持音频和视频本地文件，例如 "
                 "mp3 / m4a / wav / mp4 / mov / mkv；本地模式也可单独使用。"
             ),
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            style="Hint.TLabel",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(metrics.field_row_gap, 0))
 
         ttk.Button(
             parent,
             text="导入并生成",
             command=self._start_import,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(18, 0))
+            style="Primary.TButton",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(metrics.section_gap + 2, 0))
 
     def _build_history_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=1)
+        metrics = self._theme_metrics()
+        content = _build_vertical_scroller(parent)
+        content.columnconfigure(0, weight=1)
 
-        task_frame = ttk.LabelFrame(parent, text="任务队列", padding=12)
+        task_frame = ttk.LabelFrame(
+            content,
+            text="任务队列",
+            padding=metrics.section_padding,
+            style="Section.TLabelframe",
+        )
         task_frame.grid(row=0, column=0, sticky="ew")
         task_frame.columnconfigure(0, weight=1)
 
@@ -487,17 +871,22 @@ class LiveNoteGui:
             textvariable=self.task_progress_var,
             justify="left",
         ).grid(row=0, column=0, sticky="w")
-        self.history_progress = ttk.Progressbar(task_frame, mode="determinate")
-        self.history_progress.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.history_progress = ttk.Progressbar(
+            task_frame,
+            mode="determinate",
+            style="App.Horizontal.TProgressbar",
+        )
+        self.history_progress.grid(row=1, column=0, sticky="ew", pady=(metrics.field_row_gap, 0))
 
         self.queue_tree = ttk.Treeview(
             task_frame,
             columns=("status", "task", "target", "created"),
             show="headings",
-            height=4,
+            height=3,
             selectmode="browse",
+            style="App.Treeview",
         )
-        self.queue_tree.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self.queue_tree.grid(row=2, column=0, sticky="ew", pady=(metrics.field_row_gap, 0))
         for key, label, width in [
             ("status", "状态", 90),
             ("task", "任务", 170),
@@ -509,7 +898,7 @@ class LiveNoteGui:
         self.queue_tree.bind("<<TreeviewSelect>>", self._on_queue_select)
 
         queue_actions = ttk.Frame(task_frame)
-        queue_actions.grid(row=3, column=0, sticky="w", pady=(10, 0))
+        queue_actions.grid(row=3, column=0, sticky="w", pady=(metrics.field_row_gap, 0))
         self.cancel_queue_button = ttk.Button(
             queue_actions,
             text="取消所选",
@@ -518,8 +907,81 @@ class LiveNoteGui:
         )
         self.cancel_queue_button.grid(row=0, column=0)
 
-        table = ttk.Frame(parent)
-        table.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
+        remote_frame = ttk.LabelFrame(
+            content,
+            text="远端任务",
+            padding=metrics.section_padding,
+            style="Section.TLabelframe",
+        )
+        remote_frame.grid(row=1, column=0, sticky="ew", pady=(metrics.section_gap, 0))
+        remote_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            remote_frame,
+            textvariable=self.remote_task_status_var,
+            justify="left",
+            style="Subtle.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self.remote_task_progress = ttk.Progressbar(
+            remote_frame,
+            mode="determinate",
+            style="App.Horizontal.TProgressbar",
+        )
+        self.remote_task_progress.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=(metrics.field_row_gap, 0),
+        )
+        self.remote_task_tree = ttk.Treeview(
+            remote_frame,
+            columns=("status", "task", "session", "progress", "updated"),
+            show="headings",
+            height=3,
+            selectmode="browse",
+            style="App.Treeview",
+        )
+        self.remote_task_tree.grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            pady=(metrics.field_row_gap, 0),
+        )
+        for key, label, width in [
+            ("status", "状态", 90),
+            ("task", "任务", 180),
+            ("session", "记录", 220),
+            ("progress", "进度", 180),
+            ("updated", "更新时间", 180),
+        ]:
+            self.remote_task_tree.heading(key, text=label)
+            self.remote_task_tree.column(key, width=width, anchor="w")
+        self.remote_task_tree.bind("<<TreeviewSelect>>", self._on_remote_task_select)
+
+        remote_actions = ttk.Frame(remote_frame)
+        remote_actions.grid(row=3, column=0, sticky="w", pady=(metrics.field_row_gap, 0))
+        self.open_remote_task_button = ttk.Button(
+            remote_actions,
+            text="查看记录",
+            command=self._open_remote_task_session,
+            state="disabled",
+        )
+        self.open_remote_task_button.grid(row=0, column=0)
+        self.cancel_remote_task_button = ttk.Button(
+            remote_actions,
+            text="取消",
+            command=self._cancel_selected_remote_task,
+            state="disabled",
+        )
+        self.cancel_remote_task_button.grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(
+            remote_actions,
+            text="刷新远端任务",
+            command=self._refresh_remote_tasks,
+        ).grid(row=0, column=2, padx=(8, 0))
+
+        table = ttk.Frame(content)
+        table.grid(row=2, column=0, sticky="nsew", pady=(metrics.section_gap, 0))
         table.columnconfigure(0, weight=1)
         table.rowconfigure(0, weight=1)
 
@@ -529,6 +991,7 @@ class LiveNoteGui:
             show="headings",
             height=14,
             selectmode="extended",
+            style="App.Treeview",
         )
         self.history_tree.grid(row=0, column=0, sticky="nsew")
         for key, label, width in [
@@ -544,8 +1007,8 @@ class LiveNoteGui:
             self.history_tree.column(key, width=width, anchor="w")
         self.history_tree.bind("<<TreeviewSelect>>", self._on_history_select)
 
-        actions = ttk.Frame(parent)
-        actions.grid(row=2, column=0, sticky="ew", pady=(16, 0))
+        actions = ttk.Frame(content)
+        actions.grid(row=3, column=0, sticky="ew", pady=(metrics.section_gap, 0))
         self.history_actions_frame = actions
         self.history_action_buttons: list[ttk.Button] = []
 
@@ -585,26 +1048,31 @@ class LiveNoteGui:
         self.root.after_idle(self._relayout_history_actions)
 
         ttk.Label(
-            parent,
+            content,
             textvariable=self.history_detail_var,
             wraplength=980,
             justify="left",
-        ).grid(row=3, column=0, sticky="w", pady=(14, 0))
+            style="Subtle.TLabel",
+        ).grid(row=4, column=0, sticky="w", pady=(metrics.section_gap, 0))
 
     def _build_settings_tab(self, parent: ttk.Frame) -> None:
+        metrics = self._theme_metrics()
         content = _build_vertical_scroller(parent)
         content.columnconfigure(0, weight=1)
 
-        toolbar = ttk.Frame(content)
+        toolbar = ttk.Frame(content, style="Toolbar.TFrame")
         toolbar.grid(row=0, column=0, sticky="w")
         ttk.Button(
             toolbar,
             text="自动检测",
             command=self._autodetect_settings,
         ).grid(row=0, column=0)
-        ttk.Button(toolbar, text="保存设置", command=self._save_settings).grid(
-            row=0, column=1, padx=(8, 0)
-        )
+        ttk.Button(
+            toolbar,
+            text="保存设置",
+            command=self._save_settings,
+            style="Primary.TButton",
+        ).grid(row=0, column=1, padx=(8, 0))
         ttk.Button(toolbar, text="重新诊断", command=self._refresh_doctor_checks).grid(
             row=0, column=2, padx=(8, 0)
         )
@@ -623,8 +1091,13 @@ class LiveNoteGui:
             padx=(8, 0),
         )
 
-        whisper_frame = ttk.LabelFrame(content, text="Whisper / FFmpeg", padding=12)
-        whisper_frame.grid(row=1, column=0, sticky="ew", pady=(16, 0))
+        whisper_frame = ttk.LabelFrame(
+            content,
+            text="Whisper / FFmpeg",
+            padding=metrics.section_padding,
+            style="Section.TLabelframe",
+        )
+        whisper_frame.grid(row=1, column=0, sticky="ew", pady=(metrics.section_gap, 0))
         whisper_frame.columnconfigure(1, weight=1)
         _entry_row_with_button(
             whisper_frame,
@@ -681,8 +1154,13 @@ class LiveNoteGui:
             variable=self.refine_auto_after_live_var,
         ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
-        obsidian_frame = ttk.LabelFrame(content, text="Obsidian", padding=12)
-        obsidian_frame.grid(row=2, column=0, sticky="ew", pady=(16, 0))
+        obsidian_frame = ttk.LabelFrame(
+            content,
+            text="Obsidian",
+            padding=metrics.section_padding,
+            style="Section.TLabelframe",
+        )
+        obsidian_frame.grid(row=2, column=0, sticky="ew", pady=(metrics.section_gap, 0))
         obsidian_frame.columnconfigure(1, weight=1)
         ttk.Checkbutton(
             obsidian_frame,
@@ -701,10 +1179,16 @@ class LiveNoteGui:
         ttk.Label(
             obsidian_frame,
             text="关闭后仍会把 transcript.md 和 structured.md 写入本地会话目录。",
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
+            style="Hint.TLabel",
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(metrics.field_row_gap, 0))
 
-        llm_frame = ttk.LabelFrame(content, text="LLM", padding=12)
-        llm_frame.grid(row=3, column=0, sticky="ew", pady=(16, 0))
+        llm_frame = ttk.LabelFrame(
+            content,
+            text="LLM",
+            padding=metrics.section_padding,
+            style="Section.TLabelframe",
+        )
+        llm_frame.grid(row=3, column=0, sticky="ew", pady=(metrics.section_gap, 0))
         llm_frame.columnconfigure(1, weight=1)
         ttk.Checkbutton(
             llm_frame,
@@ -728,10 +1212,16 @@ class LiveNoteGui:
         ttk.Label(
             llm_frame,
             text="`responses` 协议会请求 /responses；开启 Stream 时会聚合 SSE 流式事件。",
-        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
+            style="Hint.TLabel",
+        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(metrics.field_row_gap, 0))
 
-        remote_frame = ttk.LabelFrame(content, text="远端转写", padding=12)
-        remote_frame.grid(row=4, column=0, sticky="ew", pady=(16, 0))
+        remote_frame = ttk.LabelFrame(
+            content,
+            text="远端转写",
+            padding=metrics.section_padding,
+            style="Section.TLabelframe",
+        )
+        remote_frame.grid(row=4, column=0, sticky="ew", pady=(metrics.section_gap, 0))
         remote_frame.columnconfigure(1, weight=1)
         ttk.Checkbutton(
             remote_frame,
@@ -747,22 +1237,112 @@ class LiveNoteGui:
             self.remote_live_chunk_ms_var,
             "默认 240；越小延迟越低，但请求更频繁。",
         )
+        ttk.Checkbutton(
+            remote_frame,
+            text="保存本地远端模板：FunASR 实时稿",
+            variable=self.funasr_enabled_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        _entry_row(remote_frame, 5, "FunASR 地址", self.funasr_base_url_var)
+        _combobox_row(remote_frame, 6, "FunASR 模式", self.funasr_mode_var, ["2pass", "online"])
+        ttk.Checkbutton(
+            remote_frame,
+            text="FunASR 启用 ITN",
+            variable=self.funasr_use_itn_var,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Label(
             remote_frame,
             text=(
-                "这里只配置桌面端如何连接远端服务。"
-                "Mac mini 上的 serve / speaker / 模型路径仍建议直接编辑远端 config.remote.toml。"
+                "这里只保存桌面端的远端配置模板。"
+                "实际生效后端以诊断结果里的 backend=... 为准；"
+                "切换远端实时后端仍需修改 Mac mini 上的 config.remote.toml 并重启服务。"
             ),
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+            style="Hint.TLabel",
+        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(metrics.field_row_gap, 0))
 
-        doctor_frame = ttk.LabelFrame(content, text="诊断结果", padding=12)
-        doctor_frame.grid(row=5, column=0, sticky="ew", pady=(16, 16))
+        speaker_frame = ttk.LabelFrame(
+            content,
+            text="说话人区分",
+            padding=metrics.section_padding,
+            style="Section.TLabelframe",
+        )
+        speaker_frame.grid(row=5, column=0, sticky="ew", pady=(metrics.section_gap, 0))
+        speaker_frame.columnconfigure(1, weight=1)
+        ttk.Checkbutton(
+            speaker_frame,
+            text="启用说话人区分后处理",
+            variable=self.speaker_enabled_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        _combobox_row(
+            speaker_frame,
+            1,
+            "后端",
+            self.speaker_backend_var,
+            SPEAKER_BACKEND_CHOICES,
+        )
+        _entry_row_with_button(
+            speaker_frame,
+            2,
+            "分割模型",
+            self.speaker_segmentation_model_var,
+            "sherpa_onnx 使用；pyannote 后端可留空",
+            lambda: self._browse_file(
+                self.speaker_segmentation_model_var,
+                "选择说话人分割模型",
+            ),
+        )
+        _entry_row_with_button(
+            speaker_frame,
+            3,
+            "嵌入模型",
+            self.speaker_embedding_model_var,
+            "sherpa_onnx 使用；pyannote 后端可留空",
+            lambda: self._browse_file(
+                self.speaker_embedding_model_var,
+                "选择说话人嵌入模型",
+            ),
+        )
+        _entry_row(
+            speaker_frame,
+            4,
+            "聚类阈值",
+            self.speaker_cluster_threshold_var,
+            (
+                "默认 0.5；已知说话人数时优先在 "
+                "config.toml / config.remote.toml 里填 expected_speakers。"
+            ),
+        )
+        _entry_row(
+            speaker_frame,
+            5,
+            "pyannote 模型",
+            self.speaker_pyannote_model_var,
+            "pyannote 后端使用；如需访问令牌，请在 .env 里配置 PYANNOTE_AUTH_TOKEN。",
+        )
+        ttk.Label(
+            speaker_frame,
+            text=(
+                "这里配置的是说话人区分的后端、模型与默认开关。"
+                "新建页可按本次任务临时开启或关闭；"
+                "远端模式下，这里主要用于本地模板与诊断展示，"
+                "真正生效的远端后端仍需同步修改 Mac mini 上的 config.remote.toml。"
+            ),
+            style="Hint.TLabel",
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(metrics.field_row_gap, 0))
+
+        doctor_frame = ttk.LabelFrame(
+            content,
+            text="诊断结果",
+            padding=metrics.section_padding,
+            style="Section.TLabelframe",
+        )
+        doctor_frame.grid(row=6, column=0, sticky="ew", pady=(metrics.section_gap, 16))
         doctor_frame.columnconfigure(0, weight=1)
         self.doctor_tree = ttk.Treeview(
             doctor_frame,
             columns=("name", "status", "detail"),
             show="headings",
             height=8,
+            style="App.Treeview",
         )
         self.doctor_tree.grid(row=0, column=0, sticky="ew")
         for key, label, width in [
@@ -810,13 +1390,16 @@ class LiveNoteGui:
         self.serve_host_var.set(draft.serve_host)
         self.serve_port_var.set(str(draft.serve_port))
         self.serve_api_token_var.set(draft.serve_api_token)
+        self.funasr_enabled_var.set(draft.funasr_enabled)
         self.funasr_base_url_var.set(draft.funasr_base_url)
         self.funasr_mode_var.set(draft.funasr_mode)
         self.funasr_use_itn_var.set(draft.funasr_use_itn)
         self.speaker_enabled_var.set(draft.speaker_enabled)
+        self.speaker_backend_var.set(draft.speaker_backend)
         self.speaker_segmentation_model_var.set(draft.speaker_segmentation_model)
         self.speaker_embedding_model_var.set(draft.speaker_embedding_model)
         self.speaker_cluster_threshold_var.set(str(draft.speaker_cluster_threshold))
+        self.speaker_pyannote_model_var.set(draft.speaker_pyannote_model)
         self._update_live_auto_refine_state()
         self._update_execution_target_hint()
 
@@ -855,15 +1438,19 @@ class LiveNoteGui:
             serve_host=self.serve_host_var.get().strip() or "127.0.0.1",
             serve_port=int(self.serve_port_var.get().strip() or "8765"),
             serve_api_token=self.serve_api_token_var.get().strip(),
+            funasr_enabled=self.funasr_enabled_var.get(),
             funasr_base_url=self.funasr_base_url_var.get().strip(),
             funasr_mode=self.funasr_mode_var.get().strip() or "2pass",
             funasr_use_itn=self.funasr_use_itn_var.get(),
             speaker_enabled=self.speaker_enabled_var.get(),
+            speaker_backend=self.speaker_backend_var.get().strip() or "sherpa_onnx",
             speaker_segmentation_model=self.speaker_segmentation_model_var.get().strip(),
             speaker_embedding_model=self.speaker_embedding_model_var.get().strip(),
             speaker_cluster_threshold=float(
                 self.speaker_cluster_threshold_var.get().strip() or "0.5"
             ),
+            speaker_pyannote_model=self.speaker_pyannote_model_var.get().strip()
+            or "pyannote/speaker-diarization-community-1",
             llm_api_key=self.llm_api_key_var.get().strip(),
         )
 
@@ -903,7 +1490,13 @@ class LiveNoteGui:
 
     def _progress_callback(self, source: str, task_id: str) -> Callable[[ProgressEvent], None]:
         def callback(event: ProgressEvent) -> None:
-            self.event_queue.put(replace(event, source=source, task_id=task_id))
+            self.event_queue.put(
+                replace(
+                    event,
+                    source=source,
+                    task_id=event.task_id or task_id,
+                )
+            )
 
         return callback
 
@@ -963,6 +1556,10 @@ class LiveNoteGui:
             task_id=started_record.task_id,
             label=started_record.label,
         )
+        cancel_event = threading.Event()
+        self.queue_cancel_task_id = started_record.task_id
+        self.queue_cancel_action = started_record.action
+        self.queue_cancel_event = cancel_event
         self._refresh_queue_tree()
         self._set_queue_progress_state(f"{started_record.label}：准备中")
         if not self.busy:
@@ -973,6 +1570,18 @@ class LiveNoteGui:
                 result = self.service.run_queue_task(
                     started_record,
                     on_progress=self._progress_callback("queue", started_record.task_id),
+                    cancel_event=cancel_event,
+                )
+            except TaskCancelledError as exc:
+                self._remove_queue_record(started_record.task_id)
+                self.event_queue.put(
+                    (
+                        "task_cancelled",
+                        "queue",
+                        started_record.task_id,
+                        started_record.label,
+                        str(exc),
+                    )
                 )
             except Exception as exc:
                 self._remove_queue_record(started_record.task_id)
@@ -1020,7 +1629,15 @@ class LiveNoteGui:
             return
         selection = tree.selection()
         cancellable = any(
-            (record := self._queue_record(task_id)) is not None and record.status == "queued"
+            (record := self._queue_record(task_id)) is not None
+            and (
+                record.status == "queued"
+                or (
+                    record.status == "running"
+                    and record.action == "import"
+                    and task_id == self.queue_current_task_id
+                )
+            )
             for task_id in selection
         )
         button.configure(state="normal" if cancellable else "disabled")
@@ -1032,12 +1649,183 @@ class LiveNoteGui:
         selection = set(tree.selection())
         if not selection:
             return
+        requested_cancel = False
+        if self.queue_current_task_id in selection:
+            requested_cancel = self._request_running_queue_import_cancel(self.queue_current_task_id)
         cancelled = self._queue_runtime().cancel(selection)
         self._sync_queue_compat_state()
+        if requested_cancel:
+            self._append_log("已请求取消当前导入任务。")
+            self._refresh_queue_tree()
+            self._update_idle_status()
         if cancelled:
             self._append_log("已取消所选排队任务。")
             self._refresh_queue_tree()
             self._update_idle_status()
+
+    def _request_running_queue_import_cancel(self, task_id: str) -> bool:
+        if task_id != getattr(self, "queue_cancel_task_id", None):
+            return False
+        if getattr(self, "queue_cancel_action", None) != "import":
+            return False
+        cancel_event = getattr(self, "queue_cancel_event", None)
+        if cancel_event is None or cancel_event.is_set():
+            return False
+        cancel_event.set()
+        return True
+
+    def _refresh_remote_tasks(self) -> None:
+        snapshot = self.service.list_remote_task_summaries()
+        tree = getattr(self, "remote_task_tree", None)
+        if tree is None:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        self.remote_task_rows = {}
+        for index, record in enumerate(snapshot.tasks):
+            iid = record.remote_task_id or f"remote-pending-{index}"
+            self.remote_task_rows[iid] = record
+            progress_text = (
+                f"{record.current}/{record.total}"
+                if record.current is not None and record.total is not None
+                else record.stage
+            )
+            tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    _remote_task_status_text(record),
+                    record.label,
+                    record.session_id or "尚未关联记录",
+                    progress_text,
+                    record.updated_at.replace("T", " ").split("+")[0],
+                ),
+            )
+        primary = _primary_remote_task(snapshot.tasks)
+        self._set_remote_task_progress_state(primary)
+        if snapshot.availability_message:
+            self.remote_task_status_var.set(snapshot.availability_message)
+        else:
+            active = [
+                record
+                for record in snapshot.tasks
+                if getattr(record, "status", "") in {"queued", "running", "cancelling"}
+                and getattr(record, "attachment_state", "") != "lost"
+            ]
+            lost_count = sum(
+                1
+                for record in snapshot.tasks
+                if str(getattr(record, "attachment_state", "") or "").strip() == "lost"
+            )
+            if active and primary is not None:
+                self.remote_task_status_var.set(f"远端活动任务 {len(active)} 项。{primary.message}")
+            elif snapshot.tasks:
+                suffix = f"历史 {len(snapshot.tasks)} 项"
+                if lost_count:
+                    suffix = f"{suffix}，其中已丢失 {lost_count} 项"
+                self.remote_task_status_var.set(f"远端没有活动任务（{suffix}）。")
+            else:
+                self.remote_task_status_var.set("当前没有远端任务。")
+        self._on_remote_task_select(None)
+
+    def _selected_remote_task(self) -> object | None:
+        tree = getattr(self, "remote_task_tree", None)
+        if tree is None:
+            return None
+        selection = tree.selection()
+        if not selection:
+            return None
+        return self.remote_task_rows.get(selection[0])
+
+    def _on_remote_task_select(self, _event: object | None) -> None:
+        record = self._selected_remote_task()
+        open_button = getattr(self, "open_remote_task_button", None)
+        cancel_button = getattr(self, "cancel_remote_task_button", None)
+        if open_button is not None:
+            can_open = bool(record is not None and getattr(record, "session_id", None))
+            open_button.configure(state="normal" if can_open else "disabled")
+        if cancel_button is not None:
+            can_retry_sync = _remote_task_requires_sync(record)
+            can_cancel = bool(
+                record is not None
+                and getattr(record, "remote_task_id", None)
+                and getattr(record, "can_cancel", False)
+                and getattr(record, "attachment_state", "") != "lost"
+            )
+            if can_retry_sync:
+                cancel_button.configure(
+                    text="重试同步",
+                    command=self._retry_selected_remote_task_sync,
+                    state="normal",
+                )
+            else:
+                cancel_button.configure(
+                    text="取消",
+                    command=self._cancel_selected_remote_task,
+                    state="normal" if can_cancel else "disabled",
+                )
+
+    def _open_remote_task_session(self) -> None:
+        record = self._selected_remote_task()
+        if record is None:
+            return
+        session_id = getattr(record, "session_id", None)
+        if not session_id:
+            return
+        self._refresh_history()
+        if session_id in self.history_rows:
+            self.history_tree.selection_set(session_id)
+            self.history_tree.focus(session_id)
+            self.history_tree.see(session_id)
+            self._on_history_select(None)
+
+    def _cancel_selected_remote_task(self) -> None:
+        record = self._selected_remote_task()
+        if record is None:
+            return
+        remote_task_id = getattr(record, "remote_task_id", None)
+        if not remote_task_id:
+            return
+        self.service.cancel_remote_task(remote_task_id)
+        self._append_log(f"已请求取消远端任务：{remote_task_id}")
+        self._refresh_remote_tasks()
+
+    def _retry_selected_remote_task_sync(self) -> None:
+        record = self._selected_remote_task()
+        if record is None:
+            return
+        remote_task_id = getattr(record, "remote_task_id", None)
+        if not remote_task_id:
+            return
+        self.service.sync_remote_task(remote_task_id)
+        self._append_log(f"已重试同步远端任务：{remote_task_id}")
+        self._refresh_remote_tasks()
+
+    def _next_remote_task_poll_interval_ms(self) -> int:
+        records = list(getattr(self, "remote_task_rows", {}).values())
+        has_active = any(
+            getattr(record, "status", "") in {"queued", "running", "cancelling"}
+            and getattr(record, "attachment_state", "") != "lost"
+            for record in records
+        )
+        if not has_active:
+            return REMOTE_TASK_POLL_IDLE_MS
+        notebook = getattr(self, "main_notebook", None)
+        history_tab = getattr(self, "history_tab", None)
+        if (
+            notebook is not None
+            and history_tab is not None
+            and notebook.select() == str(history_tab)
+        ):
+            return REMOTE_TASK_POLL_ACTIVE_MS
+        return REMOTE_TASK_POLL_BACKGROUND_MS
+
+    def _poll_remote_tasks(self) -> None:
+        try:
+            self._refresh_remote_tasks()
+        finally:
+            self.root.after(self._next_remote_task_poll_interval_ms(), self._poll_remote_tasks)
 
     def _start_live_task(
         self,
@@ -1097,6 +1885,7 @@ class LiveNoteGui:
                     if self.refine_enabled_var.get() and self.save_session_wav_var.get()
                     else False
                 ),
+                speaker_enabled=self.live_speaker_enabled_var.get(),
             )
         except Exception as exc:
             messagebox.showerror("启动失败", str(exc))
@@ -1170,6 +1959,7 @@ class LiveNoteGui:
             title=self.import_title_var.get().strip() or None,
             kind=self.import_kind_var.get(),
             language=_optional_language_override(self.import_language_var.get()),
+            speaker_enabled=self.import_speaker_enabled_var.get(),
         )
         self._enqueue_queue_task(
             label=request.label,
@@ -1291,7 +2081,7 @@ class LiveNoteGui:
         self.start_live_button.configure(state="disabled")
         self.status_var.set(f"{label}：准备中")
         self.progress.configure(mode="indeterminate", value=0)
-        self.progress.start(12)
+        self.progress.start(self._progress_animation_interval_ms())
         self._set_task_progress_state(f"{label}：准备中")
 
         def worker() -> None:
@@ -1412,6 +2202,7 @@ class LiveNoteGui:
                 padx=(0 if column == 0 else 8, 0),
                 pady=(0 if row == 0 else 8, 0),
             )
+        frame.update_idletasks()
 
     def _open_transcript(self) -> None:
         summary = self._selected_summary()
@@ -1487,6 +2278,7 @@ class LiveNoteGui:
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.geometry("760x420")
+        dialog.configure(bg=self._theme_palette().app_bg)
         dialog.columnconfigure(0, weight=1)
 
         frame = ttk.Frame(dialog, padding=16)
@@ -1499,6 +2291,7 @@ class LiveNoteGui:
                 "早期也可以只启用本地转写。"
             ),
             wraplength=700,
+            style="Subtle.TLabel",
         ).grid(row=0, column=0, columnspan=2, sticky="w")
 
         _entry_row_with_button(
@@ -1586,9 +2379,12 @@ class LiveNoteGui:
             self._refresh_doctor_checks()
             self._refresh_devices()
 
-        ttk.Button(actions, text="保存并开始", command=save_and_close).grid(
-            row=0, column=1, padx=(8, 0)
-        )
+        ttk.Button(
+            actions,
+            text="保存并开始",
+            command=save_and_close,
+            style="Primary.TButton",
+        ).grid(row=0, column=1, padx=(8, 0))
         ttk.Button(actions, text="稍后配置", command=dialog.destroy).grid(
             row=0, column=2, padx=(8, 0)
         )
@@ -1615,12 +2411,28 @@ class LiveNoteGui:
             return False
         return True
 
+    def _progress_animation_interval_ms(self) -> int:
+        return PROGRESS_ANIMATION_INTERVAL_MS
+
+    def _next_poll_interval_ms(self, *, processed_events: bool = False) -> int:
+        if processed_events:
+            return POLL_ACTIVE_INTERVAL_MS
+        if getattr(self, "busy", False):
+            return POLL_ACTIVE_INTERVAL_MS
+        if getattr(self, "queue_worker", None) is not None:
+            return POLL_ACTIVE_INTERVAL_MS
+        if getattr(self, "background_tasks", {}):
+            return POLL_ACTIVE_INTERVAL_MS
+        return POLL_IDLE_INTERVAL_MS
+
     def _poll_events(self) -> None:
+        processed_events = False
         while True:
             try:
                 item = self.event_queue.get_nowait()
             except queue.Empty:
                 break
+            processed_events = True
 
             if isinstance(item, ProgressEvent):
                 self._handle_progress(item)
@@ -1654,7 +2466,10 @@ class LiveNoteGui:
                     self._append_log(f"{label}后台完成。")
                     self._refresh_history()
                     self._refresh_doctor_checks()
-        self.root.after(150, self._poll_events)
+        self.root.after(
+            self._next_poll_interval_ms(processed_events=processed_events),
+            self._poll_events,
+        )
 
     def _handle_progress(self, event: ProgressEvent) -> None:
         if event.source == "queue":
@@ -1728,6 +2543,8 @@ class LiveNoteGui:
         if event_type == "task_error":
             self._append_log(f"{label}失败：{payload}")
             messagebox.showerror(f"{label}失败", str(payload))
+        elif event_type == "task_cancelled":
+            self._append_log(f"{label}已取消。")
         else:
             self._append_log(f"{label}完成。")
         self._refresh_history()
@@ -1749,6 +2566,10 @@ class LiveNoteGui:
         if task_id == self.queue_current_task_id:
             self.queue_worker = None
             self._task_state_model().finish_queue(task_id)
+        if task_id == getattr(self, "queue_cancel_task_id", None):
+            self.queue_cancel_task_id = None
+            self.queue_cancel_action = None
+            self.queue_cancel_event = None
         self._refresh_queue_tree()
         queued = self._queued_count()
         if queued:
@@ -1844,7 +2665,7 @@ class LiveNoteGui:
             return
         if active:
             self.progress.configure(mode="indeterminate")
-            self.progress.start(12)
+            self.progress.start(self._progress_animation_interval_ms())
             return
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
@@ -1859,20 +2680,18 @@ class LiveNoteGui:
     ) -> None:
         if hasattr(self, "task_progress_var"):
             self.task_progress_var.set(message)
-        history_progress = getattr(self, "history_progress", None)
-        if history_progress is None:
-            return
-        if total:
-            history_progress.stop()
-            history_progress.configure(mode="determinate")
-            history_progress["value"] = round((current or 0) / total * 100)
-            return
-        if active:
-            history_progress.configure(mode="indeterminate")
-            history_progress.start(12)
-            return
-        history_progress.stop()
-        history_progress.configure(mode="determinate", value=0)
+        self._apply_progress_widget(
+            getattr(self, "history_progress", None),
+            current=current,
+            total=total,
+            active=active,
+        )
+        self._apply_progress_widget(
+            getattr(self, "progress", None),
+            current=current,
+            total=total,
+            active=active,
+        )
 
     def _set_task_progress_state(
         self,
@@ -1888,6 +2707,48 @@ class LiveNoteGui:
             total=total,
             active=active,
         )
+
+    def _set_remote_task_progress_state(self, record: object | None) -> None:
+        widget = getattr(self, "remote_task_progress", None)
+        if widget is None:
+            return
+        if record is None:
+            self._apply_progress_widget(widget, current=None, total=None, active=False)
+            return
+        if str(getattr(record, "attachment_state", "") or "").strip() == "lost":
+            self._apply_progress_widget(widget, current=None, total=None, active=False)
+            return
+        status = str(getattr(record, "status", "") or "").strip()
+        current = getattr(record, "current", None)
+        total = getattr(record, "total", None)
+        self._apply_progress_widget(
+            widget,
+            current=current,
+            total=total,
+            active=status in {"queued", "running", "cancelling"},
+        )
+
+    def _apply_progress_widget(
+        self,
+        widget: ttk.Progressbar | object | None,
+        *,
+        current: int | None,
+        total: int | None,
+        active: bool,
+    ) -> None:
+        if widget is None:
+            return
+        if total:
+            widget.stop()
+            widget.configure(mode="determinate")
+            widget["value"] = round((current or 0) / total * 100)
+            return
+        if active:
+            widget.configure(mode="indeterminate")
+            widget.start(self._progress_animation_interval_ms())
+            return
+        widget.stop()
+        widget.configure(mode="determinate", value=0)
 
     def _append_log(self, line: str) -> None:
         self.log_text.configure(state="normal")
@@ -1985,10 +2846,27 @@ def _entry_row(
     variable: tk.StringVar,
     hint: str | None = None,
 ) -> None:
-    ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(10, 0))
-    ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=(10, 0))
+    metrics = _default_gui_metrics()
+    ttk.Label(parent, text=label, style="SectionTitle.TLabel").grid(
+        row=row,
+        column=0,
+        sticky="w",
+        pady=(metrics.field_row_gap, 0),
+    )
+    ttk.Entry(parent, textvariable=variable).grid(
+        row=row,
+        column=1,
+        sticky="ew",
+        pady=(metrics.field_row_gap, 0),
+    )
     if hint:
-        ttk.Label(parent, text=hint).grid(row=row, column=2, sticky="w", padx=(8, 0), pady=(10, 0))
+        ttk.Label(parent, text=hint, style="Hint.TLabel").grid(
+            row=row,
+            column=2,
+            sticky="w",
+            padx=(metrics.inline_gap, 0),
+            pady=(metrics.field_row_gap, 0),
+        )
 
 
 class _InMemoryQueueStore:
@@ -2003,13 +2881,24 @@ class _InMemoryQueueStore:
 
 
 def _build_vertical_scroller(parent: ttk.Frame) -> ttk.Frame:
+    palette = _default_gui_palette()
     parent.columnconfigure(0, weight=1)
     parent.rowconfigure(0, weight=1)
 
-    canvas = tk.Canvas(parent, highlightthickness=0, borderwidth=0)
+    canvas = tk.Canvas(
+        parent,
+        highlightthickness=0,
+        borderwidth=0,
+        background=palette.surface_bg,
+    )
     canvas.grid(row=0, column=0, sticky="nsew")
 
-    scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+    scrollbar = ttk.Scrollbar(
+        parent,
+        orient="vertical",
+        command=canvas.yview,
+        style="App.Vertical.TScrollbar",
+    )
     scrollbar.grid(row=0, column=1, sticky="ns")
     canvas.configure(yscrollcommand=scrollbar.set)
 
@@ -2031,11 +2920,20 @@ def _build_vertical_scroller(parent: ttk.Frame) -> ttk.Frame:
 
 
 def _bind_mousewheel_scrolling(root: tk.Misc, canvas: tk.Canvas) -> None:
+    def _blocks_outer_scroll(widget: tk.Misc) -> bool:
+        widget_name = str(getattr(widget, "widgetName", "")).lower()
+        if widget_name in {"canvas", "text", "listbox", "ttk::treeview"}:
+            return True
+        yview = getattr(widget, "yview", None)
+        return callable(yview)
+
     def _is_descendant_of_canvas(widget: tk.Misc | None) -> bool:
         current = widget
         while current is not None:
             if current is canvas:
                 return True
+            if _blocks_outer_scroll(current):
+                return False
             current = getattr(current, "master", None)
         return False
 
@@ -2138,13 +3036,29 @@ def _entry_row_with_button(
     hint: str,
     command: Callable[[], None],
 ) -> None:
-    ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(10, 0))
+    metrics = _default_gui_metrics()
+    ttk.Label(parent, text=label, style="SectionTitle.TLabel").grid(
+        row=row,
+        column=0,
+        sticky="w",
+        pady=(metrics.field_row_gap, 0),
+    )
     wrapper = ttk.Frame(parent)
-    wrapper.grid(row=row, column=1, sticky="ew", pady=(10, 0))
+    wrapper.grid(row=row, column=1, sticky="ew", pady=(metrics.field_row_gap, 0))
     wrapper.columnconfigure(0, weight=1)
     ttk.Entry(wrapper, textvariable=variable).grid(row=0, column=0, sticky="ew")
-    ttk.Button(wrapper, text="浏览", command=command).grid(row=0, column=1, padx=(8, 0))
-    ttk.Label(parent, text=hint).grid(row=row, column=2, sticky="w", padx=(8, 0), pady=(10, 0))
+    ttk.Button(wrapper, text="浏览", command=command).grid(
+        row=0,
+        column=1,
+        padx=(metrics.inline_gap, 0),
+    )
+    ttk.Label(parent, text=hint, style="Hint.TLabel").grid(
+        row=row,
+        column=2,
+        sticky="w",
+        padx=(metrics.inline_gap, 0),
+        pady=(metrics.field_row_gap, 0),
+    )
 
 
 def _combobox_row(
@@ -2154,12 +3068,18 @@ def _combobox_row(
     variable: tk.StringVar,
     values: list[str],
 ) -> None:
-    ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(10, 0))
+    metrics = _default_gui_metrics()
+    ttk.Label(parent, text=label, style="SectionTitle.TLabel").grid(
+        row=row,
+        column=0,
+        sticky="w",
+        pady=(metrics.field_row_gap, 0),
+    )
     ttk.Combobox(parent, textvariable=variable, state="readonly", values=values).grid(
         row=row,
         column=1,
         sticky="ew",
-        pady=(10, 0),
+        pady=(metrics.field_row_gap, 0),
     )
 
 
@@ -2170,16 +3090,81 @@ def _language_row(
     variable: tk.StringVar,
     include_blank: bool,
 ) -> None:
+    metrics = _default_gui_metrics()
     values = SESSION_LANGUAGE_CHOICES if include_blank else DEFAULT_LANGUAGE_CHOICES
     hint = "中英混合或多语言建议选 auto；也可直接输入其他 Whisper 语言代码"
-    ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(10, 0))
+    ttk.Label(parent, text=label, style="SectionTitle.TLabel").grid(
+        row=row,
+        column=0,
+        sticky="w",
+        pady=(metrics.field_row_gap, 0),
+    )
     ttk.Combobox(parent, textvariable=variable, values=values).grid(
         row=row,
         column=1,
         sticky="ew",
-        pady=(10, 0),
+        pady=(metrics.field_row_gap, 0),
     )
-    ttk.Label(parent, text=hint).grid(row=row, column=2, sticky="w", padx=(8, 0), pady=(10, 0))
+    ttk.Label(parent, text=hint, style="Hint.TLabel").grid(
+        row=row,
+        column=2,
+        sticky="w",
+        padx=(metrics.inline_gap, 0),
+        pady=(metrics.field_row_gap, 0),
+    )
+
+
+def _remote_task_status_text(record: object) -> str:
+    attachment_state = str(getattr(record, "attachment_state", "") or "").strip()
+    if attachment_state == "lost":
+        return "已丢失"
+    status = str(getattr(record, "status", "") or "").strip()
+    if status == "completed":
+        result_version = int(getattr(record, "result_version", 0) or 0)
+        last_synced = int(getattr(record, "last_synced_result_version", 0) or 0)
+        if result_version > last_synced:
+            return "同步失败" if getattr(record, "last_error", None) else "待同步"
+        return "已完成"
+    return {
+        "queued": "排队中",
+        "running": "运行中",
+        "cancelling": "取消中",
+        "failed": "失败",
+        "cancelled": "已取消",
+    }.get(status, status or "未知")
+
+
+def _primary_remote_task(records: list[object]) -> object | None:
+    for record in records:
+        if (
+            str(getattr(record, "status", "") or "").strip() in {"running", "cancelling"}
+            and str(getattr(record, "attachment_state", "") or "").strip() != "lost"
+        ):
+            return record
+    for record in records:
+        if (
+            str(getattr(record, "status", "") or "").strip() in {"queued", "running", "cancelling"}
+            and str(getattr(record, "attachment_state", "") or "").strip() != "lost"
+        ):
+            return record
+    for record in records:
+        if str(getattr(record, "attachment_state", "") or "").strip() != "lost":
+            return record
+    return records[0] if records else None
+
+
+def _remote_task_requires_sync(record: object | None) -> bool:
+    if record is None:
+        return False
+    if str(getattr(record, "status", "") or "").strip() != "completed":
+        return False
+    if str(getattr(record, "attachment_state", "") or "").strip() == "lost":
+        return False
+    if not getattr(record, "remote_task_id", None) or not getattr(record, "session_id", None):
+        return False
+    result_version = int(getattr(record, "result_version", 0) or 0)
+    last_synced = int(getattr(record, "last_synced_result_version", 0) or 0)
+    return result_version > last_synced or bool(getattr(record, "last_error", None))
 
 
 def _normalize_language_value(value: str, blank_fallback: str = "") -> str:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import tempfile
 import threading
 import unittest
@@ -11,11 +12,16 @@ from unittest.mock import ANY, MagicMock, Mock, patch
 from live_note.app.events import ProgressEvent
 from live_note.app.gui import (
     LiveNoteGui,
+    _apply_visual_theme,
+    _bind_mousewheel_scrolling,
     _build_execution_target_hint,
     _build_vertical_scroller,
+    _default_gui_metrics,
+    _default_gui_palette,
     _language_code_to_display,
     _normalize_language_value,
     _optional_language_override,
+    _primary_remote_task,
     _summary_supports_refine,
     _wrap_action_rows,
 )
@@ -50,6 +56,113 @@ class GuiLanguageTests(unittest.TestCase):
             "当前转写：远端服务（172.21.0.159，未连通）",
             _build_execution_target_hint(True, "http://172.21.0.159:8765", "FAIL"),
         )
+
+
+class GuiThemeTests(unittest.TestCase):
+    def test_default_gui_palette_is_light_and_neutral(self) -> None:
+        palette = _default_gui_palette()
+
+        self.assertEqual("#EEF2F7", palette.app_bg)
+        self.assertEqual("#FBFCFE", palette.surface_bg)
+        self.assertEqual("#1F2937", palette.text_primary)
+        self.assertEqual("#2563EB", palette.accent)
+
+    def test_default_gui_metrics_compact_layout_spacing(self) -> None:
+        metrics = _default_gui_metrics()
+
+        self.assertEqual((20, 12), metrics.header_padding)
+        self.assertEqual(14, metrics.page_padding)
+        self.assertEqual(12, metrics.section_gap)
+        self.assertEqual(11, metrics.log_height)
+
+    def test_apply_visual_theme_configures_root_and_ttk_styles(self) -> None:
+        root = MagicMock()
+        style = MagicMock()
+
+        with patch("live_note.app.gui.ttk.Style", return_value=style):
+            _apply_visual_theme(root)
+
+        root.configure.assert_called_once()
+        self.assertEqual("#EEF2F7", root.configure.call_args.kwargs["bg"])
+        style.theme_use.assert_called_once_with("clam")
+        configured_styles = [call.args[0] for call in style.configure.call_args_list]
+        self.assertIn("App.TNotebook", configured_styles)
+        self.assertIn("App.TNotebook.Tab", configured_styles)
+        self.assertIn("Section.TLabelframe", configured_styles)
+        self.assertIn("App.Treeview", configured_styles)
+
+    def test_bind_mousewheel_scrolling_does_not_scroll_outer_canvas_when_inner_matches(
+        self,
+    ) -> None:
+        root = MagicMock()
+        outer_canvas = MagicMock()
+        inner_canvas = MagicMock()
+        outer_canvas.widgetName = "canvas"
+        inner_canvas.widgetName = "canvas"
+        outer_content = SimpleNamespace(master=outer_canvas)
+        inner_content = SimpleNamespace(master=inner_canvas)
+        inner_canvas.master = outer_content
+
+        outer_canvas.winfo_containing.return_value = inner_content
+        inner_canvas.winfo_containing.return_value = inner_content
+
+        _bind_mousewheel_scrolling(root, outer_canvas)
+        _bind_mousewheel_scrolling(root, inner_canvas)
+
+        handlers = [
+            call.args[1] for call in root.bind_all.call_args_list if call.args[0] == "<MouseWheel>"
+        ]
+        self.assertEqual(2, len(handlers))
+
+        event = SimpleNamespace(x_root=120, y_root=80, delta=-120, num=None)
+        for handler in handlers:
+            handler(event)
+
+        inner_canvas.yview_scroll.assert_called_once_with(1, "units")
+        outer_canvas.yview_scroll.assert_not_called()
+
+    def test_bind_mousewheel_scrolling_does_not_scroll_outer_canvas_when_inner_treeview_matches(
+        self,
+    ) -> None:
+        root = MagicMock()
+        outer_canvas = MagicMock()
+        outer_canvas.widgetName = "canvas"
+        content = SimpleNamespace(master=outer_canvas)
+        treeview = SimpleNamespace(master=content, widgetName="ttk::treeview")
+
+        outer_canvas.winfo_containing.return_value = treeview
+
+        _bind_mousewheel_scrolling(root, outer_canvas)
+
+        handlers = [
+            call.args[1] for call in root.bind_all.call_args_list if call.args[0] == "<MouseWheel>"
+        ]
+        self.assertEqual(1, len(handlers))
+
+        event = SimpleNamespace(x_root=120, y_root=80, delta=-120, num=None)
+        handlers[0](event)
+
+        outer_canvas.yview_scroll.assert_not_called()
+
+
+class GuiRemoteTaskTests(unittest.TestCase):
+    def test_primary_remote_task_prefers_running_over_newer_queued_item(self) -> None:
+        running = SimpleNamespace(
+            status="running",
+            attachment_state="attached",
+            message="正在转写片段 4/10",
+            updated_at="2026-03-23T15:00:00+08:00",
+        )
+        queued = SimpleNamespace(
+            status="queued",
+            attachment_state="attached",
+            message="已加入远端队列。",
+            updated_at="2026-03-23T15:01:00+08:00",
+        )
+
+        primary = _primary_remote_task([queued, running])
+
+        self.assertIs(primary, running)
 
 
 class GuiHistoryTests(unittest.TestCase):
@@ -97,6 +210,142 @@ class GuiHistoryTests(unittest.TestCase):
 
         self.assertEqual([first, second], summaries)
 
+    def test_refresh_remote_tasks_populates_tree_and_status(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.service = SimpleNamespace(
+            list_remote_task_summaries=lambda: SimpleNamespace(
+                remote_available=True,
+                availability_message=None,
+                tasks=[
+                    SimpleNamespace(
+                        remote_task_id="task-1",
+                        label="文件导入",
+                        action="import",
+                        session_id="remote-1",
+                        status="running",
+                        stage="transcribing",
+                        message="正在转写片段 1/2",
+                        current=1,
+                        total=2,
+                        updated_at="2026-03-19T10:00:00+00:00",
+                        attachment_state="attached",
+                        can_cancel=True,
+                        result_version=1,
+                        last_synced_result_version=0,
+                        last_error=None,
+                    )
+                ],
+            )
+        )
+        gui.remote_task_tree = MagicMock()
+        gui.remote_task_tree.get_children.return_value = ["old"]
+        gui.remote_task_status_var = MagicMock()
+        gui.remote_task_progress = MagicMock()
+        gui._on_remote_task_select = Mock()
+
+        gui._refresh_remote_tasks()
+
+        gui.remote_task_tree.delete.assert_called_once_with("old")
+        gui.remote_task_tree.insert.assert_called_once()
+        gui.remote_task_status_var.set.assert_called_once()
+        gui.remote_task_progress.configure.assert_called()
+        self.assertIn("task-1", gui.remote_task_rows)
+
+    def test_refresh_remote_tasks_treats_lost_running_task_as_inactive(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.service = SimpleNamespace(
+            list_remote_task_summaries=lambda: SimpleNamespace(
+                remote_available=True,
+                availability_message=None,
+                tasks=[
+                    SimpleNamespace(
+                        remote_task_id="task-lost-1",
+                        label="文件导入",
+                        action="import",
+                        session_id="remote-1",
+                        status="running",
+                        stage="speaker",
+                        message="正在分析说话人特征。",
+                        current=1,
+                        total=3,
+                        updated_at="2026-03-19T10:00:00+00:00",
+                        attachment_state="lost",
+                        can_cancel=True,
+                        result_version=1,
+                        last_synced_result_version=0,
+                        last_error="服务端已重置，任务无法恢复。",
+                    )
+                ],
+            )
+        )
+        gui.remote_task_tree = MagicMock()
+        gui.remote_task_tree.get_children.return_value = []
+        gui.remote_task_status_var = MagicMock()
+        gui.remote_task_progress = MagicMock()
+        gui._on_remote_task_select = Mock()
+
+        gui._refresh_remote_tasks()
+
+        gui.remote_task_status_var.set.assert_called_once()
+        message = gui.remote_task_status_var.set.call_args.args[0]
+        self.assertIn("没有活动任务", message)
+        gui.remote_task_progress.start.assert_not_called()
+
+    def test_cancel_selected_remote_task_requests_service_and_refreshes(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.remote_task_tree = SimpleNamespace(selection=lambda: ("task-1",))
+        gui.remote_task_rows = {"task-1": SimpleNamespace(remote_task_id="task-1", can_cancel=True)}
+        gui.service = SimpleNamespace(cancel_remote_task=Mock())
+        gui._refresh_remote_tasks = Mock()
+        gui._append_log = Mock()
+
+        gui._cancel_selected_remote_task()
+
+        gui.service.cancel_remote_task.assert_called_once_with("task-1")
+        gui._refresh_remote_tasks.assert_called_once_with()
+
+    def test_remote_task_select_turns_secondary_action_into_retry_sync_when_needed(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.remote_task_tree = SimpleNamespace(selection=lambda: ("task-1",))
+        gui.remote_task_rows = {
+            "task-1": SimpleNamespace(
+                remote_task_id="task-1",
+                can_cancel=False,
+                session_id="remote-1",
+                attachment_state="attached",
+                status="completed",
+                result_version=4,
+                last_synced_result_version=1,
+                last_error="同步失败",
+            )
+        }
+        gui.open_remote_task_button = MagicMock()
+        gui.cancel_remote_task_button = MagicMock()
+
+        gui._on_remote_task_select(None)
+
+        gui.open_remote_task_button.configure.assert_called_with(state="normal")
+        gui.cancel_remote_task_button.configure.assert_called_with(
+            text="重试同步",
+            command=gui._retry_selected_remote_task_sync,
+            state="normal",
+        )
+
+    def test_retry_selected_remote_task_sync_calls_service_and_refreshes(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.remote_task_tree = SimpleNamespace(selection=lambda: ("task-1",))
+        gui.remote_task_rows = {
+            "task-1": SimpleNamespace(remote_task_id="task-1", session_id="remote-1")
+        }
+        gui.service = SimpleNamespace(sync_remote_task=Mock())
+        gui._refresh_remote_tasks = Mock()
+        gui._append_log = Mock()
+
+        gui._retry_selected_remote_task_sync()
+
+        gui.service.sync_remote_task.assert_called_once_with("task-1")
+        gui._refresh_remote_tasks.assert_called_once_with()
+
 
 class GuiTaskTests(unittest.TestCase):
     def test_parse_live_auto_stop_seconds_accepts_decimal_minutes(self) -> None:
@@ -142,6 +391,16 @@ class GuiTaskTests(unittest.TestCase):
             "remote_base_url_var",
             "remote_api_token_var",
             "remote_live_chunk_ms_var",
+            "funasr_enabled_var",
+            "funasr_base_url_var",
+            "funasr_mode_var",
+            "funasr_use_itn_var",
+            "speaker_enabled_var",
+            "speaker_backend_var",
+            "speaker_segmentation_model_var",
+            "speaker_embedding_model_var",
+            "speaker_cluster_threshold_var",
+            "speaker_pyannote_model_var",
         ]:
             setattr(gui, name, object())
         gui._autodetect_settings = Mock()
@@ -184,6 +443,229 @@ class GuiTaskTests(unittest.TestCase):
             gui._build_settings_tab(MagicMock())
 
         self.assertIn("远端转写", frame_texts)
+        self.assertIn("说话人区分", frame_texts)
+
+    def test_build_history_tab_wraps_content_in_vertical_scroller(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.root = SimpleNamespace(after_idle=Mock())
+        gui.task_progress_var = object()
+        gui.remote_task_status_var = object()
+        gui.history_detail_var = object()
+        gui._theme_metrics = Mock(return_value=_default_gui_metrics())
+
+        content = MagicMock()
+        label_frame_parents: list[object] = []
+
+        def widget_factory(*_args, **_kwargs):
+            widget = MagicMock()
+            widget.grid = Mock()
+            widget.columnconfigure = Mock()
+            widget.rowconfigure = Mock()
+            widget.bind = Mock()
+            widget.heading = Mock()
+            widget.column = Mock()
+            return widget
+
+        def label_frame_factory(parent, *_args, **_kwargs):
+            label_frame_parents.append(parent)
+            return widget_factory()
+
+        with (
+            patch("live_note.app.gui._build_vertical_scroller", return_value=content) as scroller,
+            patch("live_note.app.gui.ttk.Frame", side_effect=widget_factory),
+            patch("live_note.app.gui.ttk.Button", side_effect=widget_factory),
+            patch("live_note.app.gui.ttk.Label", side_effect=widget_factory),
+            patch("live_note.app.gui.ttk.Progressbar", side_effect=widget_factory),
+            patch("live_note.app.gui.ttk.Treeview", side_effect=widget_factory),
+            patch("live_note.app.gui.ttk.LabelFrame", side_effect=label_frame_factory),
+        ):
+            gui._build_history_tab(MagicMock())
+
+        scroller.assert_called_once()
+        self.assertTrue(label_frame_parents)
+        self.assertIs(label_frame_parents[0], content)
+
+    def test_relayout_history_actions_flushes_layout_after_regridding_buttons(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        frame = MagicMock()
+        frame.winfo_width.return_value = 320
+        frame.grid_columnconfigure = Mock()
+        frame.update_idletasks = Mock()
+        first = MagicMock()
+        second = MagicMock()
+        first.winfo_reqwidth.return_value = 120
+        second.winfo_reqwidth.return_value = 140
+        first.grid_forget = Mock()
+        second.grid_forget = Mock()
+        first.grid = Mock()
+        second.grid = Mock()
+        gui.history_actions_frame = frame
+        gui.history_action_buttons = [first, second]
+
+        gui._relayout_history_actions()
+
+        frame.update_idletasks.assert_called_once_with()
+
+    def test_load_settings_updates_visible_speaker_backend_fields(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        for name in [
+            "ffmpeg_var",
+            "whisper_binary_var",
+            "whisper_model_var",
+            "whisper_host_var",
+            "whisper_port_var",
+            "whisper_threads_var",
+            "live_language_var",
+            "import_language_var",
+            "whisper_language_var",
+            "whisper_translate_var",
+            "save_session_wav_var",
+            "refine_enabled_var",
+            "refine_auto_after_live_var",
+            "live_auto_refine_var",
+            "obsidian_enabled_var",
+            "obsidian_base_url_var",
+            "obsidian_transcript_dir_var",
+            "obsidian_structured_dir_var",
+            "obsidian_verify_ssl_var",
+            "obsidian_api_key_var",
+            "llm_enabled_var",
+            "llm_base_url_var",
+            "llm_model_var",
+            "llm_stream_var",
+            "llm_wire_api_var",
+            "llm_requires_openai_auth_var",
+            "llm_api_key_var",
+            "remote_enabled_var",
+            "remote_base_url_var",
+            "remote_api_token_var",
+            "remote_live_chunk_ms_var",
+            "serve_host_var",
+            "serve_port_var",
+            "serve_api_token_var",
+            "funasr_enabled_var",
+            "funasr_base_url_var",
+            "funasr_mode_var",
+            "funasr_use_itn_var",
+            "live_speaker_enabled_var",
+            "import_speaker_enabled_var",
+            "speaker_enabled_var",
+            "speaker_segmentation_model_var",
+            "speaker_embedding_model_var",
+            "speaker_cluster_threshold_var",
+        ]:
+            setattr(gui, name, MagicMock())
+        gui.speaker_backend_var = MagicMock()
+        gui.speaker_pyannote_model_var = MagicMock()
+        gui._update_live_auto_refine_state = Mock()
+        gui._update_execution_target_hint = Mock()
+
+        gui._load_settings(
+            SimpleNamespace(
+                ffmpeg_binary="/opt/homebrew/bin/ffmpeg",
+                whisper_binary="/Users/demo/whisper-server",
+                whisper_model="/Users/demo/model.bin",
+                whisper_host="127.0.0.1",
+                whisper_port=8178,
+                whisper_threads=4,
+                whisper_language="auto",
+                whisper_translate=False,
+                save_session_wav=True,
+                refine_enabled=True,
+                refine_auto_after_live=True,
+                obsidian_enabled=False,
+                obsidian_base_url="https://127.0.0.1:27124",
+                obsidian_transcript_dir="Sessions/Transcripts",
+                obsidian_structured_dir="Sessions/Summaries",
+                obsidian_verify_ssl=False,
+                obsidian_api_key="",
+                llm_enabled=False,
+                llm_base_url="https://api.openai.com/v1",
+                llm_model="gpt-4.1-mini",
+                llm_stream=False,
+                llm_wire_api="chat_completions",
+                llm_requires_openai_auth=False,
+                llm_api_key="",
+                remote_enabled=False,
+                remote_base_url="http://127.0.0.1:8765",
+                remote_api_token="",
+                remote_live_chunk_ms=240,
+                serve_host="127.0.0.1",
+                serve_port=8765,
+                serve_api_token="",
+                funasr_enabled=False,
+                funasr_base_url="ws://127.0.0.1:10095",
+                funasr_mode="2pass",
+                funasr_use_itn=True,
+                speaker_enabled=True,
+                speaker_backend="pyannote",
+                speaker_segmentation_model="",
+                speaker_embedding_model="",
+                speaker_cluster_threshold=0.5,
+                speaker_pyannote_model="pyannote/speaker-diarization-community-1",
+            )
+        )
+
+        gui.speaker_backend_var.set.assert_called_once_with("pyannote")
+        gui.speaker_pyannote_model_var.set.assert_called_once_with(
+            "pyannote/speaker-diarization-community-1"
+        )
+
+    def test_current_settings_reads_visible_speaker_backend_fields(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.ffmpeg_var = SimpleNamespace(get=lambda: "/opt/homebrew/bin/ffmpeg")
+        gui.whisper_binary_var = SimpleNamespace(get=lambda: "/Users/demo/whisper-server")
+        gui.whisper_model_var = SimpleNamespace(get=lambda: "/Users/demo/model.bin")
+        gui.whisper_host_var = SimpleNamespace(get=lambda: "127.0.0.1")
+        gui.whisper_port_var = SimpleNamespace(get=lambda: "8178")
+        gui.whisper_threads_var = SimpleNamespace(get=lambda: "4")
+        gui.whisper_language_var = SimpleNamespace(
+            get=lambda: "自动识别 / 中英混合 / 多语言（auto）"
+        )
+        gui.whisper_translate_var = SimpleNamespace(get=lambda: False)
+        gui.save_session_wav_var = SimpleNamespace(get=lambda: True)
+        gui.refine_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.refine_auto_after_live_var = SimpleNamespace(get=lambda: True)
+        gui.obsidian_enabled_var = SimpleNamespace(get=lambda: False)
+        gui.obsidian_base_url_var = SimpleNamespace(get=lambda: "https://127.0.0.1:27124")
+        gui.obsidian_transcript_dir_var = SimpleNamespace(get=lambda: "Sessions/Transcripts")
+        gui.obsidian_structured_dir_var = SimpleNamespace(get=lambda: "Sessions/Summaries")
+        gui.obsidian_verify_ssl_var = SimpleNamespace(get=lambda: False)
+        gui.obsidian_api_key_var = SimpleNamespace(get=lambda: "")
+        gui.llm_enabled_var = SimpleNamespace(get=lambda: False)
+        gui.llm_base_url_var = SimpleNamespace(get=lambda: "https://api.openai.com/v1")
+        gui.llm_model_var = SimpleNamespace(get=lambda: "gpt-4.1-mini")
+        gui.llm_stream_var = SimpleNamespace(get=lambda: False)
+        gui.llm_wire_api_var = SimpleNamespace(get=lambda: "chat_completions")
+        gui.llm_requires_openai_auth_var = SimpleNamespace(get=lambda: False)
+        gui.remote_enabled_var = SimpleNamespace(get=lambda: False)
+        gui.remote_base_url_var = SimpleNamespace(get=lambda: "http://127.0.0.1:8765")
+        gui.remote_api_token_var = SimpleNamespace(get=lambda: "")
+        gui.remote_live_chunk_ms_var = SimpleNamespace(get=lambda: "240")
+        gui.serve_host_var = SimpleNamespace(get=lambda: "127.0.0.1")
+        gui.serve_port_var = SimpleNamespace(get=lambda: "8765")
+        gui.serve_api_token_var = SimpleNamespace(get=lambda: "")
+        gui.funasr_enabled_var = SimpleNamespace(get=lambda: False)
+        gui.funasr_base_url_var = SimpleNamespace(get=lambda: "ws://127.0.0.1:10095")
+        gui.funasr_mode_var = SimpleNamespace(get=lambda: "2pass")
+        gui.funasr_use_itn_var = SimpleNamespace(get=lambda: True)
+        gui.speaker_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.speaker_backend_var = SimpleNamespace(get=lambda: "pyannote")
+        gui.speaker_segmentation_model_var = SimpleNamespace(get=lambda: "")
+        gui.speaker_embedding_model_var = SimpleNamespace(get=lambda: "")
+        gui.speaker_cluster_threshold_var = SimpleNamespace(get=lambda: "0.5")
+        gui.speaker_pyannote_model_var = SimpleNamespace(
+            get=lambda: "pyannote/speaker-diarization-community-1"
+        )
+        gui.llm_api_key_var = SimpleNamespace(get=lambda: "")
+
+        draft = gui._current_settings()
+
+        self.assertEqual("pyannote", draft.speaker_backend)
+        self.assertEqual(
+            "pyannote/speaker-diarization-community-1",
+            draft.speaker_pyannote_model,
+        )
 
     def test_refresh_doctor_checks_updates_execution_target_hint(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
@@ -218,6 +700,7 @@ class GuiTaskTests(unittest.TestCase):
         gui.live_kind_var = SimpleNamespace(get=lambda: "meeting")
         gui.live_language_var = SimpleNamespace(get=lambda: "沿用默认设置")
         gui.live_auto_refine_var = SimpleNamespace(get=lambda: True)
+        gui.live_speaker_enabled_var = SimpleNamespace(get=lambda: False)
         gui.live_stop_after_minutes_var = SimpleNamespace(get=lambda: "")
         gui.refine_enabled_var = SimpleNamespace(get=lambda: True)
         gui.save_session_wav_var = SimpleNamespace(get=lambda: True)
@@ -248,6 +731,7 @@ class GuiTaskTests(unittest.TestCase):
         gui.live_kind_var = SimpleNamespace(get=lambda: "meeting")
         gui.live_language_var = SimpleNamespace(get=lambda: "沿用默认设置")
         gui.live_auto_refine_var = SimpleNamespace(get=lambda: False)
+        gui.live_speaker_enabled_var = SimpleNamespace(get=lambda: True)
         gui.live_stop_after_minutes_var = SimpleNamespace(get=lambda: "15")
         gui.refine_enabled_var = SimpleNamespace(get=lambda: True)
         gui.save_session_wav_var = SimpleNamespace(get=lambda: True)
@@ -269,8 +753,28 @@ class GuiTaskTests(unittest.TestCase):
             language=None,
             on_progress=ANY,
             auto_refine_after_live=False,
+            speaker_enabled=True,
         )
         gui._arm_live_auto_stop.assert_called_once_with(900)
+
+    def test_start_import_enqueues_speaker_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            media_path = Path(temp_dir) / "demo.mp3"
+            media_path.write_bytes(b"fake-audio")
+            gui = LiveNoteGui.__new__(LiveNoteGui)
+            gui._ensure_queue_ready = Mock(return_value=True)
+            gui.import_file_var = SimpleNamespace(get=lambda: str(media_path))
+            gui.import_title_var = SimpleNamespace(get=lambda: "课程录音")
+            gui.import_kind_var = SimpleNamespace(get=lambda: "lecture")
+            gui.import_language_var = SimpleNamespace(get=lambda: "沿用默认设置")
+            gui.import_speaker_enabled_var = SimpleNamespace(get=lambda: True)
+            gui._enqueue_queue_task = Mock()
+
+            gui._start_import()
+
+        gui._enqueue_queue_task.assert_called_once()
+        payload = gui._enqueue_queue_task.call_args.kwargs["payload"]
+        self.assertTrue(payload["speaker_enabled"])
 
     def test_toggle_live_pause_pauses_and_resumes_auto_stop(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
@@ -383,6 +887,32 @@ class GuiTaskTests(unittest.TestCase):
         gui.history_progress.stop.assert_called_once()
         gui.history_progress.configure.assert_called_once_with(mode="determinate")
         self.assertEqual(gui.history_progress.__setitem__.call_args_list, [(("value", 67),)])
+
+    def test_handle_queue_progress_updates_primary_progress_for_determinate_event(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.queue_current_task_id = "task-queue-1"
+        gui.busy = False
+        gui.status_var = SimpleNamespace(set=Mock())
+        gui.task_progress_var = SimpleNamespace(set=Mock())
+        gui.history_progress = MagicMock()
+        gui.progress = MagicMock()
+        gui._append_log = Mock()
+
+        gui._handle_progress(
+            ProgressEvent(
+                stage="transcribing",
+                message="正在转写片段 2/4",
+                current=2,
+                total=4,
+                source="queue",
+                task_id="task-queue-1",
+            )
+        )
+
+        gui.status_var.set.assert_called_once_with("正在转写片段 2/4")
+        gui.progress.stop.assert_called_once()
+        gui.progress.configure.assert_called_once_with(mode="determinate")
+        self.assertEqual(gui.progress.__setitem__.call_args_list, [(("value", 50),)])
 
     def test_update_idle_status_resets_history_progress_when_no_tasks(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
@@ -549,6 +1079,97 @@ class GuiTaskTests(unittest.TestCase):
         gui._maybe_start_next_queue_task()
 
         gui._start_queue_task.assert_called_once_with(gui.queue_records[0])
+
+    def test_set_live_progress_state_uses_lower_frequency_animation(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.progress = MagicMock()
+
+        gui._set_live_progress_state("正在准备", active=True)
+
+        gui.progress.configure.assert_called_once_with(mode="indeterminate")
+        gui.progress.start.assert_called_once_with(96)
+
+    def test_set_queue_progress_state_uses_lower_frequency_animation(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.task_progress_var = SimpleNamespace(set=Mock())
+        gui.history_progress = MagicMock()
+
+        gui._set_queue_progress_state("正在处理队列", active=True)
+
+        gui.task_progress_var.set.assert_called_once_with("正在处理队列")
+        gui.history_progress.configure.assert_called_once_with(mode="indeterminate")
+        gui.history_progress.start.assert_called_once_with(96)
+
+    def test_queue_select_enables_cancel_for_running_import_task(self) -> None:
+        running_import = build_task_record(
+            task_id="task-0001",
+            action="import",
+            label="导入文件",
+            payload={"file_path": "~/demo.mp3", "kind": "generic"},
+            created_at="2026-03-19T10:00:00+00:00",
+            status="running",
+            started_at="2026-03-19T10:01:00+00:00",
+        )
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.cancel_queue_button = MagicMock()
+        gui.queue_tree = SimpleNamespace(selection=lambda: ("task-0001",))
+        gui.queue_current_task_id = "task-0001"
+        gui._queue_record = Mock(return_value=running_import)
+
+        gui._on_queue_select(None)
+
+        gui.cancel_queue_button.configure.assert_called_once_with(state="normal")
+
+    def test_cancel_selected_queue_task_requests_running_import_cancel(self) -> None:
+        running_import = build_task_record(
+            task_id="task-0001",
+            action="import",
+            label="导入文件",
+            payload={"file_path": "~/demo.mp3", "kind": "generic"},
+            created_at="2026-03-19T10:00:00+00:00",
+            status="running",
+            started_at="2026-03-19T10:01:00+00:00",
+        )
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.queue_tree = SimpleNamespace(selection=lambda: ("task-0001",))
+        gui.queue_current_task_id = "task-0001"
+        gui._queue_record = Mock(return_value=running_import)
+        gui._queue_runtime = Mock(return_value=SimpleNamespace(cancel=Mock(return_value=0)))
+        gui._request_running_queue_import_cancel = Mock(return_value=True)
+        gui._sync_queue_compat_state = Mock()
+        gui._append_log = Mock()
+        gui._refresh_queue_tree = Mock()
+        gui._update_idle_status = Mock()
+
+        gui._cancel_selected_queue_task()
+
+        gui._request_running_queue_import_cancel.assert_called_once_with("task-0001")
+        gui._append_log.assert_called_once_with("已请求取消当前导入任务。")
+        gui._refresh_queue_tree.assert_called_once_with()
+
+    def test_poll_events_uses_faster_interval_while_busy(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.event_queue = queue.Queue()
+        gui.root = MagicMock()
+        gui.busy = True
+        gui.queue_worker = None
+        gui.background_tasks = {}
+
+        gui._poll_events()
+
+        gui.root.after.assert_called_once_with(120, gui._poll_events)
+
+    def test_poll_events_uses_slower_interval_when_idle(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.event_queue = queue.Queue()
+        gui.root = MagicMock()
+        gui.busy = False
+        gui.queue_worker = None
+        gui.background_tasks = {}
+
+        gui._poll_events()
+
+        gui.root.after.assert_called_once_with(400, gui._poll_events)
 
     def test_maybe_start_next_queue_task_skips_when_live_or_background_busy(self) -> None:
         record = build_task_record(
