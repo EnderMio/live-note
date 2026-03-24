@@ -17,6 +17,7 @@ from live_note.remote.protocol import entry_from_dict, metadata_from_dict
 from .events import ProgressCallback, ProgressEvent
 from .journal import SessionWorkspace
 from .remote_sync import apply_remote_artifacts, ensure_remote_workspace
+from .remote_tasks import upsert_remote_task_payload
 from .session_outputs import try_sync_note
 
 
@@ -69,6 +70,7 @@ class RemoteLiveCoordinator:
         self.session_id: str | None = None
         self.workspace: SessionWorkspace | None = None
         self._live_entries: list[TranscriptEntry] = []
+        self._finalized_segment_ids: set[str] = set()
 
     def request_stop(self) -> None:
         self._stop_event.set()
@@ -106,31 +108,43 @@ class RemoteLiveCoordinator:
             reader.start()
             capture.start()
             stop_sent = False
+            stopping_capture = False
             try:
                 while not done_event.is_set():
                     self._drain_control_commands(capture, connection, batcher)
                     self._raise_if_error(error_queue)
                     if capture.error:
                         raise AudioCaptureError(str(capture.error))
-                    if not capture.is_alive and not stop_sent:
-                        raise AudioCaptureError("音频采集线程已停止。")
-
-                    if self._stop_event.is_set() and not stop_sent:
+                    if self._stop_event.is_set() and not stopping_capture:
                         capture.stop()
-                        stop_sent = True
-                        self._flush_audio_batch(connection, batcher)
-                        connection.send_control("stop")
+                        stopping_capture = True
+                    if not capture.is_alive and not stop_sent and not stopping_capture:
+                        raise AudioCaptureError("音频采集线程已停止。")
 
                     try:
                         item = frame_queue.get(timeout=0.1)
                     except queue.Empty:
-                        self._flush_audio_batch(connection, batcher)
+                        if stopping_capture and not capture.is_alive and not stop_sent:
+                            self._flush_audio_batch(connection, batcher)
+                            connection.send_control("stop")
+                            stop_sent = True
+                        elif not stop_sent:
+                            self._flush_audio_batch(connection, batcher)
                         self._drain_remote_events(done_event)
                         continue
-                    if isinstance(item, AudioFrame) and not stop_sent and not capture.is_paused:
+                    if isinstance(item, AudioFrame) and not capture.is_paused:
                         payload = batcher.push(item)
                         if payload:
                             connection.send_audio(payload)
+                    if (
+                        stopping_capture
+                        and not capture.is_alive
+                        and frame_queue.empty()
+                        and not stop_sent
+                    ):
+                        self._flush_audio_batch(connection, batcher)
+                        connection.send_control("stop")
+                        stop_sent = True
                     self._drain_remote_events(done_event)
                 self._flush_audio_batch(connection, batcher)
                 reader.join(timeout=max(self.config.remote.timeout_seconds, 10))
@@ -148,6 +162,7 @@ class RemoteLiveCoordinator:
             "source_label": device.name,
             "source_ref": str(device.index),
             "auto_refine_after_live": self.config.refine.auto_after_live,
+            "speaker_enabled": self.config.speaker.enabled,
         }
 
     def _reader_loop(
@@ -211,6 +226,9 @@ class RemoteLiveCoordinator:
             if event_type == "segment_final":
                 self._append_live_segment(payload)
                 continue
+            if event_type == "segment_partial":
+                self._append_live_segment(payload, emit_final_progress=False)
+                continue
             if event_type == "capture_finished":
                 self._emit(
                     "capture_finished",
@@ -219,6 +237,23 @@ class RemoteLiveCoordinator:
                 )
                 continue
             if event_type == "completed":
+                postprocess_task = payload.get("postprocess_task")
+                if isinstance(postprocess_task, dict):
+                    task_payload = dict(postprocess_task)
+                    upsert_remote_task_payload(
+                        self._remote_tasks_path(),
+                        task_payload,
+                        fallback_session_id=str(payload.get("session_id") or self.session_id or ""),
+                        fallback_label="后台整理",
+                    )
+                    self._emit(
+                        "postprocess_attached",
+                        "录音已结束，后台整理已转为远端任务。",
+                        session_id=self.session_id,
+                        task_id=str(task_payload.get("task_id") or "") or None,
+                    )
+                    done_event.set()
+                    continue
                 self._sync_remote_artifacts(self.client.get_session_artifacts(str(payload["session_id"])))
                 self._emit("done", "远端会话已完成。", session_id=self.session_id)
                 done_event.set()
@@ -255,12 +290,21 @@ class RemoteLiveCoordinator:
         self.workspace = ensure_remote_workspace(self.config, metadata)
         self.session_id = metadata.session_id
         self._live_entries = self.workspace.transcript_entries()
+        self._finalized_segment_ids = {entry.segment_id for entry in self._live_entries}
 
-    def _append_live_segment(self, payload: dict[str, Any]) -> None:
+    def _append_live_segment(
+        self,
+        payload: dict[str, Any],
+        *,
+        emit_final_progress: bool = True,
+    ) -> None:
         if self.workspace is None:
             return
         metadata = self.workspace.read_session()
         segment_id = str(payload["segment_id"])
+        is_partial = not emit_final_progress
+        if is_partial and segment_id in self._finalized_segment_ids:
+            return
         started_ms = int(payload["started_ms"])
         ended_ms = int(payload["ended_ms"])
         text = str(payload["text"])
@@ -281,7 +325,7 @@ class RemoteLiveCoordinator:
             text=text,
             speaker_label=speaker_label,
         )
-        self._live_entries.append(entry)
+        self._upsert_live_entry(entry)
         content = build_transcript_note(metadata, list(self._live_entries), status="live")
         self.workspace.write_transcript(content)
         try_sync_note(
@@ -291,7 +335,14 @@ class RemoteLiveCoordinator:
             self.workspace.session_logger(),
             f"原文片段 {segment_id}",
         )
-        self._emit("segment_transcribed", f"片段 {segment_id} 已转写", session_id=self.session_id)
+        if not is_partial:
+            self._finalized_segment_ids.add(segment_id)
+        if emit_final_progress:
+            self._emit(
+                "segment_transcribed",
+                f"片段 {segment_id} 已转写",
+                session_id=self.session_id,
+            )
 
     def _sync_remote_artifacts(self, payload: dict[str, Any]) -> None:
         metadata = metadata_from_dict(dict(payload["metadata"]))
@@ -300,11 +351,24 @@ class RemoteLiveCoordinator:
             self.config,
             metadata,
             entries,
+            transcript_content=_optional_text(payload.get("transcript_content")),
+            structured_content=_optional_text(payload.get("structured_content")),
             on_progress=self.on_progress,
         )
         self.workspace = SessionWorkspace.load(Path(local_metadata.session_dir))
         self.session_id = local_metadata.session_id
         self._live_entries = self.workspace.transcript_entries()
+        self._finalized_segment_ids = {entry.segment_id for entry in self._live_entries}
+
+    def _upsert_live_entry(self, entry: TranscriptEntry) -> None:
+        for index, current in enumerate(self._live_entries):
+            if current.segment_id != entry.segment_id:
+                continue
+            self._live_entries[index] = entry
+            break
+        else:
+            self._live_entries.append(entry)
+        self._live_entries.sort(key=lambda item: (item.started_ms, item.segment_id))
 
     def _emit_progress_payload(self, payload: dict[str, Any]) -> None:
         stage = str(payload.get("stage") or "progress")
@@ -329,6 +393,7 @@ class RemoteLiveCoordinator:
         current: int | None = None,
         total: int | None = None,
         error: str | None = None,
+        task_id: str | None = None,
     ) -> None:
         if self.on_progress is None:
             return
@@ -340,8 +405,12 @@ class RemoteLiveCoordinator:
                 current=current,
                 total=total,
                 error=error,
+                task_id=task_id,
             )
         )
+
+    def _remote_tasks_path(self) -> Path:
+        return (self.config.root_dir / ".live-note" / "remote_tasks.json").resolve()
 
     def _raise_if_error(self, error_queue: queue.Queue[BaseException]) -> None:
         try:
@@ -349,3 +418,9 @@ class RemoteLiveCoordinator:
         except queue.Empty:
             return
         raise RuntimeError(str(error)) from error
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
