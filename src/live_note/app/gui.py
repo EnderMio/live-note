@@ -1,20 +1,41 @@
 from __future__ import annotations
 
 import queue
-import sys
 import threading
 import tkinter as tk
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from tkinter import Tk, filedialog, messagebox, ttk
-from urllib.parse import urlparse
 
 from live_note.audio.capture import InputDevice
 from live_note.branding import brand_logo_png_path
 from live_note.utils import iso_now
 
 from .events import ProgressEvent
+from .gui_execution_target import (
+    build_execution_target_hint as _build_execution_target_hint,
+)
+from .gui_language import language_code_to_display as _language_code_to_display
+from .gui_language import normalize_language_value as _normalize_language_value
+from .gui_language import optional_language_override as _optional_language_override
+from .gui_layout import wrap_action_rows as _wrap_action_rows
+from .gui_queue_display import queue_target_text as _queue_target_text
+from .gui_queue_lifecycle import next_queued_record_to_start, run_queue_task_worker
+from .gui_remote import (
+    primary_remote_task as _primary_remote_task,
+)
+from .gui_remote import (
+    remote_task_requires_sync as _remote_task_requires_sync,
+)
+from .gui_remote import (
+    remote_task_status_text as _remote_task_status_text,
+)
+from .gui_scroll import bind_mousewheel_scrolling as _bind_mousewheel_scrolling
+from .gui_theme import GuiMetrics, GuiPalette
+from .gui_theme import apply_visual_theme as _apply_visual_theme
+from .gui_theme import default_gui_metrics as _default_gui_metrics
+from .gui_theme import default_gui_palette as _default_gui_palette
 from .live_control import LiveRecordingController, parse_auto_stop_seconds
 from .services import AppService, SessionSummary, SettingsDraft
 from .session_actions import (
@@ -25,7 +46,6 @@ from .session_actions import (
     can_merge_summaries,
     supports_refine,
 )
-from .task_errors import TaskCancelledError
 from .task_queue import QueuedTaskRecord, QueueLoadResult, TaskQueueStore
 from .task_queue_runtime import TaskQueueRuntime
 from .task_state import GuiTaskState
@@ -42,15 +62,6 @@ SESSION_LANGUAGE_CHOICES = [
     "韩文（ko）",
 ]
 DEFAULT_LANGUAGE_CHOICES = SESSION_LANGUAGE_CHOICES[1:]
-LANGUAGE_LABEL_TO_CODE = {
-    "沿用默认设置": "",
-    "自动识别 / 中英混合 / 多语言（auto）": "auto",
-    "中文（zh）": "zh",
-    "英文（en）": "en",
-    "日文（ja）": "ja",
-    "韩文（ko）": "ko",
-}
-LANGUAGE_CODE_TO_LABEL = {code: label for label, code in LANGUAGE_LABEL_TO_CODE.items() if code}
 PROGRESS_ANIMATION_INTERVAL_MS = 96
 POLL_ACTIVE_INTERVAL_MS = 120
 POLL_IDLE_INTERVAL_MS = 400
@@ -59,280 +70,12 @@ REMOTE_TASK_POLL_BACKGROUND_MS = 5000
 REMOTE_TASK_POLL_IDLE_MS = 15000
 
 
-@dataclass(frozen=True, slots=True)
-class GuiPalette:
-    app_bg: str
-    surface_bg: str
-    surface_alt_bg: str
-    field_bg: str
-    border: str
-    text_primary: str
-    text_secondary: str
-    text_tertiary: str
-    accent: str
-    accent_active: str
-    accent_text: str
-    selection_bg: str
-    progress_trough: str
-
-
-@dataclass(frozen=True, slots=True)
-class GuiMetrics:
-    header_padding: tuple[int, int]
-    page_padding: int
-    section_padding: int
-    section_gap: int
-    inline_gap: int
-    field_row_gap: int
-    log_height: int
-
-
 class _NoopScheduler:
     def after(self, _delay_ms: int, _callback: Callable[[], None]) -> str:
         return "noop"
 
     def after_cancel(self, _after_id: str) -> None:
         return None
-
-
-def _default_gui_palette() -> GuiPalette:
-    return GuiPalette(
-        app_bg="#EEF2F7",
-        surface_bg="#FBFCFE",
-        surface_alt_bg="#F4F7FB",
-        field_bg="#FFFFFF",
-        border="#D7DEE8",
-        text_primary="#1F2937",
-        text_secondary="#5B6677",
-        text_tertiary="#7B8797",
-        accent="#2563EB",
-        accent_active="#1D4ED8",
-        accent_text="#FFFFFF",
-        selection_bg="#E7EEF8",
-        progress_trough="#DCE6F2",
-    )
-
-
-def _default_gui_metrics() -> GuiMetrics:
-    return GuiMetrics(
-        header_padding=(20, 12),
-        page_padding=14,
-        section_padding=14,
-        section_gap=12,
-        inline_gap=8,
-        field_row_gap=8,
-        log_height=11,
-    )
-
-
-def _body_font(weight: str | None = None, size: int = 11) -> tuple[str, int] | tuple[str, int, str]:
-    family = "SF Pro Text" if sys.platform == "darwin" else "TkDefaultFont"
-    if weight:
-        return (family, size, weight)
-    return (family, size)
-
-
-def _apply_visual_theme(root: Tk) -> tuple[GuiPalette, GuiMetrics]:
-    palette = _default_gui_palette()
-    metrics = _default_gui_metrics()
-    style = ttk.Style(root)
-    style.theme_use("clam")
-    root.configure(bg=palette.app_bg)
-
-    style.configure("TFrame", background=palette.surface_bg)
-    style.configure("Header.TFrame", background=palette.app_bg)
-    style.configure("Toolbar.TFrame", background=palette.surface_bg)
-    style.configure("TLabel", background=palette.surface_bg, foreground=palette.text_primary)
-    style.configure(
-        "Header.TLabel",
-        background=palette.app_bg,
-        foreground=palette.text_secondary,
-        font=_body_font(size=11),
-    )
-    style.configure(
-        "BrandTitle.TLabel",
-        background=palette.app_bg,
-        foreground=palette.text_primary,
-        font=_body_font("bold", 20),
-    )
-    style.configure(
-        "Status.TLabel",
-        background=palette.app_bg,
-        foreground=palette.text_secondary,
-        font=_body_font("bold", 11),
-    )
-    style.configure(
-        "SectionTitle.TLabel",
-        background=palette.surface_bg,
-        foreground=palette.text_primary,
-        font=_body_font("bold", 11),
-    )
-    style.configure(
-        "Hint.TLabel",
-        background=palette.surface_bg,
-        foreground=palette.text_tertiary,
-        font=_body_font(size=10),
-    )
-    style.configure(
-        "Subtle.TLabel",
-        background=palette.surface_bg,
-        foreground=palette.text_secondary,
-        font=_body_font(size=11),
-    )
-
-    style.configure(
-        "App.TNotebook",
-        background=palette.app_bg,
-        borderwidth=0,
-        tabmargins=(0, 0, 0, 0),
-    )
-    style.configure(
-        "App.TNotebook.Tab",
-        background=palette.surface_alt_bg,
-        foreground=palette.text_secondary,
-        borderwidth=0,
-        padding=(14, 8),
-        font=_body_font(size=11),
-    )
-    style.map(
-        "App.TNotebook.Tab",
-        background=[
-            ("selected", palette.surface_bg),
-            ("active", palette.surface_bg),
-        ],
-        foreground=[
-            ("selected", palette.text_primary),
-            ("active", palette.text_primary),
-        ],
-    )
-
-    style.configure(
-        "Section.TLabelframe",
-        background=palette.surface_bg,
-        bordercolor=palette.border,
-        borderwidth=1,
-        relief="solid",
-    )
-    style.configure(
-        "Section.TLabelframe.Label",
-        background=palette.surface_bg,
-        foreground=palette.text_primary,
-        font=_body_font("bold", 11),
-    )
-
-    style.configure(
-        "TButton",
-        background=palette.surface_alt_bg,
-        foreground=palette.text_primary,
-        bordercolor=palette.border,
-        borderwidth=1,
-        focusthickness=0,
-        focuscolor=palette.surface_alt_bg,
-        padding=(12, 7),
-        font=_body_font(size=11),
-    )
-    style.map(
-        "TButton",
-        background=[("active", palette.field_bg), ("pressed", palette.field_bg)],
-        bordercolor=[("active", palette.border)],
-    )
-    style.configure(
-        "Primary.TButton",
-        background=palette.accent,
-        foreground=palette.accent_text,
-        bordercolor=palette.accent,
-        focuscolor=palette.accent,
-        padding=(14, 7),
-        font=_body_font("bold", 11),
-    )
-    style.map(
-        "Primary.TButton",
-        background=[("active", palette.accent_active), ("pressed", palette.accent_active)],
-        bordercolor=[("active", palette.accent_active)],
-    )
-
-    style.configure(
-        "TCheckbutton",
-        background=palette.surface_bg,
-        foreground=palette.text_primary,
-        font=_body_font(size=11),
-    )
-    style.map(
-        "TCheckbutton",
-        background=[("active", palette.surface_bg)],
-        foreground=[("disabled", palette.text_tertiary)],
-    )
-
-    style.configure(
-        "TEntry",
-        fieldbackground=palette.field_bg,
-        foreground=palette.text_primary,
-        bordercolor=palette.border,
-        lightcolor=palette.border,
-        darkcolor=palette.border,
-        insertcolor=palette.text_primary,
-        padding=(8, 6),
-    )
-    style.configure(
-        "TCombobox",
-        fieldbackground=palette.field_bg,
-        foreground=palette.text_primary,
-        bordercolor=palette.border,
-        lightcolor=palette.border,
-        darkcolor=palette.border,
-        padding=(8, 6),
-        arrowsize=14,
-    )
-    style.map(
-        "TCombobox",
-        fieldbackground=[("readonly", palette.field_bg)],
-        background=[("readonly", palette.field_bg)],
-        foreground=[("readonly", palette.text_primary)],
-        selectbackground=[("readonly", palette.selection_bg)],
-        selectforeground=[("readonly", palette.text_primary)],
-    )
-
-    style.configure(
-        "App.Treeview",
-        background=palette.field_bg,
-        fieldbackground=palette.field_bg,
-        foreground=palette.text_primary,
-        bordercolor=palette.border,
-        rowheight=28,
-        relief="solid",
-    )
-    style.map(
-        "App.Treeview",
-        background=[("selected", palette.selection_bg)],
-        foreground=[("selected", palette.text_primary)],
-    )
-    style.configure(
-        "App.Treeview.Heading",
-        background=palette.surface_alt_bg,
-        foreground=palette.text_secondary,
-        bordercolor=palette.border,
-        relief="flat",
-        padding=(8, 7),
-        font=_body_font("bold", 10),
-    )
-
-    style.configure(
-        "App.Horizontal.TProgressbar",
-        background=palette.accent,
-        troughcolor=palette.progress_trough,
-        borderwidth=0,
-        lightcolor=palette.accent,
-        darkcolor=palette.accent,
-    )
-    style.configure(
-        "App.Vertical.TScrollbar",
-        background=palette.surface_alt_bg,
-        troughcolor=palette.app_bg,
-        bordercolor=palette.app_bg,
-        arrowcolor=palette.text_secondary,
-    )
-
-    return palette, metrics
 
 
 def launch_gui(config_path: Path | None = None) -> int:
@@ -1535,15 +1278,13 @@ class LiveNoteGui:
 
     def _maybe_start_next_queue_task(self) -> None:
         service = getattr(self, "service", None)
-        if (
-            self.queue_worker is not None
-            or self.busy
-            or self.background_tasks
-            or (service is not None and not service.config_exists())
-        ):
-            self._update_idle_status()
-            return
-        next_record = self._queue_runtime().next_queued()
+        next_record = next_queued_record_to_start(
+            self._queue_runtime(),
+            queue_worker=self.queue_worker,
+            busy=self.busy,
+            background_tasks=self.background_tasks,
+            config_exists=service is None or service.config_exists(),
+        )
         if next_record is None:
             self._update_idle_status()
             return
@@ -1566,33 +1307,14 @@ class LiveNoteGui:
             self.status_var.set(f"{started_record.label}：准备中")
 
         def worker() -> None:
-            try:
-                result = self.service.run_queue_task(
-                    started_record,
-                    on_progress=self._progress_callback("queue", started_record.task_id),
-                    cancel_event=cancel_event,
-                )
-            except TaskCancelledError as exc:
-                self._remove_queue_record(started_record.task_id)
-                self.event_queue.put(
-                    (
-                        "task_cancelled",
-                        "queue",
-                        started_record.task_id,
-                        started_record.label,
-                        str(exc),
-                    )
-                )
-            except Exception as exc:
-                self._remove_queue_record(started_record.task_id)
-                self.event_queue.put(
-                    ("task_error", "queue", started_record.task_id, started_record.label, str(exc))
-                )
-            else:
-                self._remove_queue_record(started_record.task_id)
-                self.event_queue.put(
-                    ("task_done", "queue", started_record.task_id, started_record.label, result)
-                )
+            run_queue_task_worker(
+                self.service,
+                started_record,
+                on_progress=self._progress_callback("queue", started_record.task_id),
+                cancel_event=cancel_event,
+                remove_record=self._remove_queue_record,
+                event_queue=self.event_queue,
+            )
 
         self.queue_worker = threading.Thread(target=worker, daemon=False)
         self.queue_worker.start()
@@ -2919,113 +2641,8 @@ def _build_vertical_scroller(parent: ttk.Frame) -> ttk.Frame:
     return content
 
 
-def _bind_mousewheel_scrolling(root: tk.Misc, canvas: tk.Canvas) -> None:
-    def _blocks_outer_scroll(widget: tk.Misc) -> bool:
-        widget_name = str(getattr(widget, "widgetName", "")).lower()
-        if widget_name in {"canvas", "text", "listbox", "ttk::treeview"}:
-            return True
-        yview = getattr(widget, "yview", None)
-        return callable(yview)
-
-    def _is_descendant_of_canvas(widget: tk.Misc | None) -> bool:
-        current = widget
-        while current is not None:
-            if current is canvas:
-                return True
-            if _blocks_outer_scroll(current):
-                return False
-            current = getattr(current, "master", None)
-        return False
-
-    def _scroll(event: tk.Event[tk.Misc]) -> None:
-        try:
-            widget_under_pointer = canvas.winfo_containing(event.x_root, event.y_root)
-        except tk.TclError:
-            return
-        if not _is_descendant_of_canvas(widget_under_pointer):
-            return
-        if getattr(event, "num", None) == 4:
-            delta = -1
-        elif getattr(event, "num", None) == 5:
-            delta = 1
-        elif getattr(event, "delta", 0):
-            delta = -1 if event.delta > 0 else 1
-        else:
-            return
-        canvas.yview_scroll(delta, "units")
-
-    root.bind_all("<MouseWheel>", _scroll, add="+")
-    root.bind_all("<Button-4>", _scroll, add="+")
-    root.bind_all("<Button-5>", _scroll, add="+")
-
-
-def _wrap_action_rows(
-    available_width: int,
-    item_widths: list[int],
-    *,
-    gap: int,
-) -> list[tuple[int, int]]:
-    if not item_widths:
-        return []
-    width_limit = max(available_width, max(item_widths))
-    used_width = 0
-    row = 0
-    column = 0
-    layout: list[tuple[int, int]] = []
-    for item_width in item_widths:
-        proposed_width = item_width if column == 0 else used_width + gap + item_width
-        if column > 0 and proposed_width > width_limit:
-            row += 1
-            column = 0
-            used_width = item_width
-        else:
-            used_width = proposed_width
-        layout.append((row, column))
-        column += 1
-    return layout
-
-
 def _summary_supports_refine(summary: SessionSummary) -> bool:
     return supports_refine(summary)
-
-
-def _build_execution_target_hint(
-    remote_enabled: bool,
-    remote_base_url: str,
-    remote_health_status: str | None,
-) -> str:
-    if not remote_enabled:
-        return "当前转写：本机"
-    host = _display_remote_host(remote_base_url)
-    if remote_health_status == "OK":
-        return f"当前转写：远端服务（{host}，已连接）"
-    if remote_health_status == "FAIL":
-        return f"当前转写：远端服务（{host}，未连通）"
-    return f"当前转写：远端服务（{host}，待检测）"
-
-
-def _display_remote_host(base_url: str) -> str:
-    candidate = base_url.strip()
-    if not candidate:
-        return "未配置"
-    parsed = urlparse(candidate)
-    if parsed.hostname:
-        return parsed.hostname
-    return candidate.rstrip("/")
-
-
-def _queue_target_text(record: QueuedTaskRecord) -> str:
-    payload = record.payload
-    if record.action == "import":
-        return Path(str(payload.get("file_path", ""))).name or "本地文件"
-    if record.action == "merge":
-        session_ids = payload.get("session_ids", [])
-        if isinstance(session_ids, list):
-            return f"{len(session_ids)} 条会话"
-        return "多条会话"
-    if record.action == "session_action":
-        return str(payload.get("session_id") or "会话")
-    return record.label
 
 
 def _entry_row_with_button(
@@ -3112,75 +2729,3 @@ def _language_row(
         padx=(metrics.inline_gap, 0),
         pady=(metrics.field_row_gap, 0),
     )
-
-
-def _remote_task_status_text(record: object) -> str:
-    attachment_state = str(getattr(record, "attachment_state", "") or "").strip()
-    if attachment_state == "lost":
-        return "已丢失"
-    status = str(getattr(record, "status", "") or "").strip()
-    if status == "completed":
-        result_version = int(getattr(record, "result_version", 0) or 0)
-        last_synced = int(getattr(record, "last_synced_result_version", 0) or 0)
-        if result_version > last_synced:
-            return "同步失败" if getattr(record, "last_error", None) else "待同步"
-        return "已完成"
-    return {
-        "queued": "排队中",
-        "running": "运行中",
-        "cancelling": "取消中",
-        "failed": "失败",
-        "cancelled": "已取消",
-    }.get(status, status or "未知")
-
-
-def _primary_remote_task(records: list[object]) -> object | None:
-    for record in records:
-        if (
-            str(getattr(record, "status", "") or "").strip() in {"running", "cancelling"}
-            and str(getattr(record, "attachment_state", "") or "").strip() != "lost"
-        ):
-            return record
-    for record in records:
-        if (
-            str(getattr(record, "status", "") or "").strip() in {"queued", "running", "cancelling"}
-            and str(getattr(record, "attachment_state", "") or "").strip() != "lost"
-        ):
-            return record
-    for record in records:
-        if str(getattr(record, "attachment_state", "") or "").strip() != "lost":
-            return record
-    return records[0] if records else None
-
-
-def _remote_task_requires_sync(record: object | None) -> bool:
-    if record is None:
-        return False
-    if str(getattr(record, "status", "") or "").strip() != "completed":
-        return False
-    if str(getattr(record, "attachment_state", "") or "").strip() == "lost":
-        return False
-    if not getattr(record, "remote_task_id", None) or not getattr(record, "session_id", None):
-        return False
-    result_version = int(getattr(record, "result_version", 0) or 0)
-    last_synced = int(getattr(record, "last_synced_result_version", 0) or 0)
-    return result_version > last_synced or bool(getattr(record, "last_error", None))
-
-
-def _normalize_language_value(value: str, blank_fallback: str = "") -> str:
-    normalized = LANGUAGE_LABEL_TO_CODE.get(value.strip(), value.strip()).lower()
-    if not normalized:
-        return blank_fallback
-    return normalized
-
-
-def _optional_language_override(value: str) -> str | None:
-    normalized = _normalize_language_value(value)
-    return normalized or None
-
-
-def _language_code_to_display(code: str, allow_blank: bool) -> str:
-    normalized = code.strip().lower()
-    if not normalized:
-        return "沿用默认设置" if allow_blank else "自动识别 / 中英混合 / 多语言（auto）"
-    return LANGUAGE_CODE_TO_LABEL.get(normalized, normalized)

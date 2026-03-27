@@ -30,6 +30,42 @@ from live_note.app.task_queue import QueueLoadResult, build_task_record
 
 
 class GuiLanguageTests(unittest.TestCase):
+    def test_execution_target_helper_module_exports_same_hint_logic(self) -> None:
+        from live_note.app.gui_execution_target import build_execution_target_hint
+
+        self.assertEqual(
+            "当前转写：远端服务（172.21.0.159，已连接）",
+            build_execution_target_hint(True, "http://172.21.0.159:8765", "OK"),
+        )
+
+    def test_execution_target_helper_module_marks_unknown_remote_as_pending(self) -> None:
+        from live_note.app.gui_execution_target import build_execution_target_hint
+
+        self.assertEqual(
+            "当前转写：远端服务（172.21.0.159，待检测）",
+            build_execution_target_hint(True, "http://172.21.0.159:8765", None),
+        )
+
+    def test_execution_target_helper_module_normalizes_blank_host(self) -> None:
+        from live_note.app.gui_execution_target import display_remote_host
+
+        self.assertEqual("未配置", display_remote_host("   "))
+
+    def test_language_helper_module_normalizes_mixed_language_label(self) -> None:
+        from live_note.app.gui_language import normalize_language_value
+
+        self.assertEqual("auto", normalize_language_value("自动识别 / 中英混合 / 多语言（auto）"))
+
+    def test_language_helper_module_allows_default_override_to_none(self) -> None:
+        from live_note.app.gui_language import optional_language_override
+
+        self.assertIsNone(optional_language_override("沿用默认设置"))
+
+    def test_language_helper_module_maps_language_code_to_display(self) -> None:
+        from live_note.app.gui_language import language_code_to_display
+
+        self.assertEqual("中文（zh）", language_code_to_display("zh", allow_blank=False))
+
     def test_normalize_language_value_maps_mixed_language_label_to_auto(self) -> None:
         self.assertEqual("auto", _normalize_language_value("自动识别 / 中英混合 / 多语言（auto）"))
 
@@ -59,6 +95,35 @@ class GuiLanguageTests(unittest.TestCase):
 
 
 class GuiThemeTests(unittest.TestCase):
+    def test_theme_helper_module_exports_default_palette(self) -> None:
+        from live_note.app.gui_theme import default_gui_palette
+
+        palette = default_gui_palette()
+
+        self.assertEqual("#EEF2F7", palette.app_bg)
+        self.assertEqual("#2563EB", palette.accent)
+
+    def test_theme_helper_module_exports_default_metrics(self) -> None:
+        from live_note.app.gui_theme import default_gui_metrics
+
+        metrics = default_gui_metrics()
+
+        self.assertEqual((20, 12), metrics.header_padding)
+        self.assertEqual(12, metrics.section_gap)
+
+    def test_theme_helper_module_exports_apply_visual_theme(self) -> None:
+        from live_note.app.gui_theme import apply_visual_theme
+
+        root = MagicMock()
+        style = MagicMock()
+
+        with patch("live_note.app.gui_theme.ttk.Style", return_value=style):
+            apply_visual_theme(root)
+
+        root.configure.assert_called_once()
+        self.assertEqual("#EEF2F7", root.configure.call_args.kwargs["bg"])
+        style.theme_use.assert_called_once_with("clam")
+
     def test_default_gui_palette_is_light_and_neutral(self) -> None:
         palette = _default_gui_palette()
 
@@ -90,6 +155,36 @@ class GuiThemeTests(unittest.TestCase):
         self.assertIn("App.TNotebook.Tab", configured_styles)
         self.assertIn("Section.TLabelframe", configured_styles)
         self.assertIn("App.Treeview", configured_styles)
+
+    def test_scroll_helper_module_blocks_outer_canvas_when_inner_matches(self) -> None:
+        from live_note.app.gui_scroll import bind_mousewheel_scrolling
+
+        root = MagicMock()
+        outer_canvas = MagicMock()
+        inner_canvas = MagicMock()
+        outer_canvas.widgetName = "canvas"
+        inner_canvas.widgetName = "canvas"
+        outer_content = SimpleNamespace(master=outer_canvas)
+        inner_content = SimpleNamespace(master=inner_canvas)
+        inner_canvas.master = outer_content
+
+        outer_canvas.winfo_containing.return_value = inner_content
+        inner_canvas.winfo_containing.return_value = inner_content
+
+        bind_mousewheel_scrolling(root, outer_canvas)
+        bind_mousewheel_scrolling(root, inner_canvas)
+
+        handlers = [
+            call.args[1] for call in root.bind_all.call_args_list if call.args[0] == "<MouseWheel>"
+        ]
+        self.assertEqual(2, len(handlers))
+
+        event = SimpleNamespace(x_root=120, y_root=80, delta=-120, num=None)
+        for handler in handlers:
+            handler(event)
+
+        inner_canvas.yview_scroll.assert_called_once_with(1, "units")
+        outer_canvas.yview_scroll.assert_not_called()
 
     def test_bind_mousewheel_scrolling_does_not_scroll_outer_canvas_when_inner_matches(
         self,
@@ -144,8 +239,76 @@ class GuiThemeTests(unittest.TestCase):
 
         outer_canvas.yview_scroll.assert_not_called()
 
+    def test_bind_mousewheel_scrolling_ignores_unresolvable_popup_widget(self) -> None:
+        root = MagicMock()
+        outer_canvas = MagicMock()
+        outer_canvas.widgetName = "canvas"
+        outer_canvas.winfo_containing.side_effect = KeyError("popdown")
+
+        _bind_mousewheel_scrolling(root, outer_canvas)
+
+        handlers = [
+            call.args[1] for call in root.bind_all.call_args_list if call.args[0] == "<MouseWheel>"
+        ]
+        self.assertEqual(1, len(handlers))
+
+        event = SimpleNamespace(x_root=120, y_root=80, delta=-120, num=None)
+
+        try:
+            handlers[0](event)
+        except KeyError as exc:
+            self.fail(f"mousewheel handler leaked popup lookup failure: {exc!r}")
+
+        outer_canvas.yview_scroll.assert_not_called()
+
 
 class GuiRemoteTaskTests(unittest.TestCase):
+    def test_remote_helper_module_exports_primary_task_logic(self) -> None:
+        from live_note.app.gui_remote import primary_remote_task
+
+        running = SimpleNamespace(
+            status="running",
+            attachment_state="attached",
+            message="正在转写片段 4/10",
+            updated_at="2026-03-23T15:00:00+08:00",
+        )
+        queued = SimpleNamespace(
+            status="queued",
+            attachment_state="attached",
+            message="已加入远端队列。",
+            updated_at="2026-03-23T15:01:00+08:00",
+        )
+
+        self.assertIs(running, primary_remote_task([queued, running]))
+
+    def test_remote_helper_module_exports_status_text_logic(self) -> None:
+        from live_note.app.gui_remote import remote_task_status_text
+
+        record = SimpleNamespace(
+            status="completed",
+            attachment_state="attached",
+            result_version=4,
+            last_synced_result_version=1,
+            last_error=None,
+        )
+
+        self.assertEqual("待同步", remote_task_status_text(record))
+
+    def test_remote_helper_module_exports_requires_sync_logic(self) -> None:
+        from live_note.app.gui_remote import remote_task_requires_sync
+
+        record = SimpleNamespace(
+            remote_task_id="task-1",
+            session_id="session-1",
+            status="completed",
+            attachment_state="attached",
+            result_version=4,
+            last_synced_result_version=4,
+            last_error="同步失败",
+        )
+
+        self.assertTrue(remote_task_requires_sync(record))
+
     def test_primary_remote_task_prefers_running_over_newer_queued_item(self) -> None:
         running = SimpleNamespace(
             status="running",
@@ -163,6 +326,67 @@ class GuiRemoteTaskTests(unittest.TestCase):
         primary = _primary_remote_task([queued, running])
 
         self.assertIs(primary, running)
+
+
+class GuiQueueLifecycleHelperTests(unittest.TestCase):
+    def test_queue_lifecycle_helper_returns_next_record_when_gui_is_idle(self) -> None:
+        from live_note.app.gui_queue_lifecycle import next_queued_record_to_start
+
+        record = build_task_record(
+            task_id="task-0001",
+            action="session_action",
+            label="重转写并重写",
+            payload={"action": "retranscribe", "session_id": "session-1"},
+            created_at="2026-03-24T00:00:00+00:00",
+        )
+        runtime = SimpleNamespace(next_queued=Mock(return_value=record))
+
+        result = next_queued_record_to_start(
+            runtime,
+            queue_worker=None,
+            busy=False,
+            background_tasks={},
+            config_exists=True,
+        )
+
+        self.assertIs(record, result)
+        runtime.next_queued.assert_called_once_with()
+
+    def test_queue_lifecycle_helper_posts_done_event_on_success(self) -> None:
+        from live_note.app.gui_queue_lifecycle import run_queue_task_worker
+
+        record = build_task_record(
+            task_id="task-0001",
+            action="session_action",
+            label="重转写并重写",
+            payload={"action": "retranscribe", "session_id": "session-1"},
+            created_at="2026-03-24T00:00:00+00:00",
+        )
+        service = SimpleNamespace(run_queue_task=Mock(return_value=0))
+        remove_record = Mock()
+        event_queue = queue.Queue()
+        cancel_event = threading.Event()
+        on_progress = Mock()
+
+        run_queue_task_worker(
+            service,
+            record,
+            on_progress=on_progress,
+            cancel_event=cancel_event,
+            remove_record=remove_record,
+            event_queue=event_queue,
+        )
+
+        service.run_queue_task.assert_called_once_with(
+            record,
+            on_progress=on_progress,
+            cancel_event=cancel_event,
+        )
+        remove_record.assert_called_once_with(record.task_id)
+        self.assertEqual(
+            ("task_done", "queue", record.task_id, record.label, 0),
+            event_queue.get_nowait(),
+        )
 
 
 class GuiHistoryTests(unittest.TestCase):
@@ -1290,10 +1514,32 @@ class GuiTaskTests(unittest.TestCase):
 
 
 class GuiLayoutTests(unittest.TestCase):
+    def test_layout_helper_module_wraps_action_rows_when_width_is_tight(self) -> None:
+        from live_note.app.gui_layout import wrap_action_rows
+
+        layout = wrap_action_rows(available_width=280, item_widths=[100, 100, 100], gap=8)
+
+        self.assertEqual([(0, 0), (0, 1), (1, 0)], layout)
+
     def test_wrap_action_rows_moves_items_to_new_row_when_width_is_tight(self) -> None:
         layout = _wrap_action_rows(available_width=280, item_widths=[100, 100, 100], gap=8)
 
         self.assertEqual([(0, 0), (0, 1), (1, 0)], layout)
+
+
+class GuiQueueDisplayTests(unittest.TestCase):
+    def test_queue_display_helper_module_formats_import_target_text(self) -> None:
+        from live_note.app.gui_queue_display import queue_target_text
+
+        record = build_task_record(
+            task_id="task-0001",
+            action="import",
+            label="导入文件",
+            payload={"file_path": "~/Recordings/demo.mp3", "kind": "generic"},
+            created_at="2026-03-24T00:00:00+00:00",
+        )
+
+        self.assertEqual("demo.mp3", queue_target_text(record))
 
     def test_build_vertical_scroller_wraps_content_with_canvas_and_scrollbar(self) -> None:
         parent = MagicMock()
