@@ -9,77 +9,62 @@ from live_note.app.cli import build_parser, main
 
 
 class CliTests(unittest.TestCase):
-    def test_import_command_dispatches_to_file_import_coordinator(self) -> None:
-        runner = Mock()
-        runner.run.return_value = 0
+    def test_import_command_dispatches_via_app_service(self) -> None:
+        service = Mock()
+        service.import_audio_file.return_value = 0
 
-        with patch("live_note.app.cli.load_config", return_value=object()) as load_config_mock:
-            with patch("live_note.app.cli.FileImportCoordinator", return_value=runner) as factory:
-                exit_code = main(["import", "--file", "/tmp/demo.mp4", "--kind", "meeting"])
+        with patch("live_note.app.cli.AppService", return_value=service) as service_factory:
+            exit_code = main(["import", "--file", "/tmp/demo.mp4", "--kind", "meeting"])
 
         self.assertEqual(0, exit_code)
-        load_config_mock.assert_called_once()
-        factory.assert_called_once_with(
-            config=load_config_mock.return_value,
+        service_factory.assert_called_once_with(Path("config.toml"))
+        service.import_audio_file.assert_called_once_with(
             file_path="/tmp/demo.mp4",
             title=None,
             kind="meeting",
             language=None,
         )
-        runner.run.assert_called_once()
 
-    def test_import_command_uses_remote_import_coordinator_when_remote_enabled(self) -> None:
-        runner = Mock()
-        runner.run.return_value = 0
-        config = SimpleNamespace(remote=SimpleNamespace(enabled=True))
+    def test_devices_command_dispatches_via_app_service(self) -> None:
+        service = Mock()
+        service.list_input_devices.return_value = [
+            SimpleNamespace(index=1, name="Mic", max_input_channels=2, default_samplerate=48000.0)
+        ]
 
-        with patch("live_note.app.cli.load_config", return_value=config) as load_config_mock:
-            with patch("live_note.app.cli.FileImportCoordinator") as local_factory:
-                with patch(
-                    "live_note.app.cli.RemoteImportCoordinator",
-                    return_value=runner,
-                ) as factory:
-                    exit_code = main(["import", "--file", "/tmp/demo.mp3", "--kind", "meeting"])
+        with patch("live_note.app.cli.AppService", return_value=service) as service_factory:
+            with patch("builtins.print") as print_mock:
+                exit_code = main(["devices"])
 
         self.assertEqual(0, exit_code)
-        load_config_mock.assert_called_once()
-        local_factory.assert_not_called()
-        factory.assert_called_once_with(
-            config=config,
-            file_path="/tmp/demo.mp3",
-            title=None,
-            kind="meeting",
-            language=None,
-        )
-        runner.run.assert_called_once()
+        service_factory.assert_called_once_with(Path("config.toml"))
+        service.list_input_devices.assert_called_once_with()
+        print_mock.assert_called_once_with("  1  Mic  inputs=2  rate=48000")
 
-    def test_start_command_accepts_legacy_course_argument(self) -> None:
-        runner = Mock()
-        runner.run.return_value = 0
+    def test_start_command_dispatches_via_app_service(self) -> None:
+        service = Mock()
+        service.start_live_session.return_value = 0
 
-        with patch("live_note.app.cli.load_config", return_value=object()) as load_config_mock:
-            with patch("live_note.app.cli.SessionCoordinator", return_value=runner) as factory:
-                exit_code = main(
-                    [
-                        "start",
-                        "--course",
-                        "离散数学",
-                        "--source",
-                        "2",
-                        "--profile",
-                        "online",
-                    ]
-                )
+        with patch("live_note.app.cli.AppService", return_value=service) as service_factory:
+            exit_code = main(
+                [
+                    "start",
+                    "--course",
+                    "离散数学",
+                    "--source",
+                    "2",
+                    "--profile",
+                    "online",
+                ]
+            )
 
         self.assertEqual(0, exit_code)
-        factory.assert_called_once_with(
-            config=load_config_mock.return_value,
+        service_factory.assert_called_once_with(Path("config.toml"))
+        service.start_live_session.assert_called_once_with(
             title="离散数学",
             source="2",
             kind="lecture",
             language=None,
         )
-        runner.run.assert_called_once()
 
     def test_gui_command_dispatches_to_launcher(self) -> None:
         with patch("live_note.app.cli.launch_gui", return_value=0) as launch_gui_mock:
@@ -141,53 +126,59 @@ class CliTests(unittest.TestCase):
         self.assertTrue(args.skip_deps)
         self.assertTrue(args.dry_run)
 
-    def test_retranscribe_command_dispatches_to_coordinator(self) -> None:
-        with patch(
-            "live_note.app.cli.load_config", return_value=object()
-        ) as load_config_mock:
-            with patch(
-                "live_note.app.cli.retranscribe_session", return_value=0
-            ) as retranscribe_mock:
-                exit_code = main(["retranscribe", "--session", "20260315-210500-demo"])
+    def test_finalize_command_dispatches_via_app_service(self) -> None:
+        service = Mock()
+        service.finalize.return_value = 0
+
+        with patch("live_note.app.cli.AppService", return_value=service) as service_factory:
+            exit_code = main(["finalize", "--session", "20260315-210500-demo"])
 
         self.assertEqual(0, exit_code)
-        load_config_mock.assert_called_once()
-        retranscribe_mock.assert_called_once_with(
-            load_config_mock.return_value,
-            "20260315-210500-demo",
-        )
+        service_factory.assert_called_once_with(Path("config.toml"))
+        service.finalize.assert_called_once_with("20260315-210500-demo")
 
-    def test_refine_command_dispatches_to_coordinator(self) -> None:
-        with patch("live_note.app.cli.load_config", return_value=object()) as load_config_mock:
-            with patch("live_note.app.cli.refine_session", return_value=0) as refine_mock:
-                exit_code = main(["refine", "--session", "20260315-210500-demo"])
+    def test_retranscribe_command_dispatches_via_app_service(self) -> None:
+        service = Mock()
+        service.retranscribe.return_value = 0
 
-        self.assertEqual(0, exit_code)
-        load_config_mock.assert_called_once()
-        refine_mock.assert_called_once_with(
-            load_config_mock.return_value,
-            "20260315-210500-demo",
-        )
-
-    def test_merge_command_dispatches_to_coordinator(self) -> None:
-        with patch("live_note.app.cli.load_config", return_value=object()) as load_config_mock:
-            with patch("live_note.app.cli.merge_sessions", return_value=0) as merge_mock:
-                exit_code = main(
-                    [
-                        "merge",
-                        "--session",
-                        "20260315-210500-part1",
-                        "--session",
-                        "20260315-223000-part2",
-                        "--title",
-                        "产品周会（合并）",
-                    ]
-                )
+        with patch("live_note.app.cli.AppService", return_value=service) as service_factory:
+            exit_code = main(["retranscribe", "--session", "20260315-210500-demo"])
 
         self.assertEqual(0, exit_code)
-        load_config_mock.assert_called_once()
-        merge_mock.assert_called_once_with(
-            load_config_mock.return_value,
+        service_factory.assert_called_once_with(Path("config.toml"))
+        service.retranscribe.assert_called_once_with("20260315-210500-demo")
+
+    def test_refine_command_dispatches_via_app_service(self) -> None:
+        service = Mock()
+        service.refine.return_value = 0
+
+        with patch("live_note.app.cli.AppService", return_value=service) as service_factory:
+            exit_code = main(["refine", "--session", "20260315-210500-demo"])
+
+        self.assertEqual(0, exit_code)
+        service_factory.assert_called_once_with(Path("config.toml"))
+        service.refine.assert_called_once_with("20260315-210500-demo")
+
+    def test_merge_command_dispatches_via_app_service(self) -> None:
+        service = Mock()
+        service.merge.return_value = 0
+
+        with patch("live_note.app.cli.AppService", return_value=service) as service_factory:
+            exit_code = main(
+                [
+                    "merge",
+                    "--session",
+                    "20260315-210500-part1",
+                    "--session",
+                    "20260315-223000-part2",
+                    "--title",
+                    "产品周会（合并）",
+                ]
+            )
+
+        self.assertEqual(0, exit_code)
+        service_factory.assert_called_once_with(Path("config.toml"))
+        service.merge.assert_called_once_with(
             ["20260315-210500-part1", "20260315-223000-part2"],
             title="产品周会（合并）",
         )

@@ -226,6 +226,36 @@ class AppService:
             speaker_enabled=speaker_enabled,
         )
 
+    def start_live_session(
+        self,
+        *,
+        title: str,
+        source: str,
+        kind: str,
+        language: str | None = None,
+    ) -> int:
+        return self.create_live_coordinator(
+            title=title,
+            source=source,
+            kind=kind,
+            language=language,
+        ).run()
+
+    def import_audio_file(
+        self,
+        *,
+        file_path: str,
+        title: str | None,
+        kind: str,
+        language: str | None = None,
+    ) -> int:
+        return self.create_import_coordinator(
+            file_path=file_path,
+            title=title,
+            kind=kind,
+            language=language,
+        ).run()
+
     def finalize(
         self,
         session_id: str,

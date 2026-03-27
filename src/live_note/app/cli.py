@@ -4,19 +4,8 @@ import argparse
 import sys
 from pathlib import Path
 
-from live_note.app.coordinator import (
-    FileImportCoordinator,
-    SessionCoordinator,
-    finalize_session,
-    merge_sessions,
-    refine_session,
-    retranscribe_session,
-)
-from live_note.app.remote_coordinator import RemoteLiveCoordinator
-from live_note.app.remote_import import RemoteImportCoordinator
 from live_note.app.services import AppService
-from live_note.audio.capture import AudioCaptureError, list_input_devices
-from live_note.config import load_config
+from live_note.audio.capture import AudioCaptureError
 
 KIND_CHOICES = ["generic", "meeting", "lecture"]
 
@@ -155,69 +144,52 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    config_path = Path(args.config)
+    service = AppService(config_path)
+
     if args.command == "devices":
-        return command_devices()
+        return command_devices(service)
     if args.command == "gui":
-        return launch_gui(Path(args.config))
+        return launch_gui(config_path)
     if args.command == "serve":
-        return launch_remote_server(Path(args.config))
+        return launch_remote_server(config_path)
     if args.command == "remote-deploy":
         return launch_remote_deploy(args)
     if args.command == "doctor":
-        return command_doctor(Path(args.config))
-
-    try:
-        config = load_config(Path(args.config))
-    except Exception as exc:
-        print(exc, file=sys.stderr)
-        return 1
+        return command_doctor(service)
 
     if args.command == "start":
         title = args.title or args.course_legacy
         if not title:
             print("start 命令需要提供 --title", file=sys.stderr)
             return 1
-        coordinator_cls = (
-            RemoteLiveCoordinator
-            if getattr(getattr(config, "remote", None), "enabled", False)
-            else SessionCoordinator
-        )
-        runner = coordinator_cls(
-            config=config,
+        return service.start_live_session(
             title=title,
             source=args.source,
             kind=_resolve_kind(args.kind, args.profile_legacy),
             language=args.lang,
         )
-        return runner.run()
     if args.command == "import":
-        coordinator_cls = (
-            RemoteImportCoordinator
-            if getattr(getattr(config, "remote", None), "enabled", False)
-            else FileImportCoordinator
-        )
-        runner = coordinator_cls(
-            config=config,
+        return service.import_audio_file(
             file_path=args.file,
             title=args.title,
             kind=args.kind,
             language=args.lang,
         )
-        return runner.run()
     if args.command == "finalize":
-        return finalize_session(config, args.session)
+        return service.finalize(args.session)
     if args.command == "retranscribe":
-        return retranscribe_session(config, args.session)
+        return service.retranscribe(args.session)
     if args.command == "refine":
-        return refine_session(config, args.session)
+        return service.refine(args.session)
     if args.command == "merge":
-        return merge_sessions(config, args.session, title=args.title)
+        return service.merge(args.session, title=args.title)
     return 1
 
 
-def command_devices() -> int:
+def command_devices(service: AppService) -> int:
     try:
-        devices = list_input_devices()
+        devices = service.list_input_devices()
     except AudioCaptureError as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -234,8 +206,8 @@ def command_devices() -> int:
     return 0
 
 
-def command_doctor(config_path: Path) -> int:
-    checks = AppService(config_path).doctor_checks()
+def command_doctor(service: AppService) -> int:
+    checks = service.doctor_checks()
     failed = False
     for check in checks:
         print(f"[{check.status}] {check.name}: {check.detail}")

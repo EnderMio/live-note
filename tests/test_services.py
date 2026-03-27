@@ -223,6 +223,50 @@ class AppServiceTests(unittest.TestCase):
             speaker_enabled=None,
         )
 
+    def test_start_live_session_runs_created_coordinator(self) -> None:
+        service = AppService(Path("/tmp/config.toml"))
+        runner = Mock()
+        runner.run.return_value = 3
+
+        with patch.object(service, "create_live_coordinator", return_value=runner) as factory:
+            result = service.start_live_session(
+                title="产品周会",
+                source="1",
+                kind="meeting",
+                language="zh",
+            )
+
+        self.assertEqual(3, result)
+        factory.assert_called_once_with(
+            title="产品周会",
+            source="1",
+            kind="meeting",
+            language="zh",
+        )
+        runner.run.assert_called_once_with()
+
+    def test_import_audio_file_runs_created_coordinator(self) -> None:
+        service = AppService(Path("/tmp/config.toml"))
+        runner = Mock()
+        runner.run.return_value = 4
+
+        with patch.object(service, "create_import_coordinator", return_value=runner) as factory:
+            result = service.import_audio_file(
+                file_path="/tmp/demo.mp3",
+                title="远端导入",
+                kind="meeting",
+                language="zh",
+            )
+
+        self.assertEqual(4, result)
+        factory.assert_called_once_with(
+            file_path="/tmp/demo.mp3",
+            title="远端导入",
+            kind="meeting",
+            language="zh",
+        )
+        runner.run.assert_called_once_with()
+
     def test_refine_delegates_to_session_action_service(self) -> None:
         service = AppService(Path("/tmp/config.toml"))
 
