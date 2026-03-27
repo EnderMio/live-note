@@ -155,9 +155,17 @@ class AudioCaptureService:
             )
             next_started_ms = frame.ended_ms
             try:
-                self.frame_queue.put(frame, timeout=0.5)
+                self.frame_queue.put_nowait(frame)
             except queue.Full:
                 self._error = AudioCaptureError("音频帧队列已满，处理速度跟不上采集速度。")
+                self._stop_event.set()
+                callback_abort = getattr(sd, "CallbackAbort", None)
+                if callback_abort is not None:
+                    raise callback_abort()
+                callback_stop = getattr(sd, "CallbackStop", None)
+                if callback_stop is not None:
+                    raise callback_stop()
+                return
             if self._stop_event.is_set():
                 raise sd.CallbackStop()
 
@@ -173,4 +181,5 @@ class AudioCaptureService:
                 while not self._stop_event.is_set():
                     time.sleep(0.1)
         except Exception as exc:  # pragma: no cover - 真实设备异常不稳定
-            self._error = exc
+            if self._error is None:
+                self._error = exc
