@@ -34,7 +34,11 @@ from live_note.domain import (
 from live_note.llm import OpenAiCompatibleClient
 from live_note.obsidian.client import ObsidianClient
 from live_note.obsidian.renderer import build_transcript_note
-from live_note.transcribe.text import build_transcription_prompt, normalize_transcript_text
+from live_note.transcribe.text import (
+    build_transcription_prompt,
+    normalize_transcript_text,
+    should_admit_transcript_prompt,
+)
 from live_note.transcribe.whisper import (
     WhisperError,
     WhisperInferenceClient,
@@ -58,6 +62,9 @@ FRAME_PAUSE = object()
 FRAME_RESUME = object()
 SEGMENT_STOP = object()
 SEGMENT_CONTEXT_RESET = object()
+
+SPLIT_FALLBACK_SECONDS = 15
+SPLIT_FALLBACK_ERROR = "疑似字幕/幻觉，自动恢复失败"
 
 
 def apply_speaker_labels(*args, **kwargs):
@@ -667,6 +674,7 @@ class FileImportCoordinator:
                             entries=self.entries,
                             live_status="importing",
                             sample_rate=self.config.audio.sample_rate,
+                            guard_prompt_admission=True,
                         )
                         if not success:
                             _emit_progress(
@@ -1504,17 +1512,32 @@ def _process_segment(
     live_status: str,
     context_entries: list[TranscriptEntry] | None = None,
     sample_rate: int | None = None,
+    guard_prompt_admission: bool = False,
 ) -> bool:
     try:
         prompt_entries = context_entries if context_entries is not None else entries
-        text = _transcribe_segment_text(
-            whisper_client=whisper_client,
-            wav_path=pending.wav_path,
-            language=metadata.language,
-            entries=prompt_entries,
-            pcm16=pending.pcm16,
-            sample_rate=sample_rate,
-        )
+        if guard_prompt_admission:
+            prompt_entries = _admitted_prompt_entries(prompt_entries)
+        if guard_prompt_admission:
+            text = _transcribe_with_suspicious_recovery_ladder(
+                pending=pending,
+                whisper_client=whisper_client,
+                language=metadata.language,
+                entries=entries,
+                prompt_entries=prompt_entries,
+                pcm16=pending.pcm16,
+                sample_rate=sample_rate,
+            )
+        else:
+            text = _transcribe_segment_text(
+                whisper_client=whisper_client,
+                wav_path=pending.wav_path,
+                language=metadata.language,
+                entries=entries,
+                prompt_entries=prompt_entries,
+                pcm16=pending.pcm16,
+                sample_rate=sample_rate,
+            )
         if not text:
             raise WhisperError("whisper-server 返回空转写结果。")
         workspace.record_segment_text(
@@ -1553,6 +1576,86 @@ def _process_segment(
         return False
 
 
+def _should_run_single_split_fallback(pending: PendingSegment) -> bool:
+    return (pending.ended_ms - pending.started_ms) > SPLIT_FALLBACK_SECONDS * 1000
+
+
+def _transcribe_with_suspicious_recovery_ladder(
+    *,
+    pending: PendingSegment,
+    whisper_client: WhisperInferenceClient,
+    language: str,
+    entries: list[TranscriptEntry],
+    prompt_entries: list[TranscriptEntry],
+    pcm16: bytes | None = None,
+    sample_rate: int | None = None,
+) -> str:
+    text = _transcribe_segment_text(
+        whisper_client=whisper_client,
+        wav_path=pending.wav_path,
+        language=language,
+        entries=entries,
+        prompt_entries=prompt_entries,
+        pcm16=pcm16,
+        sample_rate=sample_rate,
+    )
+    if not text or should_admit_transcript_prompt(text):
+        return text
+
+    retry_text = _transcribe_segment_text(
+        whisper_client=whisper_client,
+        wav_path=pending.wav_path,
+        language=language,
+        entries=entries,
+        prompt_entries=prompt_entries,
+        pcm16=pcm16,
+        sample_rate=sample_rate,
+        disable_prompt=True,
+    )
+    if retry_text and should_admit_transcript_prompt(retry_text):
+        return retry_text
+    if _should_run_single_split_fallback(pending):
+        return _transcribe_with_single_split_fallback(
+            pending=pending,
+            whisper_client=whisper_client,
+            language=language,
+            entries=entries,
+        )
+    raise WhisperError(SPLIT_FALLBACK_ERROR)
+
+
+def _transcribe_with_single_split_fallback(
+    *,
+    pending: PendingSegment,
+    whisper_client: WhisperInferenceClient,
+    language: str,
+    entries: list[TranscriptEntry],
+) -> str:
+    child_output_dir = pending.wav_path.parent / f"{pending.segment_id}-split-fallback"
+    child_chunks = split_wav_file(
+        input_path=pending.wav_path,
+        output_dir=child_output_dir,
+        chunk_seconds=SPLIT_FALLBACK_SECONDS,
+    )
+
+    accepted_children: list[tuple[int, int, str]] = []
+    for child in sorted(child_chunks, key=lambda chunk: (chunk.started_ms, chunk.ended_ms)):
+        child_text = _transcribe_segment_text(
+            whisper_client=whisper_client,
+            wav_path=child.wav_path,
+            language=language,
+            entries=entries,
+            disable_prompt=True,
+        )
+        if child_text and should_admit_transcript_prompt(child_text):
+            accepted_children.append((child.started_ms, child.ended_ms, child_text))
+
+    if not accepted_children:
+        raise WhisperError(SPLIT_FALLBACK_ERROR)
+
+    return " ".join(text for _, _, text in accepted_children)
+
+
 def _recover_session_segments(
     workspace: SessionWorkspace,
     metadata: SessionMetadata,
@@ -1581,11 +1684,19 @@ def _recover_session_segments(
                     current=index,
                     total=len(states),
                 )
-                text = _transcribe_segment_text(
-                    whisper_client=whisper_client,
+                pending = PendingSegment(
+                    segment_id=state.segment_id,
+                    started_ms=state.started_ms,
+                    ended_ms=state.ended_ms,
+                    pcm16=None,
                     wav_path=state.wav_path,
+                )
+                text = _transcribe_with_suspicious_recovery_ladder(
+                    pending=pending,
+                    whisper_client=whisper_client,
                     language=metadata.language,
                     entries=entries,
+                    prompt_entries=_admitted_prompt_entries(entries),
                 )
                 if not text:
                     raise WhisperError(f"{verb}结果为空。")
@@ -1628,10 +1739,15 @@ def _transcribe_segment_text(
     language: str,
     entries: list[TranscriptEntry],
     *,
+    prompt_entries: list[TranscriptEntry] | None = None,
     pcm16: bytes | None = None,
     sample_rate: int | None = None,
+    disable_prompt: bool = False,
 ) -> str:
-    prompt = build_transcription_prompt(language, entries)
+    prompt = None
+    if not disable_prompt:
+        prompt_source = entries if prompt_entries is None else prompt_entries
+        prompt = build_transcription_prompt(language, prompt_source)
     raw_text = whisper_client.transcribe(wav_path, prompt=prompt)
     if not raw_text.strip():
         return ""
@@ -1647,6 +1763,10 @@ def _transcribe_segment_text(
         pcm16=resolved_pcm16,
         sample_rate=resolved_sample_rate,
     )
+
+
+def _admitted_prompt_entries(entries: list[TranscriptEntry]) -> list[TranscriptEntry]:
+    return [entry for entry in entries if should_admit_transcript_prompt(entry.text)]
 
 
 def _read_wav_pcm16(path: Path) -> tuple[bytes, int]:

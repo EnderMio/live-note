@@ -56,6 +56,11 @@ _SUSPICIOUS_OUTRO_PHRASES = (
     "谢谢大家",
     "感谢大家",
 )
+_SUSPICIOUS_SUBTITLE_MARKERS = (
+    "captioncube",
+    "中文字幕",
+    "字幕",
+)
 _PUNCTUATION_PATTERN = re.compile(r"[，。！？!?,.、：:；;“”\"'`·\s]+")
 _REPEATED_SPAN_PATTERN = re.compile(r"(.{1,8})\1{2,}")
 
@@ -87,6 +92,30 @@ def normalize_transcript_text(
     if pcm16 and sample_rate and _should_drop_silence_hallucination(normalized, pcm16, sample_rate):
         return ""
     return normalized
+
+
+def is_suspicious_transcript_text(text: str) -> bool:
+    normalized = " ".join(part.strip() for part in text.splitlines() if part.strip())
+    if not normalized:
+        return False
+
+    cleaned = _normalize_phrase(normalized)
+    if not cleaned:
+        return True
+    if "captioncube" in cleaned:
+        return True
+    if _looks_like_repetitive_hallucination(cleaned) and any(
+        marker in cleaned for marker in _SUSPICIOUS_SUBTITLE_MARKERS
+    ):
+        return True
+    return False
+
+
+def should_admit_transcript_prompt(text: str) -> bool:
+    normalized = " ".join(part.strip() for part in text.splitlines() if part.strip())
+    if not normalized:
+        return False
+    return not is_suspicious_transcript_text(normalized)
 
 
 def _build_context(entries: Sequence[TranscriptEntry]) -> str:
