@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import threading
 import time
@@ -109,6 +110,47 @@ class _FakeRemoteLiveConnection:
         }
         self._stop_received.wait(1)
         yield dict(self._completed_payload)
+
+
+class _DelayedSessionStartedConnection(_FakeRemoteLiveConnection):
+    def __init__(self, *, startup_delay_seconds: float = 0.2) -> None:
+        super().__init__()
+        self._startup_delay_seconds = startup_delay_seconds
+
+    def iter_events(self):
+        time.sleep(self._startup_delay_seconds)
+        yield {
+            "type": "session_started",
+            "session_id": "remote-1",
+            "started_at": "2026-03-18T10:00:00+00:00",
+            "title": "产品周会",
+            "kind": "meeting",
+            "language": "zh",
+            "source_label": "BlackHole 2ch",
+            "source_ref": "1",
+        }
+        self._stop_received.wait(1)
+        yield dict(self._completed_payload)
+
+
+class _FakeStartupWebSocket:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+        self.accepted = False
+        self.closed = False
+        self.sent_payloads: list[dict[str, object]] = []
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def receive_json(self) -> dict[str, object]:
+        return dict(self._payload)
+
+    async def send_json(self, payload: dict[str, object]) -> None:
+        self.sent_payloads.append(dict(payload))
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class _FakeRemoteClient:
@@ -890,6 +932,137 @@ class RemoteCoordinatorTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertEqual([b"a" * 8 + b"b" * 8], connection.sent_audio)
         self.assertEqual(["stop"], connection.sent_controls)
+
+    def test_remote_coordinator_waits_for_session_started_before_starting_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            connection = _DelayedSessionStartedConnection(startup_delay_seconds=0.2)
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+                client=_FakeRemoteClient(connection),
+            )
+            coordinator.request_stop()
+
+            class _SessionAwareCaptureService(_FakeAudioCaptureService):
+                def start(self) -> None:
+                    if coordinator.session_id is None:
+                        raise AssertionError("capture started before session_started")
+                    super().start()
+
+            with (
+                patch(
+                    "live_note.app.remote_coordinator.resolve_input_device",
+                    return_value=SimpleNamespace(index=1, name="BlackHole 2ch"),
+                ),
+                patch(
+                    "live_note.app.remote_coordinator.AudioCaptureService",
+                    _SessionAwareCaptureService,
+                ),
+            ):
+                exit_code = coordinator.run()
+
+        self.assertEqual(0, exit_code)
+
+    def test_remote_runner_start_times_out_when_backend_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = RemoteLiveSessionRunner(
+                config=_sample_config(Path(temp_dir), remote_timeout_seconds=1),
+                request=LiveStartRequest(
+                    title="产品周会",
+                    kind="meeting",
+                    language="zh",
+                    source_label="BlackHole 2ch",
+                    source_ref="1",
+                ),
+                on_progress=lambda _event: None,
+            )
+
+            def _run_without_backend_ready(self) -> int:
+                self._stop_event.wait(5)
+                return 0
+
+            with patch.object(RemoteLiveSessionRunner, "run", _run_without_backend_ready):
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "启动超时"):
+                        runner.start()
+                finally:
+                    runner.request_stop()
+                    runner.join(timeout=1)
+                    self.assertFalse(runner.is_alive)
+
+    def test_remote_service_live_session_reports_startup_error_before_session_started(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = RemoteSessionService(_sample_config(Path(temp_dir)))
+            websocket = _FakeStartupWebSocket(
+                {
+                    "type": "start",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+
+            with patch.object(
+                RemoteLiveSessionRunner,
+                "start",
+                side_effect=RuntimeError("后端未就绪"),
+            ):
+                asyncio.run(service.live_session(websocket))
+
+        self.assertTrue(websocket.accepted)
+        self.assertTrue(websocket.closed)
+        self.assertGreaterEqual(len(websocket.sent_payloads), 1)
+        self.assertEqual("error", websocket.sent_payloads[0]["type"])
+        self.assertNotIn("session_started", {item["type"] for item in websocket.sent_payloads})
+
+    def test_remote_service_live_session_startup_wait_does_not_block_event_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = RemoteSessionService(_sample_config(Path(temp_dir)))
+            websocket = _FakeStartupWebSocket(
+                {
+                    "type": "start",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+            async_ready_signal = threading.Event()
+
+            def _start_waiting_for_async_signal(_self) -> None:
+                if not async_ready_signal.wait(timeout=0.6):
+                    raise RuntimeError("event loop blocked")
+                raise RuntimeError("后端未就绪")
+
+            async def _run_case() -> None:
+                async def _signal_from_loop() -> None:
+                    await asyncio.sleep(0.05)
+                    async_ready_signal.set()
+
+                signal_task = asyncio.create_task(_signal_from_loop())
+                await service.live_session(websocket)
+                await signal_task
+
+            with patch.object(
+                RemoteLiveSessionRunner,
+                "start",
+                _start_waiting_for_async_signal,
+            ):
+                asyncio.run(_run_case())
+
+        self.assertTrue(websocket.accepted)
+        self.assertTrue(websocket.closed)
+        self.assertGreaterEqual(len(websocket.sent_payloads), 1)
+        self.assertEqual("error", websocket.sent_payloads[0]["type"])
+        self.assertIn("后端未就绪", str(websocket.sent_payloads[0].get("error")))
+        self.assertNotIn("event loop blocked", str(websocket.sent_payloads[0].get("error")))
+        self.assertNotIn("session_started", {item["type"] for item in websocket.sent_payloads})
 
     def test_remote_coordinator_attaches_postprocess_task_without_fetching_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

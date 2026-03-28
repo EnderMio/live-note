@@ -523,7 +523,23 @@ class RemoteSessionService:
                 speaker_enabled=request.speaker_enabled,
             ),
         )
-        metadata = runner.start()
+        try:
+            metadata = await asyncio.to_thread(runner.start)
+        except Exception as exc:
+            runner.request_stop()
+            runner.join(timeout=5)
+            message = str(exc).strip() or "远端实时后端启动失败。"
+            if not message.startswith("远端实时后端启动"):
+                message = f"远端实时后端启动失败：{message}"
+            payload: dict[str, object] = {
+                "type": "error",
+                "error": message,
+            }
+            if runner.session_id:
+                payload["session_id"] = runner.session_id
+            await websocket.send_json(payload)
+            await websocket.close()
+            return
         await websocket.send_json(
             {
                 "type": "session_started",
@@ -812,12 +828,16 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         self.failure_message: str | None = None
         self.postprocess_task_payload: dict[str, object] | None = None
         self._create_postprocess_task = create_postprocess_task
+        self._backend_ready_event = threading.Event()
+        self._startup_error: str | None = None
 
     @property
     def is_alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> SessionMetadata:
+        self._backend_ready_event.clear()
+        self._startup_error = None
         metadata = create_session_metadata(
             config=self.config,
             title=self.request.title,
@@ -838,6 +858,18 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         self.workspace = SessionWorkspace.create(Path(metadata.session_dir), metadata)
         self._thread = threading.Thread(target=self.run, name=f"remote-live-{metadata.session_id}")
         self._thread.start()
+        startup_timeout = max(int(self.config.remote.timeout_seconds), 1)
+        if not self._backend_ready_event.wait(timeout=startup_timeout):
+            self.request_stop()
+            self.join(timeout=1)
+            message = f"远端实时后端启动超时（{startup_timeout}s）。"
+            self.failure_message = message
+            raise RuntimeError(message)
+        if self._startup_error:
+            self.request_stop()
+            self.join(timeout=1)
+            self.failure_message = self._startup_error
+            raise RuntimeError(self._startup_error)
         return metadata
 
     def join(self, timeout: float | None = None) -> None:
@@ -928,6 +960,7 @@ class RemoteLiveSessionRunner(SessionCoordinator):
             )
             return 0
         except BaseException as exc:
+            self._mark_backend_startup_failed(exc)
             self.failure_message = str(exc)
             _mark_session_failed(
                 workspace=workspace,
@@ -937,6 +970,16 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                 on_progress=self.on_progress,
             )
             raise
+
+    def _mark_backend_ready(self) -> None:
+        self._backend_ready_event.set()
+
+    def _mark_backend_startup_failed(self, exc: BaseException) -> None:
+        if self._backend_ready_event.is_set():
+            return
+        message = str(exc).strip() or "未知错误"
+        self._startup_error = f"远端实时后端启动失败：{message}"
+        self._backend_ready_event.set()
 
     def _run_whisper_live_backend(
         self,
@@ -968,6 +1011,7 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         with whisper_server:
             segment_thread.start()
             transcribe_thread.start()
+            self._mark_backend_ready()
             while True:
                 self._drain_control_commands(
                     capture=self._capture,
@@ -1003,6 +1047,7 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         current_ms = 0
         tracker.start_stream(current_ms)
         connection = self._open_funasr_connection(metadata.session_id)
+        self._mark_backend_ready()
 
         with _open_session_audio_writer(
             workspace.session_live_wav,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,7 @@ class RemoteLiveCoordinator:
         self._pause_requested = False
         self._control_commands: queue.Queue[str] = queue.Queue()
         self._event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._session_started_event = threading.Event()
         self.session_id: str | None = None
         self.workspace: SessionWorkspace | None = None
         self._live_entries: list[TranscriptEntry] = []
@@ -98,6 +100,7 @@ class RemoteLiveCoordinator:
         done_event = threading.Event()
         error_queue: queue.Queue[BaseException] = queue.Queue()
         batcher = _RemoteAudioBatcher(chunk_ms=self.config.remote.live_chunk_ms)
+        self._session_started_event.clear()
 
         with self.client.connect_live(self._live_start_payload(device)) as connection:
             reader = threading.Thread(
@@ -106,6 +109,7 @@ class RemoteLiveCoordinator:
                 daemon=True,
             )
             reader.start()
+            self._wait_for_session_started(done_event, error_queue)
             capture.start()
             stop_sent = False
             stopping_capture = False
@@ -177,9 +181,35 @@ class RemoteLiveCoordinator:
                 if payload.get("type") in {"completed", "error"}:
                     done_event.set()
                     return
+            error_queue.put(
+                RemoteClientError(
+                    "远端连接在会话就绪前已关闭。"
+                    if not self._session_started_event.is_set()
+                    else "远端连接已断开。"
+                )
+            )
+            done_event.set()
         except BaseException as exc:
             error_queue.put(exc)
             done_event.set()
+
+    def _wait_for_session_started(
+        self,
+        done_event: threading.Event,
+        error_queue: queue.Queue[BaseException],
+    ) -> None:
+        timeout_seconds = max(int(self.config.remote.timeout_seconds), 1)
+        deadline = time.monotonic() + timeout_seconds
+        while not self._session_started_event.is_set():
+            self._raise_if_error(error_queue)
+            self._drain_remote_events(done_event)
+            if self._session_started_event.is_set():
+                return
+            if done_event.is_set():
+                raise RemoteClientError("远端会话在就绪前已结束。")
+            if time.monotonic() >= deadline:
+                raise RemoteClientError(f"等待远端会话就绪超时（{timeout_seconds}s）。")
+            done_event.wait(0.05)
 
     def _drain_control_commands(
         self,
@@ -254,7 +284,9 @@ class RemoteLiveCoordinator:
                     )
                     done_event.set()
                     continue
-                self._sync_remote_artifacts(self.client.get_session_artifacts(str(payload["session_id"])))
+                self._sync_remote_artifacts(
+                    self.client.get_session_artifacts(str(payload["session_id"]))
+                )
                 self._emit("done", "远端会话已完成。", session_id=self.session_id)
                 done_event.set()
                 continue
@@ -291,6 +323,7 @@ class RemoteLiveCoordinator:
         self.session_id = metadata.session_id
         self._live_entries = self.workspace.transcript_entries()
         self._finalized_segment_ids = {entry.segment_id for entry in self._live_entries}
+        self._session_started_event.set()
 
     def _append_live_segment(
         self,
