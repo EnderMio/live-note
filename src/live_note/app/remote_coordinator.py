@@ -14,12 +14,46 @@ from live_note.obsidian.client import ObsidianClient
 from live_note.obsidian.renderer import build_transcript_note
 from live_note.remote.client import RemoteClient, RemoteClientError
 from live_note.remote.protocol import entry_from_dict, metadata_from_dict
+from live_note.utils import compact_text
 
 from .events import ProgressCallback, ProgressEvent
 from .journal import SessionWorkspace
 from .remote_sync import apply_remote_artifacts, ensure_remote_workspace
 from .remote_tasks import upsert_remote_task_payload
 from .session_outputs import try_sync_note
+
+_NO_SPACE_PUNCTUATION = frozenset("，。！？；：、】【（）《》「」『』、")
+
+
+def _is_no_space_script_char(value: str) -> bool:
+    codepoint = ord(value)
+    return (
+        0x3040 <= codepoint <= 0x30FF
+        or 0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xAC00 <= codepoint <= 0xD7AF
+        or 0x1100 <= codepoint <= 0x11FF
+        or 0x3130 <= codepoint <= 0x318F
+    )
+
+
+def _is_no_space_boundary_char(value: str) -> bool:
+    return _is_no_space_script_char(value) or value in _NO_SPACE_PUNCTUATION
+
+
+def _merge_partial_segment_append(current: str, cleaned: str) -> str:
+    current_tail = current.rstrip()
+    incoming_head = cleaned.lstrip()
+    if (
+        current_tail
+        and incoming_head
+        and " " not in current
+        and " " not in cleaned
+        and _is_no_space_boundary_char(current_tail[-1])
+        and _is_no_space_boundary_char(incoming_head[0])
+    ):
+        return f"{current_tail}{incoming_head}"
+    return compact_text(f"{current} {cleaned}")
 
 
 @dataclass
@@ -341,6 +375,18 @@ class RemoteLiveCoordinator:
         started_ms = int(payload["started_ms"])
         ended_ms = int(payload["ended_ms"])
         text = str(payload["text"])
+        current_entry = self._entry_for_segment(segment_id)
+        if is_partial:
+            merged_text = _merge_partial_segment_text(
+                current_entry.text if current_entry is not None else "",
+                text,
+            )
+            if merged_text is None:
+                return
+            text = merged_text
+            if current_entry is not None:
+                started_ms = min(started_ms, current_entry.started_ms)
+                ended_ms = max(ended_ms, current_entry.ended_ms)
         speaker_label = (
             str(payload["speaker_label"]) if payload.get("speaker_label") is not None else None
         )
@@ -403,6 +449,12 @@ class RemoteLiveCoordinator:
             self._live_entries.append(entry)
         self._live_entries.sort(key=lambda item: (item.started_ms, item.segment_id))
 
+    def _entry_for_segment(self, segment_id: str) -> TranscriptEntry | None:
+        for entry in self._live_entries:
+            if entry.segment_id == segment_id:
+                return entry
+        return None
+
     def _emit_progress_payload(self, payload: dict[str, Any]) -> None:
         stage = str(payload.get("stage") or "progress")
         if stage == "segment_transcribed":
@@ -457,3 +509,20 @@ def _optional_text(value: Any) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _merge_partial_segment_text(current: str, incoming: str) -> str | None:
+    cleaned = incoming.strip()
+    if not cleaned:
+        return None
+    if not current:
+        return cleaned
+    normalized_current = compact_text(current)
+    normalized_incoming = compact_text(cleaned)
+    if normalized_incoming.startswith(normalized_current):
+        return cleaned
+    if normalized_current == normalized_incoming or normalized_current.endswith(
+        normalized_incoming
+    ):
+        return current
+    return _merge_partial_segment_append(current, cleaned)

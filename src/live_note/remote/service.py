@@ -36,11 +36,44 @@ from live_note.obsidian.client import ObsidianClient
 from live_note.obsidian.renderer import build_transcript_note
 from live_note.transcribe.funasr import FunAsrMessage, FunAsrWebSocketClient
 from live_note.transcribe.whisper import WhisperInferenceClient, WhisperServerProcess
-from live_note.utils import slugify_filename
+from live_note.utils import compact_text, slugify_filename
 
 from .protocol import LiveStartRequest, entry_to_dict, metadata_to_dict, progress_to_payload
 from .speaker import apply_speaker_labels
 from .tasks import RemoteTaskRegistry
+
+_NO_SPACE_PUNCTUATION = frozenset("，。！？；：、】【（）《》「」『』、")
+
+
+def _is_no_space_script_char(value: str) -> bool:
+    codepoint = ord(value)
+    return (
+        0x3040 <= codepoint <= 0x30FF
+        or 0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xAC00 <= codepoint <= 0xD7AF
+        or 0x1100 <= codepoint <= 0x11FF
+        or 0x3130 <= codepoint <= 0x318F
+    )
+
+
+def _is_no_space_boundary_char(value: str) -> bool:
+    return _is_no_space_script_char(value) or value in _NO_SPACE_PUNCTUATION
+
+
+def _merge_partial_text(current: str, cleaned: str) -> str:
+    current_tail = current.rstrip()
+    incoming_head = cleaned.lstrip()
+    if (
+        current_tail
+        and incoming_head
+        and " " not in current
+        and " " not in cleaned
+        and _is_no_space_boundary_char(current_tail[-1])
+        and _is_no_space_boundary_char(incoming_head[0])
+    ):
+        return f"{current_tail}{incoming_head}"
+    return compact_text(f"{current} {cleaned}")
 
 
 class RemoteSessionService:
@@ -665,17 +698,32 @@ class _FunAsrDraftTracker:
             return None
         started_ms, ended_ms = self._resolve_bounds(current_ms=current_ms, bounds_ms=bounds_ms)
         self._ensure_current_segment(started_ms=started_ms)
-        if cleaned == self._current_text and ended_ms <= self._current_ended_ms:
-            return None
+        current = self._current_text
+        normalized_incoming = compact_text(cleaned)
+        normalized_current = compact_text(current)
+        if not current:
+            merged = cleaned
+        elif normalized_incoming.startswith(normalized_current):
+            merged = cleaned
+        elif normalized_current == normalized_incoming or normalized_current.endswith(
+            normalized_incoming
+        ):
+            merged = current
+        else:
+            merged = _merge_partial_text(current, cleaned)
+        previous_ended_ms = self._current_ended_ms
         self._current_started_ms = min(self._current_started_ms, started_ms)
         self._current_ended_ms = max(self._current_ended_ms, ended_ms)
-        self._current_text = cleaned
+        self._current_text = merged
+        if merged == current:
+            self._current_ended_ms = max(previous_ended_ms, ended_ms)
+            return None
         return {
             "type": "segment_partial",
             "segment_id": self._current_segment_id,
             "started_ms": self._current_started_ms,
             "ended_ms": self._current_ended_ms,
-            "text": cleaned,
+            "text": merged,
             "speaker_label": None,
         }
 
@@ -686,8 +734,7 @@ class _FunAsrDraftTracker:
         current_ms: int,
         bounds_ms: tuple[int, int] | None = None,
     ) -> TranscriptEntry | None:
-        cleaned = text.strip()
-        if not cleaned:
+        if not text.strip():
             return None
         started_ms, ended_ms = self._resolve_bounds(current_ms=current_ms, bounds_ms=bounds_ms)
         self._ensure_current_segment(started_ms=started_ms)
@@ -697,13 +744,9 @@ class _FunAsrDraftTracker:
             segment_id=str(self._current_segment_id),
             started_ms=self._current_started_ms,
             ended_ms=self._current_ended_ms,
-            text=cleaned,
+            text=text,
         )
-        self._last_finalized_ms = self._current_ended_ms
-        self._current_segment_id = None
-        self._current_started_ms = self._last_finalized_ms
-        self._current_ended_ms = self._last_finalized_ms
-        self._current_text = ""
+        self._reset_open_segment(finalized_ms=self._current_ended_ms)
         return entry
 
     def force_finalize(self) -> TranscriptEntry | None:
@@ -717,12 +760,15 @@ class _FunAsrDraftTracker:
             ended_ms=ended_ms,
             text=cleaned,
         )
-        self._last_finalized_ms = ended_ms
-        self._current_segment_id = None
-        self._current_started_ms = ended_ms
-        self._current_ended_ms = ended_ms
-        self._current_text = ""
+        self._reset_open_segment(finalized_ms=ended_ms)
         return entry
+
+    def _reset_open_segment(self, *, finalized_ms: int) -> None:
+        self._last_finalized_ms = finalized_ms
+        self._current_segment_id = None
+        self._current_started_ms = finalized_ms
+        self._current_ended_ms = finalized_ms
+        self._current_text = ""
 
     def _ensure_current_segment(self, *, started_ms: int | None = None) -> None:
         if self._current_segment_id is not None:
@@ -1195,8 +1241,8 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         metadata: SessionMetadata,
         current_ms: int,
     ) -> None:
-        text = message.text.strip()
-        if not text:
+        text = message.text
+        if not text.strip():
             return
         if _is_funasr_final_message(message):
             entry = tracker.build_final_entry(

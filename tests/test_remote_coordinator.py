@@ -27,6 +27,7 @@ from live_note.config import (
     WhisperConfig,
 )
 from live_note.domain import AudioFrame
+from live_note.obsidian.renderer import build_transcript_note
 from live_note.remote.protocol import LiveStartRequest
 from live_note.remote.service import (
     RemoteLiveSessionRunner,
@@ -35,6 +36,7 @@ from live_note.remote.service import (
     _FunAsrDraftTracker,
 )
 from live_note.transcribe.funasr import FunAsrMessage
+from live_note.utils import compact_text
 
 
 class _FakeFunAsrConnection:
@@ -629,6 +631,210 @@ class RemoteCoordinatorTests(unittest.TestCase):
         self.assertEqual("大家好，开始吧。", entries[0].text)
         self.assertEqual(2400, entries[0].ended_ms)
 
+    def test_remote_partial_segment_accumulates_delta_fragments_locally(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+            )
+            coordinator._apply_session_started(
+                {
+                    "session_id": "remote-1",
+                    "started_at": "2026-03-18T10:00:00+00:00",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+
+            coordinator._append_live_segment(
+                {
+                    "segment_id": "seg-00001",
+                    "started_ms": 0,
+                    "ended_ms": 200,
+                    "text": "so",
+                },
+                emit_final_progress=False,
+            )
+            coordinator._append_live_segment(
+                {
+                    "segment_id": "seg-00001",
+                    "started_ms": 0,
+                    "ended_ms": 500,
+                    "text": "today's class",
+                },
+                emit_final_progress=False,
+            )
+            coordinator._append_live_segment(
+                {
+                    "segment_id": "seg-00001",
+                    "started_ms": 0,
+                    "ended_ms": 900,
+                    "text": "organized",
+                },
+                emit_final_progress=False,
+            )
+
+            entries = coordinator.workspace.transcript_entries()
+
+        self.assertEqual(1, len(entries))
+        self.assertEqual("so today's class organized", compact_text(entries[0].text))
+        self.assertEqual(900, entries[0].ended_ms)
+
+    def test_remote_partial_segment_does_not_downgrade_to_shorter_fragment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+            )
+            coordinator._apply_session_started(
+                {
+                    "session_id": "remote-1",
+                    "started_at": "2026-03-18T10:00:00+00:00",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+
+            coordinator._append_live_segment(
+                {
+                    "segment_id": "seg-00001",
+                    "started_ms": 0,
+                    "ended_ms": 500,
+                    "text": "so today's class",
+                },
+                emit_final_progress=False,
+            )
+            coordinator._append_live_segment(
+                {
+                    "segment_id": "seg-00001",
+                    "started_ms": 0,
+                    "ended_ms": 650,
+                    "text": "class",
+                },
+                emit_final_progress=False,
+            )
+
+            entries = coordinator.workspace.transcript_entries()
+
+        self.assertEqual(1, len(entries))
+        self.assertEqual("so today's class", compact_text(entries[0].text))
+        self.assertEqual(650, entries[0].ended_ms)
+
+    def test_remote_partial_segment_no_space_cjk_delta_does_not_inject_spaces(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+            )
+            coordinator._apply_session_started(
+                {
+                    "session_id": "remote-1",
+                    "started_at": "2026-03-18T10:00:00+00:00",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+
+            coordinator._append_live_segment(
+                {
+                    "segment_id": "seg-00001",
+                    "started_ms": 0,
+                    "ended_ms": 200,
+                    "text": "今天",
+                },
+                emit_final_progress=False,
+            )
+            coordinator._append_live_segment(
+                {
+                    "segment_id": "seg-00001",
+                    "started_ms": 0,
+                    "ended_ms": 500,
+                    "text": "天气",
+                },
+                emit_final_progress=False,
+            )
+            coordinator._append_live_segment(
+                {
+                    "segment_id": "seg-00001",
+                    "started_ms": 0,
+                    "ended_ms": 900,
+                    "text": "很好",
+                },
+                emit_final_progress=False,
+            )
+
+            entries = coordinator.workspace.transcript_entries()
+
+        self.assertEqual(1, len(entries))
+        self.assertEqual("今天天气很好", entries[0].text)
+        self.assertEqual(900, entries[0].ended_ms)
+
+    def test_remote_partial_segment_no_space_cjk_punctuation_boundary_does_not_inject_spaces(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+            )
+            coordinator._apply_session_started(
+                {
+                    "session_id": "remote-1",
+                    "started_at": "2026-03-18T10:00:00+00:00",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+
+            coordinator._append_live_segment(
+                {
+                    "segment_id": "seg-00001",
+                    "started_ms": 0,
+                    "ended_ms": 500,
+                    "text": "今天天气，",
+                },
+                emit_final_progress=False,
+            )
+            coordinator._append_live_segment(
+                {
+                    "segment_id": "seg-00001",
+                    "started_ms": 0,
+                    "ended_ms": 900,
+                    "text": "很好",
+                },
+                emit_final_progress=False,
+            )
+
+            entries = coordinator.workspace.transcript_entries()
+
+        self.assertEqual(1, len(entries))
+        self.assertEqual("今天天气，很好", entries[0].text)
+        self.assertEqual(900, entries[0].ended_ms)
+
     def test_partial_after_final_does_not_overwrite_local_final_text(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -703,6 +909,424 @@ class RemoteCoordinatorTests(unittest.TestCase):
         self.assertEqual(1200, final.ended_ms)
         self.assertEqual("seg-00002", next_partial["segment_id"])
         self.assertEqual(1200, next_partial["started_ms"])
+
+    def test_funasr_draft_tracker_accumulates_online_delta_fragments(self) -> None:
+        tracker = _FunAsrDraftTracker()
+
+        tracker.start_stream(0)
+        first = tracker.build_partial_payload("so", current_ms=200, bounds_ms=(0, 200))
+        second = tracker.build_partial_payload("today's class", current_ms=500, bounds_ms=(0, 500))
+        duplicate = tracker.build_partial_payload("class", current_ms=650, bounds_ms=(0, 650))
+        third = tracker.build_partial_payload("organized", current_ms=900, bounds_ms=(0, 900))
+
+        self.assertEqual("so", first["text"])
+        self.assertEqual("so today's class", compact_text(str(second["text"])))
+        self.assertIsNone(duplicate)
+        self.assertEqual(
+            "so today's class organized",
+            compact_text(str(third["text"])),
+        )
+
+    def test_funasr_draft_tracker_accepts_cumulative_online_snapshots_without_duplication(
+        self,
+    ) -> None:
+        tracker = _FunAsrDraftTracker()
+
+        tracker.start_stream(0)
+        first = tracker.build_partial_payload("so", current_ms=200, bounds_ms=(0, 200))
+        second = tracker.build_partial_payload(
+            "so today's class",
+            current_ms=500,
+            bounds_ms=(0, 500),
+        )
+        regression = tracker.build_partial_payload(
+            "today's class", current_ms=650, bounds_ms=(0, 650)
+        )
+        third = tracker.build_partial_payload(
+            "so today's class is organized",
+            current_ms=900,
+            bounds_ms=(0, 900),
+        )
+
+        self.assertEqual("so", first["text"])
+        self.assertEqual("so today's class", compact_text(str(second["text"])))
+        self.assertIsNone(regression)
+        self.assertEqual(
+            "so today's class is organized",
+            compact_text(str(third["text"])),
+        )
+
+    def test_funasr_forced_final_preserves_accumulated_online_draft(self) -> None:
+        tracker = _FunAsrDraftTracker()
+
+        tracker.start_stream(0)
+        tracker.build_partial_payload("so", current_ms=200, bounds_ms=(0, 200))
+        tracker.build_partial_payload("today's class", current_ms=500, bounds_ms=(0, 500))
+        tracker.build_partial_payload("organized", current_ms=900, bounds_ms=(0, 900))
+
+        final = tracker.force_finalize()
+
+        self.assertIsNotNone(final)
+        assert final is not None
+        self.assertEqual(
+            "so today's class organized",
+            compact_text(final.text),
+        )
+        self.assertEqual(900, final.ended_ms)
+
+        tracker.start_stream(final.ended_ms)
+        next_partial = tracker.build_partial_payload(
+            "next segment",
+            current_ms=1200,
+            bounds_ms=(0, 300),
+        )
+
+        self.assertEqual("seg-00002", next_partial["segment_id"])
+        self.assertEqual(final.ended_ms, next_partial["started_ms"])
+
+    def test_funasr_draft_tracker_no_space_cjk_delta_does_not_inject_spaces(self) -> None:
+        tracker = _FunAsrDraftTracker()
+
+        tracker.start_stream(0)
+        first = tracker.build_partial_payload("今天", current_ms=200, bounds_ms=(0, 200))
+        second = tracker.build_partial_payload("天气", current_ms=500, bounds_ms=(0, 500))
+        third = tracker.build_partial_payload("很好", current_ms=900, bounds_ms=(0, 900))
+
+        self.assertEqual("今天", first["text"])
+        self.assertEqual("今天天气", second["text"])
+        self.assertEqual("今天天气很好", third["text"])
+
+    def test_funasr_draft_tracker_no_space_cjk_punctuation_boundary_does_not_inject_spaces(
+        self,
+    ) -> None:
+        tracker = _FunAsrDraftTracker()
+
+        tracker.start_stream(0)
+        first = tracker.build_partial_payload("今天天气，", current_ms=500, bounds_ms=(0, 500))
+        second = tracker.build_partial_payload("很好", current_ms=900, bounds_ms=(0, 900))
+
+        self.assertEqual("今天天气，", first["text"])
+        self.assertEqual("今天天气，很好", second["text"])
+
+    def test_funasr_forced_final_no_space_cjk_draft_preserves_joined_text(self) -> None:
+        tracker = _FunAsrDraftTracker()
+
+        tracker.start_stream(0)
+        tracker.build_partial_payload("今天", current_ms=200, bounds_ms=(0, 200))
+        tracker.build_partial_payload("天气", current_ms=500, bounds_ms=(0, 500))
+        tracker.build_partial_payload("很好", current_ms=900, bounds_ms=(0, 900))
+
+        final = tracker.force_finalize()
+
+        self.assertIsNotNone(final)
+        assert final is not None
+        self.assertEqual("今天天气很好", final.text)
+        self.assertEqual(900, final.ended_ms)
+
+    def test_funasr_forced_final_no_space_cjk_punctuation_draft_preserves_joined_text(
+        self,
+    ) -> None:
+        tracker = _FunAsrDraftTracker()
+
+        tracker.start_stream(0)
+        tracker.build_partial_payload("今天天气，", current_ms=500, bounds_ms=(0, 500))
+        tracker.build_partial_payload("很好", current_ms=900, bounds_ms=(0, 900))
+
+        final = tracker.force_finalize()
+
+        self.assertIsNotNone(final)
+        assert final is not None
+        self.assertEqual("今天天气，很好", final.text)
+        self.assertEqual(900, final.ended_ms)
+
+    def test_funasr_offline_final_overrides_online_draft_snapshot(self) -> None:
+        tracker = _FunAsrDraftTracker()
+
+        tracker.start_stream(0)
+        tracker.build_partial_payload("hello", current_ms=200, bounds_ms=(0, 200))
+        tracker.build_partial_payload("world", current_ms=500, bounds_ms=(0, 500))
+
+        final = tracker.build_final_entry(
+            "  hello   brave   world  ",
+            current_ms=1200,
+            bounds_ms=(100, 1200),
+        )
+
+        self.assertIsNotNone(final)
+        assert final is not None
+        self.assertEqual("  hello   brave   world  ", final.text)
+        self.assertEqual("seg-00001", final.segment_id)
+        self.assertEqual(0, final.started_ms)
+        self.assertEqual(1200, final.ended_ms)
+        self.assertIsNone(tracker.force_finalize())
+
+        tracker.start_stream(final.ended_ms)
+        next_partial = tracker.build_partial_payload(
+            "fresh start",
+            current_ms=1500,
+            bounds_ms=(0, 300),
+        )
+
+        self.assertEqual("seg-00002", next_partial["segment_id"])
+        self.assertEqual(final.ended_ms, next_partial["started_ms"])
+        self.assertEqual("fresh start", next_partial["text"])
+
+    def test_real_fragment_trace_rebuilds_one_live_row_for_open_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+            )
+            coordinator._apply_session_started(
+                {
+                    "session_id": "remote-1",
+                    "started_at": "2026-03-18T10:00:00+00:00",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+
+            tracker = _FunAsrDraftTracker()
+            tracker.start_stream(0)
+            trace = [
+                "so",
+                "'s ass",
+                "is",
+                "troductary",
+                "class",
+                "will talk",
+                "about the class",
+                "self",
+                "and",
+                "h",
+            ]
+
+            current_ms = 0
+            for token in trace:
+                current_ms += 600
+                payload = tracker.build_partial_payload(
+                    token,
+                    current_ms=current_ms,
+                    bounds_ms=(0, current_ms),
+                )
+                if payload is None:
+                    continue
+                coordinator._append_live_segment(payload, emit_final_progress=False)
+
+            entries = coordinator.workspace.transcript_entries()
+
+        self.assertEqual(1, len(entries))
+        self.assertEqual("seg-00001", entries[0].segment_id)
+        self.assertEqual(
+            "so 's ass is troductary class will talk about the class self and h",
+            compact_text(entries[0].text),
+        )
+
+    def test_live_transcript_note_keeps_one_row_per_open_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+            )
+            coordinator._apply_session_started(
+                {
+                    "session_id": "remote-1",
+                    "started_at": "2026-03-18T10:00:00+00:00",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+
+            tracker = _FunAsrDraftTracker()
+            tracker.start_stream(0)
+            current_ms = 0
+            for token in ["so", "today's class", "organized"]:
+                current_ms += 300
+                payload = tracker.build_partial_payload(
+                    token,
+                    current_ms=current_ms,
+                    bounds_ms=(0, current_ms),
+                )
+                if payload is None:
+                    continue
+                coordinator._append_live_segment(payload, emit_final_progress=False)
+
+            entries = coordinator.workspace.transcript_entries()
+            note = build_transcript_note(
+                coordinator.workspace.read_session(),
+                entries,
+                status="live",
+            )
+
+        self.assertEqual(1, len(entries))
+        self.assertEqual("so today's class organized", compact_text(entries[0].text))
+        self.assertEqual(1, note.count("- [00:00:00]"))
+        expected_line = "- [00:00:00] so today's class organized"
+        self.assertIn(expected_line, note.splitlines())
+        self.assertEqual(1, note.splitlines().count(expected_line))
+
+    def test_live_journal_rebuild_does_not_emit_fragment_history_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+            )
+            coordinator._apply_session_started(
+                {
+                    "session_id": "remote-1",
+                    "started_at": "2026-03-18T10:00:00+00:00",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+
+            tracker = _FunAsrDraftTracker()
+            tracker.start_stream(0)
+            current_ms = 0
+            for token in ["so", "today's class", "organized"]:
+                current_ms += 300
+                payload = tracker.build_partial_payload(
+                    token,
+                    current_ms=current_ms,
+                    bounds_ms=(0, current_ms),
+                )
+                if payload is None:
+                    continue
+                coordinator.workspace.record_segment_text(
+                    str(payload["segment_id"]),
+                    int(payload["started_ms"]),
+                    int(payload["ended_ms"]),
+                    str(payload["text"]),
+                )
+
+            entries = coordinator.workspace.transcript_entries()
+            transcribed_events = [
+                event
+                for event in coordinator.workspace.load_events()
+                if event.kind == "segment_transcribed"
+            ]
+
+        self.assertGreater(len(transcribed_events), 1)
+        self.assertEqual(1, len(entries))
+        self.assertEqual("seg-00001", entries[0].segment_id)
+        self.assertEqual("so today's class organized", compact_text(entries[0].text))
+        self.assertEqual(
+            compact_text(transcribed_events[-1].text or ""),
+            compact_text(entries[0].text),
+        )
+
+    def test_mixed_online_partials_and_late_final_keep_segment_boundaries_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+            )
+            coordinator._apply_session_started(
+                {
+                    "session_id": "remote-1",
+                    "started_at": "2026-03-18T10:00:00+00:00",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+
+            tracker = _FunAsrDraftTracker()
+            tracker.start_stream(0)
+            seg1_partial_1 = tracker.build_partial_payload(
+                "so",
+                current_ms=300,
+                bounds_ms=(0, 300),
+            )
+            seg1_partial_2 = tracker.build_partial_payload(
+                "today's class",
+                current_ms=700,
+                bounds_ms=(0, 700),
+            )
+            seg1_final = tracker.build_final_entry(
+                "segment one final authority",
+                current_ms=1200,
+                bounds_ms=(0, 1200),
+            )
+            assert seg1_partial_1 is not None
+            assert seg1_partial_2 is not None
+            assert seg1_final is not None
+
+            tracker.start_stream(seg1_final.ended_ms)
+            seg2_partial_1 = tracker.build_partial_payload(
+                "segment two",
+                current_ms=1500,
+                bounds_ms=(0, 300),
+            )
+            seg2_partial_2 = tracker.build_partial_payload(
+                "keeps drafting",
+                current_ms=1800,
+                bounds_ms=(0, 600),
+            )
+            assert seg2_partial_1 is not None
+            assert seg2_partial_2 is not None
+
+            self.assertEqual("seg-00001", seg1_partial_1["segment_id"])
+            self.assertEqual("seg-00001", seg1_partial_2["segment_id"])
+            self.assertEqual("seg-00001", seg1_final.segment_id)
+            self.assertEqual("seg-00002", seg2_partial_1["segment_id"])
+            self.assertEqual("seg-00002", seg2_partial_2["segment_id"])
+
+            coordinator._append_live_segment(seg1_partial_1, emit_final_progress=False)
+            coordinator._append_live_segment(seg1_partial_2, emit_final_progress=False)
+            coordinator._append_live_segment(seg2_partial_1, emit_final_progress=False)
+            coordinator._append_live_segment(seg2_partial_2, emit_final_progress=False)
+            coordinator._append_live_segment(
+                {
+                    "segment_id": seg1_final.segment_id,
+                    "started_ms": seg1_final.started_ms,
+                    "ended_ms": seg1_final.ended_ms,
+                    "text": seg1_final.text,
+                }
+            )
+
+            entries = coordinator.workspace.transcript_entries()
+            note = build_transcript_note(
+                coordinator.workspace.read_session(),
+                entries,
+                status="live",
+            )
+
+        self.assertEqual(2, len(entries))
+        by_segment_id = {entry.segment_id: entry for entry in entries}
+        self.assertEqual({"seg-00001", "seg-00002"}, set(by_segment_id))
+        self.assertEqual("segment one final authority", by_segment_id["seg-00001"].text)
+        self.assertEqual(
+            "segment two keeps drafting",
+            compact_text(by_segment_id["seg-00002"].text),
+        )
+        self.assertEqual(1, note.count("- [00:00:00]"))
+        expected_seg2_line = "- [00:00:01] segment two keeps drafting"
+        self.assertIn(expected_seg2_line, note.splitlines())
+        self.assertEqual(1, note.splitlines().count(expected_seg2_line))
 
     def test_handle_funasr_message_uses_realtime_modes_and_timestamp_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
