@@ -3,11 +3,18 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from live_note.audio.capture import AudioCaptureError, AudioCaptureService, resolve_input_device
+from live_note.audio.capture import (
+    AudioCaptureError,
+    AudioCaptureService,
+    InputLevel,
+    describe_input_level,
+    resolve_input_device,
+)
 from live_note.config import AppConfig, with_refine_auto_after_live
 from live_note.domain import AudioFrame, TranscriptEntry
 from live_note.obsidian.client import ObsidianClient
@@ -20,7 +27,7 @@ from .events import ProgressCallback, ProgressEvent
 from .journal import SessionWorkspace
 from .remote_sync import apply_remote_artifacts, ensure_remote_workspace
 from .remote_tasks import upsert_remote_task_payload
-from .session_outputs import try_sync_note
+from .session_outputs import publish_failure_outputs
 
 _NO_SPACE_PUNCTUATION = frozenset("，。！？；：、】【（）《》「」『』、")
 
@@ -107,6 +114,7 @@ class RemoteLiveCoordinator:
         self.workspace: SessionWorkspace | None = None
         self._live_entries: list[TranscriptEntry] = []
         self._finalized_segment_ids: set[str] = set()
+        self._explicit_remote_failure_reason: str | None = None
 
     def request_stop(self) -> None:
         self._stop_event.set()
@@ -135,62 +143,78 @@ class RemoteLiveCoordinator:
         error_queue: queue.Queue[BaseException] = queue.Queue()
         batcher = _RemoteAudioBatcher(chunk_ms=self.config.remote.live_chunk_ms)
         self._session_started_event.clear()
+        self._explicit_remote_failure_reason = None
+        try:
+            with self.client.connect_live(self._live_start_payload(device)) as connection:
+                reader = threading.Thread(
+                    target=self._reader_loop,
+                    args=(connection, done_event, error_queue),
+                    daemon=True,
+                )
+                reader.start()
+                self._wait_for_session_started(done_event, error_queue)
+                if hasattr(capture, "set_level_callback"):
+                    capture.set_level_callback(self._build_input_level_callback())
+                capture.start()
+                stop_sent = False
+                stopping_capture = False
+                try:
+                    while not done_event.is_set():
+                        self._drain_control_commands(capture, connection, batcher)
+                        self._raise_if_error(error_queue)
+                        if capture.error:
+                            raise AudioCaptureError(str(capture.error))
+                        if self._stop_event.is_set() and not stopping_capture:
+                            capture.stop()
+                            stopping_capture = True
+                        if not capture.is_alive and not stop_sent and not stopping_capture:
+                            raise AudioCaptureError("音频采集线程已停止。")
 
-        with self.client.connect_live(self._live_start_payload(device)) as connection:
-            reader = threading.Thread(
-                target=self._reader_loop,
-                args=(connection, done_event, error_queue),
-                daemon=True,
-            )
-            reader.start()
-            self._wait_for_session_started(done_event, error_queue)
-            capture.start()
-            stop_sent = False
-            stopping_capture = False
-            try:
-                while not done_event.is_set():
-                    self._drain_control_commands(capture, connection, batcher)
-                    self._raise_if_error(error_queue)
-                    if capture.error:
-                        raise AudioCaptureError(str(capture.error))
-                    if self._stop_event.is_set() and not stopping_capture:
-                        capture.stop()
-                        stopping_capture = True
-                    if not capture.is_alive and not stop_sent and not stopping_capture:
-                        raise AudioCaptureError("音频采集线程已停止。")
-
-                    try:
-                        item = frame_queue.get(timeout=0.1)
-                    except queue.Empty:
-                        if stopping_capture and not capture.is_alive and not stop_sent:
+                        try:
+                            item = frame_queue.get(timeout=0.1)
+                        except queue.Empty:
+                            if stopping_capture and not capture.is_alive and not stop_sent:
+                                self._flush_audio_batch(connection, batcher)
+                                connection.send_control("stop")
+                                stop_sent = True
+                            elif not stop_sent:
+                                self._flush_audio_batch(connection, batcher)
+                            self._drain_remote_events(done_event)
+                            continue
+                        if isinstance(item, AudioFrame) and not capture.is_paused:
+                            payload = batcher.push(item)
+                            if payload:
+                                connection.send_audio(payload)
+                        if (
+                            stopping_capture
+                            and not capture.is_alive
+                            and frame_queue.empty()
+                            and not stop_sent
+                        ):
                             self._flush_audio_batch(connection, batcher)
                             connection.send_control("stop")
                             stop_sent = True
-                        elif not stop_sent:
-                            self._flush_audio_batch(connection, batcher)
                         self._drain_remote_events(done_event)
-                        continue
-                    if isinstance(item, AudioFrame) and not capture.is_paused:
-                        payload = batcher.push(item)
-                        if payload:
-                            connection.send_audio(payload)
-                    if (
-                        stopping_capture
-                        and not capture.is_alive
-                        and frame_queue.empty()
-                        and not stop_sent
-                    ):
-                        self._flush_audio_batch(connection, batcher)
-                        connection.send_control("stop")
-                        stop_sent = True
-                    self._drain_remote_events(done_event)
-                self._flush_audio_batch(connection, batcher)
-                reader.join(timeout=max(self.config.remote.timeout_seconds, 10))
-                self._raise_if_error(error_queue)
-            finally:
-                capture.stop()
-                capture.join(timeout=5)
-        return 0
+                    self._flush_audio_batch(connection, batcher)
+                    reader.join(timeout=max(self.config.remote.timeout_seconds, 10))
+                    self._raise_if_error(error_queue)
+                finally:
+                    capture.stop()
+                    capture.join(timeout=5)
+            return 0
+        except BaseException as exc:
+            should_publish_failure = self._explicit_remote_failure_reason is not None or isinstance(
+                exc, AudioCaptureError
+            )
+            if self.workspace is not None and should_publish_failure:
+                publish_failure_outputs(
+                    workspace=self.workspace,
+                    metadata=self.workspace.read_session(),
+                    obsidian=ObsidianClient(self.config.obsidian),
+                    logger=self.workspace.session_logger(),
+                    reason=str(exc),
+                )
+            raise
 
     def _live_start_payload(self, device) -> dict[str, Any]:
         return {
@@ -269,6 +293,18 @@ class RemoteLiveCoordinator:
         if payload:
             connection.send_audio(payload)
 
+    def _build_input_level_callback(self) -> Callable[[InputLevel], None]:
+        def callback(level: InputLevel) -> None:
+            self._emit(
+                "input_level",
+                describe_input_level(level),
+                session_id=self.session_id,
+                current=max(0, min(100, round(level.normalized * 100))),
+                total=100,
+            )
+
+        return callback
+
     def _drain_remote_events(self, done_event: threading.Event) -> None:
         while True:
             try:
@@ -325,7 +361,8 @@ class RemoteLiveCoordinator:
                 done_event.set()
                 continue
             if event_type == "error":
-                raise RemoteClientError(str(payload.get("error") or "远端会话失败。"))
+                self._explicit_remote_failure_reason = str(payload.get("error") or "远端会话失败。")
+                raise RemoteClientError(self._explicit_remote_failure_reason)
 
     def _apply_session_started(self, payload: dict[str, Any]) -> None:
         metadata_payload = payload.get("metadata")
@@ -407,13 +444,6 @@ class RemoteLiveCoordinator:
         self._upsert_live_entry(entry)
         content = build_transcript_note(metadata, list(self._live_entries), status="live")
         self.workspace.write_transcript(content)
-        try_sync_note(
-            ObsidianClient(self.config.obsidian),
-            metadata.transcript_note_path,
-            content,
-            self.workspace.session_logger(),
-            f"原文片段 {segment_id}",
-        )
         if not is_partial:
             self._finalized_segment_ids.add(segment_id)
         if emit_final_progress:

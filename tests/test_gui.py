@@ -156,6 +156,17 @@ class GuiThemeTests(unittest.TestCase):
         self.assertIn("Section.TLabelframe", configured_styles)
         self.assertIn("App.Treeview", configured_styles)
 
+    def test_apply_visual_theme_configures_input_meter_styles(self) -> None:
+        root = MagicMock()
+        style = MagicMock()
+
+        with patch("live_note.app.gui.ttk.Style", return_value=style):
+            _apply_visual_theme(root)
+
+        configured_styles = [call.args[0] for call in style.configure.call_args_list]
+        self.assertIn("InputMeter.NoSignal.Horizontal.TProgressbar", configured_styles)
+        self.assertIn("InputMeter.Clipping.TLabel", configured_styles)
+
     def test_scroll_helper_module_blocks_outer_canvas_when_inner_matches(self) -> None:
         from live_note.app.gui_scroll import bind_mousewheel_scrolling
 
@@ -981,6 +992,74 @@ class GuiTaskTests(unittest.TestCase):
         )
         gui._arm_live_auto_stop.assert_called_once_with(900)
 
+    def test_start_live_session_progress_callback_still_routes_regular_progress_events(
+        self,
+    ) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        runner = Mock()
+        gui.event_queue = queue.Queue()
+        gui._ensure_ready_for_run = Mock(return_value=True)
+        gui.live_title_var = SimpleNamespace(get=lambda: "产品周会")
+        gui.live_devices = [SimpleNamespace(index=2)]
+        gui.live_device_combo = SimpleNamespace(current=lambda: 0)
+        gui.service = SimpleNamespace(create_live_coordinator=Mock(return_value=runner))
+        gui.live_kind_var = SimpleNamespace(get=lambda: "meeting")
+        gui.live_language_var = SimpleNamespace(get=lambda: "沿用默认设置")
+        gui.live_auto_refine_var = SimpleNamespace(get=lambda: True)
+        gui.live_speaker_enabled_var = SimpleNamespace(get=lambda: False)
+        gui.live_stop_after_minutes_var = SimpleNamespace(get=lambda: "")
+        gui.refine_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.save_session_wav_var = SimpleNamespace(get=lambda: True)
+        gui._next_task_id = Mock(return_value="task-1")
+        gui._start_live_task = Mock()
+        gui._arm_live_auto_stop = Mock()
+        gui.stop_live_button = MagicMock()
+        gui.pause_live_button = MagicMock()
+        gui.execution_target_var = SimpleNamespace(get=lambda: "当前转写：本机")
+        gui._append_log = Mock()
+
+        gui._start_live_session()
+
+        callback = gui.service.create_live_coordinator.call_args.kwargs["on_progress"]
+        callback(ProgressEvent(stage="listening", message="正在监听输入设备：Mic"))
+        queued = gui.event_queue.get_nowait()
+
+        self.assertEqual("listening", queued.stage)
+        self.assertEqual("live", queued.source)
+        self.assertEqual("task-1", queued.task_id)
+
+    def test_handle_live_progress_updates_input_meter_without_logging(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.current_live_task_id = "task-1"
+        gui.background_tasks = {}
+        gui.status_var = SimpleNamespace(set=Mock())
+        gui._append_log = Mock()
+        gui.live_input_level_var = SimpleNamespace(set=Mock())
+        gui.live_input_meter = MagicMock()
+        gui.live_input_meter_status = MagicMock()
+
+        gui._handle_live_progress(
+            ProgressEvent(
+                stage="input_level",
+                message="High",
+                current=78,
+                total=100,
+                task_id="task-1",
+            )
+        )
+
+        gui.status_var.set.assert_not_called()
+        gui._append_log.assert_not_called()
+        gui.live_input_level_var.set.assert_called_once_with("High")
+        gui.live_input_meter.configure.assert_any_call(mode="determinate")
+        gui.live_input_meter.configure.assert_any_call(
+            style="InputMeter.High.Horizontal.TProgressbar"
+        )
+        self.assertEqual(("value", 78), gui.live_input_meter.__setitem__.call_args.args)
+        gui.live_input_meter_status.configure.assert_called_once_with(
+            style="InputMeter.High.TLabel"
+        )
+
     def test_start_import_enqueues_speaker_choice(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             media_path = Path(temp_dir) / "demo.mp3"
@@ -1137,6 +1216,37 @@ class GuiTaskTests(unittest.TestCase):
         gui.progress.stop.assert_called_once()
         gui.progress.configure.assert_called_once_with(mode="determinate")
         self.assertEqual(gui.progress.__setitem__.call_args_list, [(("value", 50),)])
+
+    def test_finish_task_resets_input_meter(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui._live_controller = Mock(return_value=SimpleNamespace(clear=Mock()))
+        gui._task_state_model = Mock(return_value=SimpleNamespace(finish_foreground=Mock()))
+        gui.start_live_button = MagicMock()
+        gui._reset_live_controls = Mock()
+        gui.progress = MagicMock()
+        gui._reset_live_input_meter = Mock()
+        gui._update_idle_status = Mock()
+        gui._maybe_start_next_queue_task = Mock()
+
+        gui._finish_task()
+
+        gui._reset_live_input_meter.assert_called_once_with()
+
+    def test_detach_live_task_resets_input_meter(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui._task_state_model = Mock(
+            return_value=SimpleNamespace(detach_live=Mock(return_value="task-1"))
+        )
+        gui._live_controller = Mock(return_value=SimpleNamespace(clear=Mock()))
+        gui.start_live_button = MagicMock()
+        gui._reset_live_controls = Mock()
+        gui.progress = MagicMock()
+        gui._reset_live_input_meter = Mock()
+        gui._update_idle_status = Mock()
+
+        gui._detach_live_task("session-1")
+
+        gui._reset_live_input_meter.assert_called_once_with()
 
     def test_update_idle_status_resets_history_progress_when_no_tasks(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)

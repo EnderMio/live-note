@@ -29,9 +29,11 @@ from live_note.app.coordinator import (
 )
 from live_note.app.events import ProgressEvent
 from live_note.app.journal import SessionWorkspace, build_workspace, list_sessions
+from live_note.app.session_outputs import publish_failure_outputs, publish_final_outputs
 from live_note.audio.segmentation import SpeechSegmenter
 from live_note.config import AppConfig
 from live_note.domain import AudioFrame, SessionMetadata, TranscriptEntry
+from live_note.llm import OpenAiCompatibleClient
 from live_note.obsidian.client import ObsidianClient
 from live_note.obsidian.renderer import build_transcript_note
 from live_note.transcribe.funasr import FunAsrMessage, FunAsrWebSocketClient
@@ -43,6 +45,14 @@ from .speaker import apply_speaker_labels
 from .tasks import RemoteTaskRegistry
 
 _NO_SPACE_PUNCTUATION = frozenset("，。！？；：、】【（）《》「」『』、")
+
+
+def _disabled_obsidian_client(config: AppConfig) -> ObsidianClient:
+    return ObsidianClient(replace(config.obsidian, enabled=False, api_key=None))
+
+
+def _server_local_only_config(config: AppConfig) -> AppConfig:
+    return replace(config, obsidian=replace(config.obsidian, enabled=False, api_key=None))
 
 
 def _is_no_space_script_char(value: str) -> bool:
@@ -303,7 +313,7 @@ class RemoteSessionService:
         def run() -> None:
             from live_note.app.coordinator import FileImportCoordinator
 
-            config = self.config
+            config = _server_local_only_config(self.config)
             if speaker_enabled is not None:
                 config = replace(
                     config,
@@ -332,6 +342,11 @@ class RemoteSessionService:
             workspace = build_workspace(self.config.root_dir, session_id)
             metadata = workspace.read_session()
             logger = workspace.session_logger()
+            disabled_obsidian = _disabled_obsidian_client(self.config)
+
+            def on_progress(event: ProgressEvent) -> None:
+                self._record_task_progress(task_id, event)
+
             previous_source = metadata.transcript_source
             metadata = workspace.update_session(status="refining", refine_status="refining")
             try:
@@ -340,22 +355,36 @@ class RemoteSessionService:
                     workspace=workspace,
                     metadata=metadata,
                     logger=logger,
-                    on_progress=lambda event: self._record_task_progress(task_id, event),
+                    on_progress=on_progress,
                 )
-            except Exception:
-                workspace.update_session(
+            except Exception as exc:
+                metadata = workspace.update_session(
                     transcript_source=previous_source,
                     refine_status="failed",
-                    status="failed",
                 )
-                raise
+                self.tasks.record_progress(
+                    task_id,
+                    ProgressEvent(
+                        stage="error",
+                        message=f"远端离线精修失败：{exc}",
+                        session_id=session_id,
+                        error=str(exc),
+                    ),
+                )
             metadata = apply_speaker_labels(
                 self.config,
                 workspace,
                 metadata,
-                on_progress=lambda event: self._record_task_progress(task_id, event),
+                on_progress=on_progress,
             )
-            workspace.update_session(status="completed")
+            publish_final_outputs(
+                workspace=workspace,
+                metadata=metadata,
+                obsidian=disabled_obsidian,
+                llm_client=OpenAiCompatibleClient(self.config.llm),
+                logger=logger,
+                on_progress=on_progress,
+            )
             self.tasks.mark_completed(
                 task_id,
                 message="远端离线精修已完成。",
@@ -367,7 +396,7 @@ class RemoteSessionService:
     def _build_retranscribe_runner(self, task_id: str, session_id: str):
         def run() -> None:
             exit_code = retranscribe_session(
-                self.config,
+                _server_local_only_config(self.config),
                 session_id,
                 on_progress=lambda event: self._record_task_progress(task_id, event),
             )
@@ -458,14 +487,35 @@ class RemoteSessionService:
                     config,
                     speaker=replace(config.speaker, enabled=bool(speaker_enabled)),
                 )
-            _run_remote_postprocess(
-                config,
-                workspace,
-                workspace.read_session(),
-                logger=workspace.session_logger(),
-                on_progress=lambda event: self._record_task_progress(task_id, event),
-            )
-            workspace.update_session(status="completed")
+            logger = workspace.session_logger()
+            disabled_obsidian = _disabled_obsidian_client(config)
+            try:
+                _run_remote_postprocess(
+                    config,
+                    workspace,
+                    workspace.read_session(),
+                    logger=logger,
+                    on_progress=lambda event: self._record_task_progress(task_id, event),
+                )
+            except Exception as exc:
+                publish_failure_outputs(
+                    workspace=workspace,
+                    metadata=workspace.read_session(),
+                    obsidian=disabled_obsidian,
+                    logger=logger,
+                    reason=str(exc),
+                )
+                self.tasks.record_progress(
+                    task_id,
+                    ProgressEvent(
+                        stage="error",
+                        message=f"远端后台整理失败：{exc}",
+                        session_id=session_id,
+                        error=str(exc),
+                    ),
+                    result_changed=True,
+                )
+                raise
             self.tasks.mark_completed(
                 task_id,
                 message="远端后台整理已完成。",
@@ -951,9 +1001,7 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         workspace = self.workspace
         metadata = self.metadata
         logger = workspace.session_logger()
-        disabled_obsidian = ObsidianClient(
-            replace(self.config.obsidian, enabled=False, api_key=None)
-        )
+        disabled_obsidian = _disabled_obsidian_client(self.config)
         try:
             _attach_console_logging()
             workspace.write_transcript(build_transcript_note(metadata, [], status="live"))
@@ -997,7 +1045,6 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                 logger=logger,
                 on_progress=self.on_progress,
             )
-            workspace.update_session(status="completed")
             _emit_progress(
                 self.on_progress,
                 "done",
@@ -1010,6 +1057,7 @@ class RemoteLiveSessionRunner(SessionCoordinator):
             self.failure_message = str(exc)
             _mark_session_failed(
                 workspace=workspace,
+                obsidian=disabled_obsidian,
                 logger=logger,
                 label="远端会话",
                 exc=exc,
@@ -1354,11 +1402,12 @@ def _run_remote_postprocess(
                 error=str(exc),
             )
     current = apply_speaker_labels(config, workspace, current, on_progress=on_progress)
-    content = build_transcript_note(
-        current,
-        workspace.transcript_entries(),
-        status=workspace.read_session().status,
-        session_audio_path="session.live.wav" if workspace.session_live_wav.exists() else None,
+    publish_final_outputs(
+        workspace=workspace,
+        metadata=current,
+        obsidian=_disabled_obsidian_client(config),
+        llm_client=OpenAiCompatibleClient(config.llm),
+        logger=logger,
+        on_progress=on_progress,
     )
-    workspace.write_transcript(content)
-    return current
+    return workspace.read_session()

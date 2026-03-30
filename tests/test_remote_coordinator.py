@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,6 +14,7 @@ from live_note.app.coordinator import create_session_metadata
 from live_note.app.journal import SessionWorkspace
 from live_note.app.remote_coordinator import RemoteLiveCoordinator, _RemoteAudioBatcher
 from live_note.app.remote_tasks import load_remote_tasks
+from live_note.audio.capture import InputLevel
 from live_note.config import (
     AppConfig,
     AudioConfig,
@@ -34,6 +36,7 @@ from live_note.remote.service import (
     RemoteSessionService,
     _FunAsrAudioBatcher,
     _FunAsrDraftTracker,
+    _run_remote_postprocess,
 )
 from live_note.transcribe.funasr import FunAsrMessage
 from live_note.utils import compact_text
@@ -133,6 +136,22 @@ class _DelayedSessionStartedConnection(_FakeRemoteLiveConnection):
         }
         self._stop_received.wait(1)
         yield dict(self._completed_payload)
+
+
+class _DisconnectAfterStartConnection(_FakeRemoteLiveConnection):
+    def iter_events(self):
+        yield {
+            "type": "session_started",
+            "session_id": "remote-1",
+            "started_at": "2026-03-18T10:00:00+00:00",
+            "title": "产品周会",
+            "kind": "meeting",
+            "language": "zh",
+            "source_label": "BlackHole 2ch",
+            "source_ref": "1",
+        }
+        self._stop_received.wait(0.2)
+        return
 
 
 class _FakeStartupWebSocket:
@@ -428,7 +447,11 @@ class RemoteCoordinatorTests(unittest.TestCase):
     def test_sync_artifacts_rewrites_local_journal_with_speaker_labels(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            config = _sample_config(root)
+            config = replace(
+                _sample_config(root),
+                refine=RefineConfig(enabled=False, auto_after_live=False),
+                obsidian=replace(_sample_config(root).obsidian, enabled=True),
+            )
             coordinator = RemoteLiveCoordinator(
                 config=config,
                 title="产品周会",
@@ -544,6 +567,28 @@ class RemoteCoordinatorTests(unittest.TestCase):
         self.assertEqual(1, len(transcribed_events))
         self.assertEqual("片段 seg-00001 已转写", transcribed_events[0].message)
 
+    def test_remote_coordinator_input_level_callback_emits_progress_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events = []
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+                on_progress=events.append,
+            )
+            coordinator.session_id = "remote-1"
+
+            callback = coordinator._build_input_level_callback()
+            callback(InputLevel(normalized=0.99, peak=1.0, clipping=True))
+
+        self.assertEqual("input_level", events[0].stage)
+        self.assertEqual("Clipping", events[0].message)
+        self.assertEqual("remote-1", events[0].session_id)
+        self.assertEqual(99, events[0].current)
+        self.assertEqual(100, events[0].total)
+
     def test_remote_partial_segment_updates_local_draft_without_emitting_final_progress(
         self,
     ) -> None:
@@ -584,6 +629,44 @@ class RemoteCoordinatorTests(unittest.TestCase):
         self.assertEqual(1, len(entries))
         self.assertEqual("大家好", entries[0].text)
         self.assertEqual([], [event for event in events if event.stage == "segment_transcribed"])
+
+    def test_append_live_segment_keeps_remote_draft_local_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+            )
+            coordinator._apply_session_started(
+                {
+                    "session_id": "remote-1",
+                    "started_at": "2026-03-18T10:00:00+00:00",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+
+            coordinator._append_live_segment(
+                {
+                    "segment_id": "seg-00001",
+                    "started_ms": 0,
+                    "ended_ms": 900,
+                    "text": "大家好",
+                },
+                emit_final_progress=False,
+            )
+
+            entries = coordinator.workspace.transcript_entries()
+            transcript = coordinator.workspace.transcript_md.read_text(encoding="utf-8")
+
+        self.assertEqual(1, len(entries))
+        self.assertEqual("大家好", entries[0].text)
+        self.assertIn("大家好", transcript)
 
     def test_append_live_segment_updates_existing_segment_instead_of_appending_duplicate(
         self,
@@ -1394,6 +1477,146 @@ class RemoteCoordinatorTests(unittest.TestCase):
         self.assertEqual(860, entries[0].ended_ms)
         self.assertEqual(1, len(runner.entries))
 
+    def test_run_remote_postprocess_generates_structured_output_and_preserves_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = replace(
+                _sample_config(root),
+                refine=RefineConfig(enabled=False, auto_after_live=False),
+            )
+            metadata = create_session_metadata(
+                config=config,
+                title="产品周会",
+                kind="meeting",
+                language="zh",
+                input_mode="live",
+                source_label="BlackHole 2ch",
+                source_ref="1",
+            )
+            workspace = SessionWorkspace.create(Path(metadata.session_dir), metadata)
+            workspace.record_segment_text("seg-00001", 0, 1200, "大家好，开始吧。")
+
+            with patch(
+                "live_note.remote.service.apply_speaker_labels",
+                side_effect=lambda _config, _workspace, current, **_kwargs: current,
+            ):
+                final_metadata = _run_remote_postprocess(
+                    config=config,
+                    workspace=workspace,
+                    metadata=metadata,
+                    logger=workspace.session_logger(),
+                    on_progress=lambda _event: None,
+                )
+
+            structured = workspace.structured_md.read_text(encoding="utf-8")
+            transcript = workspace.transcript_md.read_text(encoding="utf-8")
+            saved_status = workspace.read_session().status
+
+        self.assertEqual("transcript_only", final_metadata.status)
+        self.assertEqual("transcript_only", saved_status)
+        self.assertIn("## 关键点", structured)
+        self.assertIn("大家好，开始吧。", transcript)
+
+    def test_run_remote_postprocess_uses_disabled_obsidian_for_final_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = replace(
+                _sample_config(root),
+                refine=RefineConfig(enabled=False, auto_after_live=False),
+            )
+            metadata = create_session_metadata(
+                config=config,
+                title="产品周会",
+                kind="meeting",
+                language="zh",
+                input_mode="live",
+                source_label="BlackHole 2ch",
+                source_ref="1",
+            )
+            workspace = SessionWorkspace.create(Path(metadata.session_dir), metadata)
+            workspace.record_segment_text("seg-00001", 0, 1200, "大家好，开始吧。")
+
+            def _fake_publish_final_outputs(*, workspace, obsidian, **_kwargs):
+                self.assertFalse(obsidian.is_enabled())
+                workspace.update_session(status="transcript_only")
+
+            with (
+                patch(
+                    "live_note.remote.service.apply_speaker_labels",
+                    side_effect=lambda _config, _workspace, current, **_kwargs: current,
+                ),
+                patch(
+                    "live_note.remote.service.publish_final_outputs",
+                    side_effect=_fake_publish_final_outputs,
+                ) as publish_mock,
+            ):
+                final_metadata = _run_remote_postprocess(
+                    config=config,
+                    workspace=workspace,
+                    metadata=metadata,
+                    logger=workspace.session_logger(),
+                    on_progress=lambda _event: None,
+                )
+
+        publish_mock.assert_called_once()
+        self.assertEqual("transcript_only", final_metadata.status)
+
+    def test_remote_runner_failure_marks_session_with_disabled_obsidian(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_config = _sample_config(root, remote_timeout_seconds=1)
+            config = replace(
+                base_config,
+                obsidian=replace(base_config.obsidian, enabled=True),
+            )
+            runner = RemoteLiveSessionRunner(
+                config=config,
+                request=LiveStartRequest(
+                    title="产品周会",
+                    kind="meeting",
+                    language="zh",
+                    source_label="BlackHole 2ch",
+                    source_ref="1",
+                ),
+                on_progress=lambda _event: None,
+            )
+            metadata = create_session_metadata(
+                config=config,
+                title="产品周会",
+                kind="meeting",
+                language="zh",
+                input_mode="live",
+                source_label="BlackHole 2ch",
+                source_ref="1",
+            )
+            metadata = replace(
+                metadata,
+                execution_target="remote",
+                remote_session_id=metadata.session_id,
+            )
+            runner.metadata = metadata
+            runner.workspace = SessionWorkspace.create(Path(metadata.session_dir), metadata)
+
+            with (
+                patch.object(
+                    RemoteLiveSessionRunner,
+                    "_run_whisper_live_backend",
+                    side_effect=RuntimeError("boom"),
+                ),
+                patch(
+                    "live_note.remote.service._mark_session_failed",
+                ) as failed_mock,
+                patch(
+                    "live_note.remote.service._attach_console_logging",
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    runner.run()
+
+        failed_mock.assert_called_once()
+        self.assertIn("obsidian", failed_mock.call_args.kwargs)
+        self.assertFalse(failed_mock.call_args.kwargs["obsidian"].is_enabled())
+
     def test_flush_funasr_stream_keeps_waiting_for_delayed_offline_final(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1738,6 +1961,92 @@ class RemoteCoordinatorTests(unittest.TestCase):
         self.assertEqual(1, len(attachments.records))
         self.assertEqual("task-post-1", attachments.records[0].remote_task_id)
         self.assertEqual("postprocess", attachments.records[0].action)
+
+    def test_remote_coordinator_publishes_local_failure_notes_after_session_started(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_config = _sample_config(root)
+            config = replace(
+                base_config,
+                obsidian=replace(base_config.obsidian, enabled=True),
+            )
+            connection = _FakeRemoteLiveConnection(
+                completed_payload={
+                    "type": "error",
+                    "session_id": "remote-1",
+                    "error": "远端后台失败",
+                }
+            )
+            coordinator = RemoteLiveCoordinator(
+                config=config,
+                title="产品周会",
+                source="1",
+                kind="meeting",
+                client=_FakeRemoteClient(connection),
+            )
+            coordinator.request_stop()
+
+            def _fake_publish_failure_outputs(*, workspace, obsidian, reason, **_kwargs):
+                self.assertEqual("remote-1", workspace.read_session().session_id)
+                self.assertTrue(obsidian.is_enabled())
+                self.assertIn("远端后台失败", reason)
+
+            with (
+                patch(
+                    "live_note.app.remote_coordinator.resolve_input_device",
+                    return_value=SimpleNamespace(index=1, name="BlackHole 2ch"),
+                ),
+                patch(
+                    "live_note.app.remote_coordinator.AudioCaptureService",
+                    _FakeAudioCaptureService,
+                ),
+                patch(
+                    "live_note.app.remote_coordinator.publish_failure_outputs",
+                    side_effect=_fake_publish_failure_outputs,
+                ) as publish_mock,
+            ):
+                with self.assertRaisesRegex(Exception, "远端后台失败"):
+                    coordinator.run()
+
+        publish_mock.assert_called_once()
+
+    def test_remote_coordinator_does_not_publish_failure_notes_on_post_start_disconnect(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_config = _sample_config(root)
+            config = replace(
+                base_config,
+                obsidian=replace(base_config.obsidian, enabled=True),
+            )
+            connection = _DisconnectAfterStartConnection()
+            coordinator = RemoteLiveCoordinator(
+                config=config,
+                title="产品周会",
+                source="1",
+                kind="meeting",
+                client=_FakeRemoteClient(connection),
+            )
+            coordinator.request_stop()
+
+            with (
+                patch(
+                    "live_note.app.remote_coordinator.resolve_input_device",
+                    return_value=SimpleNamespace(index=1, name="BlackHole 2ch"),
+                ),
+                patch(
+                    "live_note.app.remote_coordinator.AudioCaptureService",
+                    _FakeAudioCaptureService,
+                ),
+                patch(
+                    "live_note.app.remote_coordinator.publish_failure_outputs",
+                ) as publish_mock,
+            ):
+                with self.assertRaisesRegex(Exception, "远端连接已断开"):
+                    coordinator.run()
+
+        publish_mock.assert_not_called()
 
 
 def _sample_config(

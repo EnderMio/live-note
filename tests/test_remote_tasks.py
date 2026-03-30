@@ -4,9 +4,12 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from live_note.app.coordinator import create_session_metadata
+from live_note.app.journal import SessionWorkspace
 from live_note.config import (
     AppConfig,
     AudioConfig,
@@ -69,7 +72,12 @@ class RemoteTaskRegistryTests(unittest.TestCase):
 
     def test_list_tasks_returns_active_and_recent_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            config = build_config(Path(temp_dir))
+            base_config = build_config(Path(temp_dir))
+            config = replace(
+                base_config,
+                refine=RefineConfig(enabled=False, auto_after_live=False),
+                obsidian=replace(base_config.obsidian, enabled=True),
+            )
             registry = RemoteTaskRegistry(config)
             done = threading.Event()
 
@@ -700,6 +708,256 @@ class RemoteSessionServiceRecoveryTests(unittest.TestCase):
             release.set()
             recovered.tasks.shutdown()
             service.tasks.shutdown()
+
+    def test_postprocess_failure_writes_syncable_failure_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = build_config(Path(temp_dir))
+            service = RemoteSessionService(config)
+            metadata = create_session_metadata(
+                config=config,
+                title="产品周会",
+                kind="meeting",
+                language="zh",
+                input_mode="live",
+                source_label="BlackHole 2ch",
+                source_ref="1",
+            )
+            metadata = replace(metadata, status="live")
+            workspace = SessionWorkspace.create(Path(metadata.session_dir), metadata)
+            workspace.record_segment_text("seg-00001", 0, 1200, "这是实时草稿。")
+
+            with patch(
+                "live_note.remote.service.apply_speaker_labels",
+                side_effect=RuntimeError("speaker boom"),
+            ):
+                task = service._create_postprocess_task(session_id=metadata.session_id)
+                initial_payload = service.task_payload(str(task["task_id"]))
+                payload = self._wait_for_status(service, str(task["task_id"]), "failed")
+
+            transcript = workspace.transcript_md.read_text(encoding="utf-8")
+            structured = workspace.structured_md.read_text(encoding="utf-8")
+            service.tasks.shutdown()
+
+        self.assertEqual(0, initial_payload["result_version"])
+        self.assertEqual(1, payload["result_version"])
+        self.assertNotIn("这是实时草稿。", transcript)
+        self.assertIn("原文暂未成功生成", transcript)
+        self.assertIn("speaker boom", structured)
+
+    def test_postprocess_failure_uses_disabled_obsidian_for_failure_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                build_config(Path(temp_dir)),
+                refine=RefineConfig(enabled=False, auto_after_live=False),
+            )
+            service = RemoteSessionService(config)
+            metadata = create_session_metadata(
+                config=config,
+                title="产品周会",
+                kind="meeting",
+                language="zh",
+                input_mode="live",
+                source_label="BlackHole 2ch",
+                source_ref="1",
+            )
+            SessionWorkspace.create(Path(metadata.session_dir), metadata)
+
+            def _fake_publish_failure_outputs(*, obsidian, **_kwargs):
+                self.assertFalse(obsidian.is_enabled())
+
+            with (
+                patch(
+                    "live_note.remote.service._run_remote_postprocess",
+                    side_effect=RuntimeError("postprocess boom"),
+                ),
+                patch(
+                    "live_note.remote.service.publish_failure_outputs",
+                    side_effect=_fake_publish_failure_outputs,
+                ) as publish_mock,
+            ):
+                runner = service._build_postprocess_runner("task-1", metadata.session_id)
+                with self.assertRaisesRegex(RuntimeError, "postprocess boom"):
+                    runner()
+
+            service.tasks.shutdown()
+
+        publish_mock.assert_called_once()
+
+    def test_refine_runner_republishes_outputs_with_disabled_obsidian_and_preserves_status(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_config = build_config(Path(temp_dir))
+            config = replace(
+                base_config,
+                refine=RefineConfig(enabled=True, auto_after_live=True),
+                obsidian=replace(base_config.obsidian, enabled=True),
+            )
+            service = RemoteSessionService(config)
+            metadata = create_session_metadata(
+                config=config,
+                title="产品周会",
+                kind="meeting",
+                language="zh",
+                input_mode="live",
+                source_label="BlackHole 2ch",
+                source_ref="1",
+            )
+            workspace = SessionWorkspace.create(Path(metadata.session_dir), metadata)
+            workspace.record_segment_text("seg-00001", 0, 1200, "refined text")
+
+            refined_metadata = workspace.update_session(
+                status="refining",
+                transcript_source="refined",
+                refine_status="done",
+            )
+
+            def _fake_publish_final_outputs(*, workspace, obsidian, **_kwargs):
+                self.assertFalse(obsidian.is_enabled())
+                workspace.update_session(status="transcript_only")
+
+            with (
+                patch(
+                    "live_note.remote.service._run_live_refinement",
+                    return_value=refined_metadata,
+                ),
+                patch(
+                    "live_note.remote.service.apply_speaker_labels",
+                    side_effect=lambda _config, _workspace, current, **_kwargs: current,
+                ),
+                patch(
+                    "live_note.remote.service.publish_final_outputs",
+                    side_effect=_fake_publish_final_outputs,
+                ) as publish_mock,
+            ):
+                runner = service._build_refine_runner("task-1", metadata.session_id)
+                runner()
+
+            final_status = workspace.read_session().status
+            service.tasks.shutdown()
+
+        publish_mock.assert_called_once()
+        self.assertEqual("transcript_only", final_status)
+
+    def test_refine_runner_falls_back_to_existing_transcript_when_refinement_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_config = build_config(Path(temp_dir))
+            config = replace(
+                base_config,
+                refine=RefineConfig(enabled=True, auto_after_live=True),
+                obsidian=replace(base_config.obsidian, enabled=True),
+            )
+            service = RemoteSessionService(config)
+            metadata = create_session_metadata(
+                config=config,
+                title="产品周会",
+                kind="meeting",
+                language="zh",
+                input_mode="live",
+                source_label="BlackHole 2ch",
+                source_ref="1",
+            )
+            workspace = SessionWorkspace.create(Path(metadata.session_dir), metadata)
+            workspace.record_segment_text("seg-00001", 0, 1200, "existing draft")
+            workspace.write_transcript("existing transcript body\n")
+
+            def _fake_publish_final_outputs(*, workspace, metadata, obsidian, **_kwargs):
+                self.assertFalse(obsidian.is_enabled())
+                self.assertEqual("live", metadata.transcript_source)
+                self.assertEqual("failed", metadata.refine_status)
+                self.assertEqual(
+                    "existing transcript body\n",
+                    workspace.transcript_md.read_text(encoding="utf-8"),
+                )
+                workspace.update_session(status="transcript_only")
+
+            with (
+                patch(
+                    "live_note.remote.service._run_live_refinement",
+                    side_effect=RuntimeError("refine boom"),
+                ),
+                patch(
+                    "live_note.remote.service.apply_speaker_labels",
+                    side_effect=lambda _config, _workspace, current, **_kwargs: current,
+                ) as speaker_mock,
+                patch(
+                    "live_note.remote.service.publish_final_outputs",
+                    side_effect=_fake_publish_final_outputs,
+                ) as publish_mock,
+                patch(
+                    "live_note.remote.service.publish_failure_outputs",
+                    side_effect=AssertionError("refine fallback 不应发布 generic failure notes"),
+                ),
+            ):
+                task = service.request_refine(metadata.session_id, request_id="req-refine-fallback")
+                payload = self._wait_for_status(service, str(task["task_id"]), "completed")
+
+            final_metadata = workspace.read_session()
+            service.tasks.shutdown()
+
+        speaker_mock.assert_called_once()
+        publish_mock.assert_called_once()
+        self.assertEqual("live", final_metadata.transcript_source)
+        self.assertEqual("failed", final_metadata.refine_status)
+        self.assertEqual("transcript_only", final_metadata.status)
+        self.assertEqual("completed", payload["status"])
+
+    def test_import_runner_disables_obsidian_before_file_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_config = build_config(Path(temp_dir))
+            config = replace(base_config, obsidian=replace(base_config.obsidian, enabled=True))
+            service = RemoteSessionService(config)
+            uploaded_path = service._uploads_dir(request_id="req-import-obsidian") / "upload.bin"
+            uploaded_path.parent.mkdir(parents=True, exist_ok=True)
+            uploaded_path.write_bytes(b"demo")
+
+            class _FakeFileImportCoordinator:
+                def __init__(self, *, config, **_kwargs) -> None:
+                    self.config = config
+
+                def run(self) -> int:
+                    self_outer.assertFalse(self.config.obsidian.enabled)
+                    return 0
+
+            self_outer = self
+            with patch(
+                "live_note.app.coordinator.FileImportCoordinator",
+                _FakeFileImportCoordinator,
+            ):
+                runner = service._build_import_runner(
+                    task_id="task-1",
+                    uploaded_path=uploaded_path,
+                    title="导入",
+                    kind="meeting",
+                    language="zh",
+                    speaker_enabled=None,
+                    cancel_event=None,
+                )
+                runner()
+
+            service.tasks.shutdown()
+
+    def test_retranscribe_runner_disables_obsidian_before_retranscribe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_config = build_config(Path(temp_dir))
+            config = replace(base_config, obsidian=replace(base_config.obsidian, enabled=True))
+            service = RemoteSessionService(config)
+
+            def _fake_retranscribe_session(config, session_id, **_kwargs) -> int:
+                self.assertFalse(config.obsidian.enabled)
+                self.assertEqual("session-1", session_id)
+                return 0
+
+            with patch(
+                "live_note.remote.service.retranscribe_session",
+                side_effect=_fake_retranscribe_session,
+            ) as retranscribe_mock:
+                runner = service._build_retranscribe_runner("task-1", "session-1")
+                runner()
+
+            service.tasks.shutdown()
+
+        retranscribe_mock.assert_called_once()
 
     def test_duplicate_import_request_id_does_not_write_second_upload(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

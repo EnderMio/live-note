@@ -20,6 +20,11 @@ class GuiPalette:
     accent_text: str
     selection_bg: str
     progress_trough: str
+    meter_no_signal: str
+    meter_low: str
+    meter_ok: str
+    meter_high: str
+    meter_clipping: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +53,11 @@ def default_gui_palette() -> GuiPalette:
         accent_text="#FFFFFF",
         selection_bg="#E7EEF8",
         progress_trough="#DCE6F2",
+        meter_no_signal="#C7D0DB",
+        meter_low="#8DA3B8",
+        meter_ok="#6E9D79",
+        meter_high="#C99A56",
+        meter_clipping="#C56A68",
     )
 
 
@@ -262,6 +272,27 @@ def apply_visual_theme(root: Tk) -> tuple[GuiPalette, GuiMetrics]:
         lightcolor=palette.accent,
         darkcolor=palette.accent,
     )
+    for name, color in [
+        ("NoSignal", palette.meter_no_signal),
+        ("Low", palette.meter_low),
+        ("OK", palette.meter_ok),
+        ("High", palette.meter_high),
+        ("Clipping", palette.meter_clipping),
+    ]:
+        style.configure(
+            f"InputMeter.{name}.Horizontal.TProgressbar",
+            background=color,
+            troughcolor=palette.progress_trough,
+            borderwidth=0,
+            lightcolor=color,
+            darkcolor=color,
+        )
+        style.configure(
+            f"InputMeter.{name}.TLabel",
+            background=palette.surface_bg,
+            foreground=color,
+            font=_body_font("bold", 10),
+        )
     style.configure(
         "App.Vertical.TScrollbar",
         background=palette.surface_alt_bg,

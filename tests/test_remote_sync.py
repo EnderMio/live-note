@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from live_note.app.remote_sync import apply_remote_artifacts
+from live_note.app.remote_sync import apply_remote_artifacts, sync_remote_transcript_snapshot
 from live_note.config import (
     AppConfig,
     AudioConfig,
@@ -19,6 +19,33 @@ from live_note.domain import SessionMetadata, TranscriptEntry
 
 
 class RemoteSyncTests(unittest.TestCase):
+    def test_sync_remote_transcript_snapshot_keeps_running_draft_local_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = _sample_config(root)
+            metadata = _sample_metadata(root, "remote-live-1")
+            entries = [
+                TranscriptEntry(
+                    segment_id="seg-00001",
+                    started_ms=0,
+                    ended_ms=1200,
+                    text="大家好，开始吧。",
+                )
+            ]
+
+            with patch(
+                "live_note.app.remote_sync.try_sync_note",
+                side_effect=AssertionError("远端 snapshot 不应同步到 Obsidian"),
+            ):
+                local_metadata = sync_remote_transcript_snapshot(config, metadata, entries)
+
+            transcript = (
+                root / ".live-note" / "sessions" / "remote-live-1" / "transcript.md"
+            ).read_text(encoding="utf-8")
+
+        self.assertEqual("remote-live-1", local_metadata.session_id)
+        self.assertIn("大家好，开始吧。", transcript)
+
     def test_apply_remote_artifacts_writes_remote_note_contents_without_local_republish(
         self,
     ) -> None:

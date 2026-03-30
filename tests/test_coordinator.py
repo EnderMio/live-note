@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import tempfile
 import threading
@@ -16,12 +17,13 @@ from live_note.app.coordinator import (
     SEGMENT_STOP,
     FileImportCoordinator,
     SessionCoordinator,
+    _process_segment,
     finalize_session,
     retranscribe_session,
 )
 from live_note.app.journal import SessionWorkspace, list_sessions
 from live_note.app.task_errors import TaskCancelledError
-from live_note.audio.capture import InputDevice
+from live_note.audio.capture import InputDevice, InputLevel
 from live_note.audio.convert import AudioImportError
 from live_note.config import (
     AppConfig,
@@ -57,6 +59,27 @@ class CoordinatorFailureTests(unittest.TestCase):
 
         self.assertTrue(config.refine.auto_after_live)
         self.assertFalse(runner.config.refine.auto_after_live)
+
+    def test_session_coordinator_input_level_callback_emits_progress_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events = []
+            runner = SessionCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+                on_progress=events.append,
+            )
+
+            callback = runner._build_input_level_callback("session-1")
+            callback(InputLevel(normalized=0.52, peak=0.52, clipping=False))
+
+        self.assertEqual("input_level", events[0].stage)
+        self.assertEqual("OK", events[0].message)
+        self.assertEqual("session-1", events[0].session_id)
+        self.assertEqual(52, events[0].current)
+        self.assertEqual(100, events[0].total)
 
     def test_live_coordinator_emits_capture_finished_before_segment_queue_drains(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -345,6 +368,46 @@ class CoordinatorFailureTests(unittest.TestCase):
                 )
 
         self.assertEqual([0, 0], prompt_lengths)
+
+    def test_process_segment_keeps_live_draft_local_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = SessionWorkspace.create(
+                root / ".live-note" / "sessions" / "session-1",
+                replace(
+                    _sample_metadata(root / ".live-note" / "sessions" / "session-1"),
+                    session_dir=str(root / ".live-note" / "sessions" / "session-1"),
+                ),
+            )
+            metadata = workspace.read_session()
+            pending = _pending_segment(root, "seg-00001", 0, 2000)
+            obsidian = _FakeObsidianClient()
+            entries: list[TranscriptEntry] = []
+
+            with (
+                patch(
+                    "live_note.app.coordinator._transcribe_segment_text",
+                    return_value="大家好，开始吧。",
+                ),
+                patch(
+                    "live_note.app.coordinator.try_sync_note",
+                    side_effect=AssertionError("live 片段不应同步到 Obsidian"),
+                ),
+            ):
+                result = _process_segment(
+                    pending=pending,
+                    workspace=workspace,
+                    metadata=metadata,
+                    obsidian=obsidian,
+                    whisper_client=object(),
+                    logger=logging.getLogger("test.coordinator"),
+                    entries=entries,
+                    live_status="live",
+                )
+
+            self.assertTrue(result)
+            self.assertEqual(1, len(entries))
+            self.assertIn("大家好，开始吧。", workspace.transcript_md.read_text(encoding="utf-8"))
 
     def test_live_coordinator_marks_session_failed_when_startup_step_raises(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

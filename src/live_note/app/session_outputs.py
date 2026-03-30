@@ -9,6 +9,7 @@ from live_note.obsidian.renderer import (
     build_structured_failure_note,
     build_structured_note,
     build_structured_pending_note,
+    build_transcript_failure_note,
     build_transcript_note,
 )
 from live_note.review import detect_review_items
@@ -27,7 +28,40 @@ def write_initial_transcript(
 ) -> None:
     initial_note = build_transcript_note(metadata, [], status=status)
     workspace.write_transcript(initial_note)
-    try_sync_note(obsidian, metadata.transcript_note_path, initial_note, logger, "原文初始笔记")
+
+
+def publish_failure_outputs(
+    workspace: SessionWorkspace,
+    metadata: SessionMetadata,
+    obsidian: ObsidianClient,
+    logger: logging.Logger,
+    *,
+    reason: str,
+) -> SessionMetadata:
+    failed_metadata = workspace.update_session(status="failed")
+    transcript_body = build_transcript_failure_note(failed_metadata, reason)
+    structured_body = build_structured_failure_note(
+        failed_metadata,
+        transcript_note_path=failed_metadata.transcript_note_path,
+        reason=reason,
+    )
+    workspace.write_transcript(transcript_body)
+    workspace.write_structured(structured_body)
+    try_sync_note(
+        obsidian,
+        failed_metadata.transcript_note_path,
+        transcript_body,
+        logger,
+        "原文失败笔记",
+    )
+    try_sync_note(
+        obsidian,
+        failed_metadata.structured_note_path,
+        structured_body,
+        logger,
+        "整理失败笔记",
+    )
+    return failed_metadata
 
 
 def publish_final_outputs(
@@ -62,13 +96,7 @@ def publish_final_outputs(
         session_audio_path=session_audio_path,
     )
     workspace.write_transcript(final_transcript)
-    try_sync_note(
-        obsidian,
-        metadata.transcript_note_path,
-        final_transcript,
-        logger,
-        "原文最终笔记",
-    )
+    try_sync_note(obsidian, metadata.transcript_note_path, final_transcript, logger, "原文最终笔记")
 
     _emit_progress(
         on_progress,

@@ -10,8 +10,10 @@ from unittest.mock import Mock, patch
 from live_note.app.journal import SessionWorkspace
 from live_note.app.session_outputs import (
     build_structured_output,
+    publish_failure_outputs,
     publish_final_outputs,
     try_sync_note,
+    write_initial_transcript,
 )
 from live_note.config import LlmConfig, ObsidianConfig
 from live_note.domain import SessionMetadata, TranscriptEntry
@@ -121,6 +123,75 @@ class SessionOutputsTests(unittest.TestCase):
         self.assertIn("今天讲随机梯度下降。", transcript)
         self.assertIn("## 关键点", structured)
         self.assertTrue(progress.called)
+
+    def test_write_initial_transcript_does_not_sync_obsidian_live_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / self.metadata.session_id
+            metadata = replace(self.metadata, session_dir=str(session_dir), status="live")
+            workspace = SessionWorkspace.create(session_dir, metadata)
+            obsidian = Mock(spec=ObsidianClient)
+
+            write_initial_transcript(
+                workspace=workspace,
+                metadata=metadata,
+                obsidian=obsidian,
+                logger=logging.getLogger("test.session_outputs"),
+                status="live",
+            )
+
+            transcript = workspace.transcript_md.read_text(encoding="utf-8")
+
+        obsidian.put_note.assert_not_called()
+        self.assertIn('status: "live"', transcript)
+
+    def test_publish_final_outputs_syncs_transcript_and_structured_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / self.metadata.session_id
+            metadata = replace(self.metadata, session_dir=str(session_dir))
+            workspace = SessionWorkspace.create(session_dir, metadata)
+            workspace.record_segment_text("seg-00001", 0, 1200, "今天讲随机梯度下降。")
+            llm_client = OpenAiCompatibleClient(
+                LlmConfig(base_url="https://api.openai.com/v1", model="gpt-4.1-mini", enabled=False)
+            )
+            obsidian = Mock(spec=ObsidianClient)
+
+            with patch("live_note.app.session_outputs.detect_review_items", return_value=[]):
+                publish_final_outputs(
+                    workspace=workspace,
+                    metadata=metadata,
+                    obsidian=obsidian,
+                    llm_client=llm_client,
+                    logger=logging.getLogger("test.session_outputs"),
+                )
+
+        self.assertEqual(2, obsidian.put_note.call_count)
+        self.assertEqual(metadata.transcript_note_path, obsidian.put_note.call_args_list[0].args[0])
+        self.assertEqual(metadata.structured_note_path, obsidian.put_note.call_args_list[1].args[0])
+
+    def test_publish_failure_outputs_writes_minimal_failure_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = Path(temp_dir) / self.metadata.session_id
+            metadata = replace(self.metadata, session_dir=str(session_dir), status="live")
+            workspace = SessionWorkspace.create(session_dir, metadata)
+            workspace.record_segment_text("seg-00001", 0, 1200, "这是实时草稿。")
+            obsidian = Mock(spec=ObsidianClient)
+
+            failed_metadata = publish_failure_outputs(
+                workspace=workspace,
+                metadata=metadata,
+                obsidian=obsidian,
+                logger=logging.getLogger("test.session_outputs"),
+                reason="LLM 请求失败",
+            )
+
+            transcript = workspace.transcript_md.read_text(encoding="utf-8")
+            structured = workspace.structured_md.read_text(encoding="utf-8")
+
+        self.assertEqual("failed", failed_metadata.status)
+        self.assertEqual(2, obsidian.put_note.call_count)
+        self.assertNotIn("这是实时草稿。", transcript)
+        self.assertIn("原文暂未成功生成", transcript)
+        self.assertIn("LLM 请求失败", structured)
 
     def test_build_structured_output_returns_failure_note_when_llm_errors(self) -> None:
         llm_client = OpenAiCompatibleClient(

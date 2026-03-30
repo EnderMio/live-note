@@ -5,6 +5,7 @@ import queue
 import threading
 import time
 from array import array
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from live_note.config import AudioConfig
@@ -21,6 +22,13 @@ class InputDevice:
     name: str
     max_input_channels: int
     default_samplerate: float
+
+
+@dataclass(frozen=True, slots=True)
+class InputLevel:
+    normalized: float
+    peak: float
+    clipping: bool
 
 
 def _load_sounddevice():
@@ -88,6 +96,34 @@ def downmix_pcm16(data: bytes, channels: int) -> bytes:
     return mixed.tobytes()
 
 
+def measure_input_level(pcm16: bytes) -> InputLevel:
+    if not pcm16:
+        return InputLevel(normalized=0.0, peak=0.0, clipping=False)
+    samples = array("h")
+    samples.frombytes(pcm16)
+    if not samples:
+        return InputLevel(normalized=0.0, peak=0.0, clipping=False)
+    peak_sample = max(abs(sample) for sample in samples)
+    peak = min(peak_sample / 32767.0, 1.0)
+    return InputLevel(
+        normalized=peak,
+        peak=peak,
+        clipping=peak_sample >= 32700,
+    )
+
+
+def describe_input_level(level: InputLevel) -> str:
+    if level.clipping or level.peak >= 0.98:
+        return "Clipping"
+    if level.normalized < 0.015:
+        return "No signal"
+    if level.normalized < 0.18:
+        return "Low"
+    if level.normalized < 0.72:
+        return "OK"
+    return "High"
+
+
 class AudioCaptureService:
     def __init__(
         self,
@@ -102,6 +138,8 @@ class AudioCaptureService:
         self._pause_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._error: Exception | None = None
+        self._level_callback: Callable[[InputLevel], None] | None = None
+        self._smoothed_level = 0.0
 
     @property
     def error(self) -> Exception | None:
@@ -128,6 +166,9 @@ class AudioCaptureService:
         if self._thread:
             self._thread.join(timeout=timeout)
 
+    def set_level_callback(self, callback: Callable[[InputLevel], None] | None) -> None:
+        self._level_callback = callback
+
     @property
     def is_paused(self) -> bool:
         return self._pause_event.is_set()
@@ -143,10 +184,13 @@ class AudioCaptureService:
             if status:
                 self._error = AudioCaptureError(str(status))
             if self._pause_event.is_set():
+                self._smoothed_level = 0.0
+                self._emit_input_level(b"")
                 if self._stop_event.is_set():
                     raise sd.CallbackStop()
                 return
             mono_pcm16 = downmix_pcm16(bytes(indata), channels)
+            self._emit_input_level(mono_pcm16)
             duration_ms = int(frames * 1000 / self.config.sample_rate)
             frame = AudioFrame(
                 started_ms=next_started_ms,
@@ -183,3 +227,20 @@ class AudioCaptureService:
         except Exception as exc:  # pragma: no cover - 真实设备异常不稳定
             if self._error is None:
                 self._error = exc
+
+    def _emit_input_level(self, pcm16: bytes) -> None:
+        if self._level_callback is None:
+            return
+        measured = measure_input_level(pcm16)
+        if measured.normalized >= self._smoothed_level:
+            smoothed = measured.normalized
+        else:
+            smoothed = max(measured.normalized, self._smoothed_level * 0.85)
+        self._smoothed_level = smoothed
+        self._level_callback(
+            InputLevel(
+                normalized=smoothed,
+                peak=measured.peak,
+                clipping=measured.clipping,
+            )
+        )

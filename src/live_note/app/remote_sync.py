@@ -55,14 +55,6 @@ def sync_remote_transcript_snapshot(
         )
     transcript = build_transcript_note(metadata, entries, status=metadata.status)
     workspace.write_transcript(transcript)
-    logger = workspace.session_logger()
-    try_sync_note(
-        ObsidianClient(config.obsidian),
-        metadata.transcript_note_path,
-        transcript,
-        logger,
-        "远端导入原文快照",
-    )
     return workspace.read_session()
 
 

@@ -37,9 +37,7 @@ def build_transcript_note(
         "## 转写记录",
     ]
     if entries:
-        lines.extend(
-            f"- [{format_ms(entry.started_ms)}] {_entry_text(entry)}" for entry in entries
-        )
+        lines.extend(f"- [{format_ms(entry.started_ms)}] {_entry_text(entry)}" for entry in entries)
     else:
         lines.append("- 等待音频输入或文件转写…")
     lines.extend(
@@ -79,6 +77,53 @@ def build_transcript_note(
                 lines.append(line)
         else:
             lines.append("- 未发现明显异常段落。")
+    return "\n".join(lines) + "\n"
+
+
+def build_transcript_failure_note(metadata: SessionMetadata, reason: str) -> str:
+    lines = [
+        "---",
+        f"title: {yaml_quote(metadata.note_stem)}",
+        f"session_title: {yaml_quote(metadata.title)}",
+        f"session_id: {yaml_quote(metadata.session_id)}",
+        f"started_at: {yaml_quote(metadata.started_at)}",
+        f"kind: {yaml_quote(metadata.kind)}",
+        f"input_mode: {yaml_quote(metadata.input_mode)}",
+        f"source_label: {yaml_quote(metadata.source_label)}",
+        f"source_ref: {yaml_quote(metadata.source_ref)}",
+        'status: "failed"',
+        f"transcript_source: {yaml_quote(metadata.transcript_source)}",
+        f"refine_status: {yaml_quote(metadata.refine_status)}",
+        f"execution_target: {yaml_quote(metadata.execution_target)}",
+        f"speaker_status: {yaml_quote(metadata.speaker_status)}",
+        "tags:",
+        "  - live-note/transcript",
+        "  - live-note/failed",
+        "---",
+        "",
+        f"# {metadata.title}",
+        "",
+        "## 转写记录",
+        "",
+        "原文暂未成功生成。",
+        "",
+        "## 待跟进",
+        "",
+        f"- {compact_text(reason)}",
+        "",
+        "## 会话信息",
+        f"- Session ID: `{metadata.session_id}`",
+        f"- 类型: `{metadata.kind}`",
+        f"- 输入模式: `{metadata.input_mode}`",
+        f"- 输入源: `{metadata.source_label}`",
+        f"- 语言: `{metadata.language}`",
+        f"- 转写来源: `{metadata.transcript_source}`",
+        f"- 精修状态: `{metadata.refine_status}`",
+        f"- 运行位置: `{metadata.execution_target}`",
+        f"- 说话人区分: `{metadata.speaker_status}`",
+    ]
+    if metadata.remote_session_id:
+        lines.append(f"- 远端会话: `{metadata.remote_session_id}`")
     return "\n".join(lines) + "\n"
 
 

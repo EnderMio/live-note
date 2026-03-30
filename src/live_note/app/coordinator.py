@@ -5,7 +5,7 @@ import queue
 import shutil
 import threading
 import wave
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -15,6 +15,8 @@ from typing import Any
 from live_note.audio.capture import (
     AudioCaptureError,
     AudioCaptureService,
+    InputLevel,
+    describe_input_level,
     resolve_input_device,
 )
 from live_note.audio.convert import (
@@ -51,6 +53,7 @@ from live_note.utils import iso_now, slugify_filename
 from .events import ProgressCallback, ProgressEvent
 from .journal import SessionWorkspace, build_workspace, session_root
 from .session_outputs import (
+    publish_failure_outputs,
     publish_final_outputs,
     try_sync_note,
     write_initial_transcript,
@@ -201,6 +204,19 @@ class SessionCoordinator:
     def is_paused(self) -> bool:
         return self._pause_requested
 
+    def _build_input_level_callback(self, session_id: str) -> Callable[[InputLevel], None]:
+        def callback(level: InputLevel) -> None:
+            _emit_progress(
+                self.on_progress,
+                "input_level",
+                describe_input_level(level),
+                session_id=session_id,
+                current=max(0, min(100, round(level.normalized * 100))),
+                total=100,
+            )
+
+        return callback
+
     def run(self) -> int:
         device = resolve_input_device(self.source)
         metadata = create_session_metadata(
@@ -245,6 +261,8 @@ class SessionCoordinator:
             segment_queue: queue.Queue[PendingSegment | object] = queue.Queue(maxsize=32)
             segmenter = SpeechSegmenter(self.config.audio)
             capture = AudioCaptureService(self.config.audio, device, frame_queue)
+            if hasattr(capture, "set_level_callback"):
+                capture.set_level_callback(self._build_input_level_callback(metadata.session_id))
 
             segment_thread = threading.Thread(
                 target=self._segment_loop,
@@ -386,6 +404,7 @@ class SessionCoordinator:
         except BaseException as exc:
             _mark_session_failed(
                 workspace=workspace,
+                obsidian=obsidian,
                 logger=logger,
                 label="实时会话",
                 exc=exc,
@@ -722,6 +741,7 @@ class FileImportCoordinator:
         except BaseException as exc:
             _mark_session_failed(
                 workspace=workspace,
+                obsidian=obsidian,
                 logger=logger,
                 label="导入会话",
                 exc=exc,
@@ -1075,13 +1095,20 @@ def sync_session_notes(
 def _mark_session_failed(
     *,
     workspace: SessionWorkspace,
+    obsidian: ObsidianClient,
     logger: logging.Logger,
     label: str,
     exc: BaseException,
     on_progress: ProgressCallback | None,
 ) -> None:
     try:
-        metadata = workspace.update_session(status="failed")
+        metadata = publish_failure_outputs(
+            workspace=workspace,
+            metadata=workspace.read_session(),
+            obsidian=obsidian,
+            logger=logger,
+            reason=str(exc),
+        )
     except Exception:
         metadata = workspace.read_session()
     logger.exception("%s失败: %s", label, exc)
@@ -1557,13 +1584,6 @@ def _process_segment(
             context_entries.append(entry)
         content = build_transcript_note(metadata, list(entries), status=live_status)
         workspace.write_transcript(content)
-        try_sync_note(
-            obsidian,
-            metadata.transcript_note_path,
-            content,
-            logger,
-            f"原文片段 {pending.segment_id}",
-        )
         return True
     except Exception as exc:
         workspace.record_segment_error(

@@ -115,6 +115,7 @@ class LiveNoteGui:
         self.live_speaker_enabled_var = tk.BooleanVar(value=False)
         self.live_stop_after_minutes_var = tk.StringVar(value="")
         self.live_device_var = tk.StringVar()
+        self.live_input_level_var = tk.StringVar(value="No signal")
         self._live_control = LiveRecordingController(
             scheduler=self.root,
             on_auto_stop=self._on_live_auto_stop,
@@ -529,6 +530,38 @@ class LiveNoteGui:
             state="disabled",
         )
         self.pause_live_button.grid(row=0, column=2, padx=(8, 0))
+
+        input_meter = ttk.Frame(parent)
+        input_meter.grid(
+            row=4,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(metrics.inline_gap, 0),
+        )
+        input_meter.columnconfigure(1, weight=1)
+        ttk.Label(input_meter, text="Input", style="Subtle.TLabel").grid(
+            row=0,
+            column=0,
+            sticky="w",
+        )
+        self.live_input_meter = ttk.Progressbar(
+            input_meter,
+            mode="determinate",
+            maximum=100,
+            length=150,
+            style="InputMeter.NoSignal.Horizontal.TProgressbar",
+        )
+        self.live_input_meter.grid(row=0, column=1, sticky="w", padx=(10, 8))
+        self.live_input_meter_status = ttk.Label(
+            input_meter,
+            textvariable=self.live_input_level_var,
+            style="InputMeter.NoSignal.TLabel",
+            anchor="w",
+            width=10,
+        )
+        self.live_input_meter_status.grid(row=0, column=2, sticky="w")
+        self._reset_live_input_meter()
 
     def _build_import_tab(self, parent: ttk.Frame) -> None:
         metrics = self._theme_metrics()
@@ -1595,6 +1628,7 @@ class LiveNoteGui:
             return
         device = self.live_devices[index]
         task_id = self._next_task_id()
+        self._reset_live_input_meter()
         try:
             runner = self.service.create_live_coordinator(
                 title=title,
@@ -2223,6 +2257,11 @@ class LiveNoteGui:
         )
 
     def _handle_live_progress(self, event: ProgressEvent) -> None:
+        if event.stage == "input_level":
+            if event.task_id != self.current_live_task_id:
+                return
+            self._set_live_input_meter(level=event.current or 0, state=event.message or "No signal")
+            return
         if event.stage == "capture_finished" and event.task_id == self.current_live_task_id:
             self._append_log(event.message)
             self._detach_live_task(event.session_id)
@@ -2279,6 +2318,7 @@ class LiveNoteGui:
         self.current_worker = None
         self.start_live_button.configure(state="normal")
         self._reset_live_controls()
+        self._reset_live_input_meter()
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
         self._update_idle_status()
@@ -2312,6 +2352,7 @@ class LiveNoteGui:
         self.current_worker = None
         self.start_live_button.configure(state="normal")
         self._reset_live_controls()
+        self._reset_live_input_meter()
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
         self._update_idle_status()
@@ -2391,6 +2432,23 @@ class LiveNoteGui:
             return
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
+
+    def _set_live_input_meter(self, *, level: int, state: str) -> None:
+        style_name = _input_meter_style_name(state)
+        if hasattr(self, "live_input_level_var"):
+            self.live_input_level_var.set(state)
+        meter = getattr(self, "live_input_meter", None)
+        if meter is not None:
+            meter.stop()
+            meter.configure(mode="determinate")
+            meter["value"] = max(0, min(100, level))
+            meter.configure(style=f"InputMeter.{style_name}.Horizontal.TProgressbar")
+        status = getattr(self, "live_input_meter_status", None)
+        if status is not None:
+            status.configure(style=f"InputMeter.{style_name}.TLabel")
+
+    def _reset_live_input_meter(self) -> None:
+        self._set_live_input_meter(level=0, state="No signal")
 
     def _set_queue_progress_state(
         self,
@@ -2559,6 +2617,16 @@ class LiveNoteGui:
             (record for record in getattr(self, "queue_records", []) if record.task_id == task_id),
             None,
         )
+
+
+def _input_meter_style_name(state: str) -> str:
+    return {
+        "No signal": "NoSignal",
+        "Low": "Low",
+        "OK": "OK",
+        "High": "High",
+        "Clipping": "Clipping",
+    }.get(state, "NoSignal")
 
 
 def _entry_row(
