@@ -192,9 +192,7 @@ class RemoteClient:
         try:
             from websockets.sync.client import connect
         except ImportError as exc:
-            raise RemoteClientError(
-                "缺少 websockets 依赖，先运行 pip install -e ."
-            ) from exc
+            raise RemoteClientError("缺少 websockets 依赖，先运行 pip install -e .") from exc
 
         headers = {}
         if self.config.api_token:
@@ -204,6 +202,8 @@ class RemoteClient:
             additional_headers=headers or None,
             open_timeout=self.config.timeout_seconds,
             close_timeout=self.config.timeout_seconds,
+            ping_interval=self.config.ws_ping_interval_seconds,
+            ping_timeout=self.config.ws_ping_timeout_seconds,
         )
         websocket.send(json.dumps({"type": "start", **payload}))
         return RemoteLiveConnection(websocket)

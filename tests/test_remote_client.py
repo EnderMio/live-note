@@ -98,12 +98,41 @@ class RemoteClientTests(unittest.TestCase):
             {"Authorization": "Bearer secret-token"},
             connect_calls[0]["additional_headers"],
         )
+        self.assertEqual(20, connect_calls[0]["ping_interval"])
+        self.assertEqual(20, connect_calls[0]["ping_timeout"])
         self.assertEqual(
             {"type": "start", "title": "产品周会"},
             json.loads(str(fake_socket.sent[0])),
         )
         self.assertEqual({"type": "pause"}, json.loads(str(fake_socket.sent[1])))
         self.assertTrue(fake_socket.closed)
+
+    def test_connect_live_uses_explicit_ping_settings_from_config(self) -> None:
+        fake_socket = _FakeWebSocket([])
+        connect_calls: list[dict[str, object]] = []
+        client_module = types.ModuleType("websockets.sync.client")
+
+        def fake_connect(url: str, **kwargs):
+            connect_calls.append({"url": url, **kwargs})
+            return fake_socket
+
+        client_module.connect = fake_connect
+        config = RemoteConfig(
+            enabled=True,
+            base_url="https://remote.example.com",
+            api_token="secret-token",
+            timeout_seconds=9,
+            ws_ping_interval_seconds=45,
+            ws_ping_timeout_seconds=60,
+        )
+        client = RemoteClient(config)
+
+        with patch.dict(sys.modules, {"websockets.sync.client": client_module}):
+            with client.connect_live({"title": "产品周会"}):
+                pass
+
+        self.assertEqual(45, connect_calls[0]["ping_interval"])
+        self.assertEqual(60, connect_calls[0]["ping_timeout"])
 
     def test_get_session_artifacts_quotes_non_ascii_session_id(self) -> None:
         config = RemoteConfig(

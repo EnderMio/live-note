@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from live_note.app.journal import SessionWorkspace
 from live_note.domain import SessionMetadata
-from live_note.remote.server import build_session_artifacts_payload
+from live_note.remote.server import build_session_artifacts_payload, serve_remote_app
 
 
 class RemoteServerTests(unittest.TestCase):
@@ -40,6 +43,56 @@ class RemoteServerTests(unittest.TestCase):
         self.assertEqual("Speaker 1", payload["entries"][0]["speaker_label"])
         self.assertEqual("# 原文\n", payload["transcript_content"])
         self.assertEqual("# 整理\n", payload["structured_content"])
+
+    def test_serve_remote_app_passes_explicit_websocket_ping_settings_to_uvicorn(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "[audio]",
+                        "",
+                        "[import]",
+                        "",
+                        "[refine]",
+                        "",
+                        "[whisper]",
+                        'binary = "/Users/demo/whisper-server"',
+                        'model = "./model.bin"',
+                        "",
+                        "[obsidian]",
+                        "enabled = false",
+                        'base_url = "https://127.0.0.1:27124"',
+                        'transcript_dir = "Sessions/Transcripts"',
+                        'structured_dir = "Sessions/Summaries"',
+                        "",
+                        "[llm]",
+                        "enabled = false",
+                        'base_url = "https://api.openai.com/v1"',
+                        'model = "gpt-4.1-mini"',
+                        "",
+                        "[serve]",
+                        'host = "0.0.0.0"',
+                        "port = 18765",
+                        'api_token = "server-token"',
+                        "ws_ping_interval_seconds = 33",
+                        "ws_ping_timeout_seconds = 47",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (root / "model.bin").write_bytes(b"model")
+
+            fake_uvicorn = types.ModuleType("uvicorn")
+
+            with patch.dict(sys.modules, {"uvicorn": fake_uvicorn}):
+                with patch.object(fake_uvicorn, "run", create=True) as run_mock:
+                    exit_code = serve_remote_app(config_path)
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(33, run_mock.call_args.kwargs["ws_ping_interval"])
+        self.assertEqual(47, run_mock.call_args.kwargs["ws_ping_timeout"])
 
 
 def _sample_metadata(session_dir: Path) -> SessionMetadata:

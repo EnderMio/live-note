@@ -46,5 +46,7 @@ def serve_remote_app(config_path: Path) -> int:
         host=config.serve.host,
         port=config.serve.port,
         log_level="info",
+        ws_ping_interval=config.serve.ws_ping_interval_seconds,
+        ws_ping_timeout=config.serve.ws_ping_timeout_seconds,
     )
     return 0
