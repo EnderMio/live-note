@@ -1119,6 +1119,35 @@ class GuiTaskTests(unittest.TestCase):
         gui._cancel_live_auto_stop.assert_called_once_with()
         gui._append_log.assert_called_once_with("已到自动停止时间，等待当前片段收尾。")
 
+    def test_on_close_uses_stopping_prompt_after_stop_requested(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.root = SimpleNamespace(destroy=Mock())
+        gui._task_state = SimpleNamespace(
+            busy=True,
+            current_task_id="task-1",
+            current_task_label="实时录音",
+            current_task_session_id="session-1",
+            current_live_task_id="task-1",
+            queue_current_task_id=None,
+            queue_current_task_label=None,
+            background_tasks={},
+            background_task_sessions={},
+            foreground_live_detachable=False,
+            foreground_detached_to_background=False,
+        )
+        gui._live_control = SimpleNamespace(runner=object(), is_stopping=True)
+        gui.queue_worker = None
+        gui._queued_count = Mock(return_value=0)
+
+        with patch("live_note.app.gui.messagebox.askyesno", return_value=True) as askyesno_mock:
+            gui._on_close()
+
+        askyesno_mock.assert_called_once_with(
+            "退出",
+            "当前录音正在停止中。关闭窗口后会继续等待后台收尾。是否继续关闭窗口？",
+        )
+        gui.root.destroy.assert_called_once_with()
+
     def test_summary_supports_refine_when_live_segments_can_be_reconstructed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             session_dir = Path(temp_dir)

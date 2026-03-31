@@ -2540,6 +2540,14 @@ class LiveNoteGui:
 
     def _on_close(self) -> None:
         if self.busy and self.current_live_runner is not None:
+            if self._live_controller().is_stopping:
+                if not messagebox.askyesno(
+                    "退出",
+                    "当前录音正在停止中。关闭窗口后会继续等待后台收尾。是否继续关闭窗口？",
+                ):
+                    return
+                self.root.destroy()
+                return
             if messagebox.askyesno("退出", "当前仍在录音。要先发送停止请求再退出吗？"):
                 self._request_live_stop()
                 return
