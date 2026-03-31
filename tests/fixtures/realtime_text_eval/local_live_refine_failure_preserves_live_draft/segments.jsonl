@@ -1,0 +1,2 @@
+{"kind": "segment_transcribed", "segment_id": "seg-00001", "started_ms": 0, "ended_ms": 1200, "created_at": "2026-03-30T10:00:01+00:00", "text": "Draft intro line.", "wav_path": null, "error": null, "speaker_label": null}
+{"kind": "segment_transcribed", "segment_id": "seg-00002", "started_ms": 1200, "ended_ms": 2600, "created_at": "2026-03-30T10:00:02+00:00", "text": "Draft fallback action.", "wav_path": null, "error": null, "speaker_label": null}
