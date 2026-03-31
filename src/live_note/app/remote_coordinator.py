@@ -173,12 +173,15 @@ class RemoteLiveCoordinator:
                         try:
                             item = frame_queue.get(timeout=0.1)
                         except queue.Empty:
-                            if stopping_capture and not capture.is_alive and not stop_sent:
+                            if stopping_capture and not stop_sent:
                                 self._flush_audio_batch(connection, batcher)
                                 connection.send_control("stop")
                                 stop_sent = True
                             elif not stop_sent:
                                 self._flush_audio_batch(connection, batcher)
+                            self._drain_remote_events(done_event)
+                            continue
+                        if isinstance(item, AudioFrame) and stop_sent:
                             self._drain_remote_events(done_event)
                             continue
                         if isinstance(item, AudioFrame) and not capture.is_paused:

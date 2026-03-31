@@ -154,6 +154,27 @@ class _DisconnectAfterStartConnection(_FakeRemoteLiveConnection):
         return
 
 
+class _StopMustArrivePromptlyConnection(_FakeRemoteLiveConnection):
+    def __init__(self, *, wait_seconds: float = 0.2) -> None:
+        super().__init__()
+        self._wait_seconds = wait_seconds
+
+    def iter_events(self):
+        yield {
+            "type": "session_started",
+            "session_id": "remote-1",
+            "started_at": "2026-03-18T10:00:00+00:00",
+            "title": "产品周会",
+            "kind": "meeting",
+            "language": "zh",
+            "source_label": "BlackHole 2ch",
+            "source_ref": "1",
+        }
+        if not self._stop_received.wait(self._wait_seconds):
+            raise RuntimeError("stop not sent promptly")
+        yield dict(self._completed_payload)
+
+
 class _FakeStartupWebSocket:
     def __init__(self, payload: dict[str, object]) -> None:
         self._payload = payload
@@ -1812,6 +1833,49 @@ class RemoteCoordinatorTests(unittest.TestCase):
                 exit_code = coordinator.run()
 
         self.assertEqual(0, exit_code)
+
+    def test_remote_coordinator_sends_stop_without_waiting_for_capture_thread_exit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            connection = _StopMustArrivePromptlyConnection(wait_seconds=0.2)
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+                client=_FakeRemoteClient(connection),
+            )
+
+            class _StickyStopAudioCaptureService(_FakeAudioCaptureService):
+                def start(self) -> None:
+                    self._alive = True
+                    self.frame_queue.put(AudioFrame(started_ms=0, ended_ms=120, pcm16=b"a" * 8))
+                    coordinator.request_stop()
+
+                def stop(self) -> None:
+                    return None
+
+                @property
+                def is_alive(self) -> bool:
+                    return True
+
+            with (
+                patch(
+                    "live_note.app.remote_coordinator.resolve_input_device",
+                    return_value=SimpleNamespace(index=1, name="BlackHole 2ch"),
+                ),
+                patch(
+                    "live_note.app.remote_coordinator.AudioCaptureService",
+                    _StickyStopAudioCaptureService,
+                ),
+            ):
+                exit_code = coordinator.run()
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual([b"a" * 8], connection.sent_audio)
+        self.assertEqual(["stop"], connection.sent_controls)
 
     def test_remote_runner_start_times_out_when_backend_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
