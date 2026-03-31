@@ -47,6 +47,22 @@ class LiveControlTests(unittest.TestCase):
         runner.request_stop.assert_called_once_with()
         self.assertEqual({}, scheduler.calls)
 
+    def test_request_stop_marks_controller_stopping_until_cleared(self) -> None:
+        scheduler = _FakeScheduler()
+        runner = SimpleNamespace(request_stop=Mock(), request_pause=Mock(), request_resume=Mock())
+        controller = LiveRecordingController(
+            scheduler=scheduler,
+            monotonic=lambda: 10.0,
+            on_auto_stop=Mock(),
+        )
+        controller.bind_runner(runner)
+
+        controller.request_stop()
+
+        self.assertTrue(controller.is_stopping)
+        controller.clear()
+        self.assertFalse(controller.is_stopping)
+
     def test_pause_and_resume_preserve_remaining_auto_stop_time(self) -> None:
         scheduler = _FakeScheduler()
         monotonic_values = iter([100.0, 112.0, 120.0])
@@ -92,4 +108,3 @@ class LiveControlTests(unittest.TestCase):
         scheduled_callback()
 
         on_elapsed.assert_called_once_with()
-

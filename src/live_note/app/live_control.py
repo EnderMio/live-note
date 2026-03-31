@@ -51,6 +51,7 @@ class LiveRecordingController:
         self._auto_stop_deadline: float | None = None
         self._auto_stop_remaining_seconds: float | None = None
         self._auto_stop_paused = False
+        self._stop_requested = False
 
     @property
     def auto_stop_deadline(self) -> float | None:
@@ -60,12 +61,18 @@ class LiveRecordingController:
     def remaining_auto_stop_seconds(self) -> float | None:
         return self._auto_stop_remaining_seconds
 
+    @property
+    def is_stopping(self) -> bool:
+        return self._stop_requested
+
     def bind_runner(self, runner: LiveRunner | None) -> None:
         self.runner = runner
+        self._stop_requested = False
 
     def clear(self) -> None:
         self.cancel_auto_stop()
         self.runner = None
+        self._stop_requested = False
 
     def arm_auto_stop(self, seconds: int | None) -> None:
         self.cancel_auto_stop()
@@ -80,6 +87,7 @@ class LiveRecordingController:
         if self.runner is None:
             return False
         self.cancel_auto_stop()
+        self._stop_requested = True
         self.runner.request_stop()
         return True
 
@@ -144,4 +152,3 @@ class LiveRecordingController:
             return
         self.scheduler.after_cancel(self._auto_stop_after_id)
         self._auto_stop_after_id = None
-
