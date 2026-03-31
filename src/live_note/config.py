@@ -77,6 +77,8 @@ class RemoteConfig:
     timeout_seconds: int = 20
     upload_timeout_seconds: int = 180
     live_chunk_ms: int = 240
+    ws_ping_interval_seconds: int = 20
+    ws_ping_timeout_seconds: int = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +86,8 @@ class ServeConfig:
     host: str = "127.0.0.1"
     port: int = 8765
     api_token: str | None = None
+    ws_ping_interval_seconds: int = 20
+    ws_ping_timeout_seconds: int = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,11 +243,15 @@ def load_config(config_path: Path | None = None, env_path: Path | None = None) -
             timeout_seconds=int(remote_data.get("timeout_seconds", 20)),
             upload_timeout_seconds=int(remote_data.get("upload_timeout_seconds", 180)),
             live_chunk_ms=int(remote_data.get("live_chunk_ms", 240)),
+            ws_ping_interval_seconds=int(remote_data.get("ws_ping_interval_seconds", 20)),
+            ws_ping_timeout_seconds=int(remote_data.get("ws_ping_timeout_seconds", 20)),
         ),
         serve=ServeConfig(
             host=str(serve_data.get("host", "127.0.0.1")),
             port=int(serve_data.get("port", 8765)),
             api_token=str(serve_data["api_token"]).strip() if serve_data.get("api_token") else None,
+            ws_ping_interval_seconds=int(serve_data.get("ws_ping_interval_seconds", 20)),
+            ws_ping_timeout_seconds=int(serve_data.get("ws_ping_timeout_seconds", 20)),
         ),
         funasr=FunAsrConfig(
             enabled=bool(funasr_data.get("enabled", False)),
@@ -261,8 +269,9 @@ def load_config(config_path: Path | None = None, env_path: Path | None = None) -
             min_duration_on=float(speaker_data.get("min_duration_on", 0.3)),
             min_duration_off=float(speaker_data.get("min_duration_off", 0.5)),
             pyannote_model=(
-                str(speaker_data.get("pyannote_model", "pyannote/speaker-diarization-community-1"))
-                .strip()
+                str(
+                    speaker_data.get("pyannote_model", "pyannote/speaker-diarization-community-1")
+                ).strip()
                 or "pyannote/speaker-diarization-community-1"
             ),
             pyannote_auth_token=merged_env.get("PYANNOTE_AUTH_TOKEN") or None,
@@ -349,6 +358,8 @@ def render_config(config: AppConfig) -> str:
                 "timeout_seconds": config.remote.timeout_seconds,
                 "upload_timeout_seconds": config.remote.upload_timeout_seconds,
                 "live_chunk_ms": config.remote.live_chunk_ms,
+                "ws_ping_interval_seconds": config.remote.ws_ping_interval_seconds,
+                "ws_ping_timeout_seconds": config.remote.ws_ping_timeout_seconds,
             },
         ),
         (
@@ -357,6 +368,8 @@ def render_config(config: AppConfig) -> str:
                 "host": config.serve.host,
                 "port": config.serve.port,
                 "api_token": config.serve.api_token or "",
+                "ws_ping_interval_seconds": config.serve.ws_ping_interval_seconds,
+                "ws_ping_timeout_seconds": config.serve.ws_ping_timeout_seconds,
             },
         ),
         (

@@ -42,12 +42,16 @@ class RemoteConfigTests(unittest.TestCase):
                         'base_url = "http://mini.local:8765"',
                         'api_token = "remote-token"',
                         "timeout_seconds = 22",
+                        "ws_ping_interval_seconds = 35",
+                        "ws_ping_timeout_seconds = 55",
                         "live_chunk_ms = 320",
                         "",
                         "[serve]",
                         'host = "0.0.0.0"',
                         "port = 18765",
                         'api_token = "server-token"',
+                        "ws_ping_interval_seconds = 30",
+                        "ws_ping_timeout_seconds = 45",
                         "",
                         "[funasr]",
                         "enabled = true",
@@ -74,10 +78,14 @@ class RemoteConfigTests(unittest.TestCase):
         self.assertEqual("http://mini.local:8765", config.remote.base_url)
         self.assertEqual("remote-token", config.remote.api_token)
         self.assertEqual(22, config.remote.timeout_seconds)
+        self.assertEqual(35, config.remote.ws_ping_interval_seconds)
+        self.assertEqual(55, config.remote.ws_ping_timeout_seconds)
         self.assertEqual(320, config.remote.live_chunk_ms)
         self.assertEqual("0.0.0.0", config.serve.host)
         self.assertEqual(18765, config.serve.port)
         self.assertEqual("server-token", config.serve.api_token)
+        self.assertEqual(30, config.serve.ws_ping_interval_seconds)
+        self.assertEqual(45, config.serve.ws_ping_timeout_seconds)
         self.assertTrue(config.funasr.enabled)
         self.assertEqual("ws://127.0.0.1:10095", config.funasr.base_url)
         self.assertEqual("2pass", config.funasr.mode)
@@ -124,6 +132,8 @@ class RemoteConfigTests(unittest.TestCase):
         self.assertIn("[serve]", rendered)
         self.assertIn("[funasr]", rendered)
         self.assertIn("[speaker]", rendered)
+        self.assertIn("ws_ping_interval_seconds = 20", rendered)
+        self.assertIn("ws_ping_timeout_seconds = 20", rendered)
         self.assertIn("expected_speakers = 0", rendered)
 
     def test_load_config_reads_pyannote_speaker_backend_and_env_token(self) -> None:
