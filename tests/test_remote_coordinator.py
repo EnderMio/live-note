@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import queue
 import tempfile
 import threading
 import time
@@ -28,7 +30,7 @@ from live_note.config import (
     SpeakerConfig,
     WhisperConfig,
 )
-from live_note.domain import AudioFrame
+from live_note.domain import AudioFrame, TranscriptEntry
 from live_note.obsidian.renderer import build_transcript_note
 from live_note.remote.protocol import LiveStartRequest
 from live_note.remote.service import (
@@ -193,6 +195,80 @@ class _FakeStartupWebSocket:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class _SequencedLiveWebSocket:
+    def __init__(self, start_payload: dict[str, object], messages: list[dict[str, object]]) -> None:
+        self._start_payload = start_payload
+        self._messages = list(messages)
+        self.accepted = False
+        self.closed = False
+        self.sent_payloads: list[dict[str, object]] = []
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def receive_json(self) -> dict[str, object]:
+        return dict(self._start_payload)
+
+    async def receive(self) -> dict[str, object]:
+        if self._messages:
+            return dict(self._messages.pop(0))
+        return {"type": "websocket.disconnect"}
+
+    async def send_json(self, payload: dict[str, object]) -> None:
+        self.sent_payloads.append(dict(payload))
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FailingSendWebSocket(_SequencedLiveWebSocket):
+    def __init__(
+        self,
+        start_payload: dict[str, object],
+        messages: list[dict[str, object]],
+        *,
+        fail_types: set[str],
+    ) -> None:
+        super().__init__(start_payload, messages)
+        self._fail_types = set(fail_types)
+
+    async def send_json(self, payload: dict[str, object]) -> None:
+        payload_type = str(payload.get("type", ""))
+        if payload_type in self._fail_types:
+            raise RuntimeError(f"send failed for {payload_type}")
+        await super().send_json(payload)
+
+
+class _QueueingRunner:
+    def __init__(self) -> None:
+        self.enqueued_audio: list[bytes] = []
+        self.stop_requested = False
+        self.pause_requested = False
+        self.resume_requested = False
+        self.session_id = "remote-1"
+        self.entries: list[TranscriptEntry] = []
+        self.failure_message: str | None = None
+        self.postprocess_task_payload: dict[str, object] | None = None
+        self.on_event = None
+
+    @property
+    def is_alive(self) -> bool:
+        return False
+
+    def enqueue_audio_bytes(self, payload: bytes) -> None:
+        self.enqueued_audio.append(payload)
+        return True
+
+    def request_stop(self) -> None:
+        self.stop_requested = True
+
+    def request_pause(self) -> None:
+        self.pause_requested = True
+
+    def request_resume(self) -> None:
+        self.resume_requested = True
 
 
 class _FakeRemoteClient:
@@ -587,6 +663,55 @@ class RemoteCoordinatorTests(unittest.TestCase):
         transcribed_events = [event for event in events if event.stage == "segment_transcribed"]
         self.assertEqual(1, len(transcribed_events))
         self.assertEqual("片段 seg-00001 已转写", transcribed_events[0].message)
+
+    def test_repeated_segment_final_does_not_duplicate_segment_transcribed_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events = []
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+                on_progress=events.append,
+            )
+            coordinator._apply_session_started(
+                {
+                    "session_id": "remote-1",
+                    "started_at": "2026-03-18T10:00:00+00:00",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+
+            coordinator._append_live_segment(
+                {
+                    "segment_id": "seg-00002",
+                    "started_ms": 1000,
+                    "ended_ms": 1400,
+                    "text": "第一版",
+                }
+            )
+            coordinator._append_live_segment(
+                {
+                    "segment_id": "seg-00002",
+                    "started_ms": 1000,
+                    "ended_ms": 1800,
+                    "text": "第一版 更新后",
+                }
+            )
+
+            entries = coordinator.workspace.transcript_entries()
+
+        transcribed_events = [event for event in events if event.stage == "segment_transcribed"]
+        self.assertEqual(1, len(transcribed_events))
+        self.assertEqual("片段 seg-00002 已转写", transcribed_events[0].message)
+        self.assertEqual(1, len(entries))
+        self.assertEqual("第一版 更新后", entries[0].text)
+        self.assertEqual(1800, entries[0].ended_ms)
 
     def test_remote_coordinator_input_level_callback_emits_progress_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1736,6 +1861,58 @@ class RemoteCoordinatorTests(unittest.TestCase):
         self.assertEqual("大家好", runner.entries[0].text)
         self.assertEqual(420, runner.entries[0].ended_ms)
 
+    def test_flush_funasr_stream_stop_interrupts_pause_wait_promptly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = _sample_config(root, funasr_enabled=True, remote_timeout_seconds=2)
+            runner = RemoteLiveSessionRunner(
+                config=config,
+                request=LiveStartRequest(
+                    title="产品周会",
+                    kind="meeting",
+                    language="zh",
+                    source_label="BlackHole 2ch",
+                    source_ref="1",
+                ),
+                on_progress=lambda _event: None,
+            )
+            metadata = create_session_metadata(
+                config=config,
+                title="产品周会",
+                kind="meeting",
+                language="zh",
+                input_mode="live",
+                source_label="BlackHole 2ch",
+                source_ref="1",
+            )
+            workspace = SessionWorkspace.create(Path(metadata.session_dir), metadata)
+            tracker = _FunAsrDraftTracker()
+            tracker.start_stream(0)
+            tracker.build_partial_payload("大家好", current_ms=420, bounds_ms=(0, 420))
+            connection = _FakeFunAsrConnection(timeout_delay_seconds=0.05)
+
+            def _request_stop_later() -> None:
+                time.sleep(0.1)
+                runner.request_stop()
+
+            stop_thread = threading.Thread(target=_request_stop_later, daemon=True)
+            stop_thread.start()
+            started = time.monotonic()
+            runner._flush_funasr_stream(
+                connection,
+                _FunAsrAudioBatcher(chunk_ms=60),
+                tracker,
+                workspace,
+                metadata,
+                current_ms=420,
+            )
+            elapsed = time.monotonic() - started
+            stop_thread.join(timeout=1)
+
+        self.assertLess(elapsed, 0.8)
+        self.assertEqual(1, len(runner.entries))
+        self.assertEqual("大家好", runner.entries[0].text)
+
     def test_funasr_backend_drains_buffered_frames_before_stop_finalize(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1974,6 +2151,210 @@ class RemoteCoordinatorTests(unittest.TestCase):
         self.assertIn("后端未就绪", str(websocket.sent_payloads[0].get("error")))
         self.assertNotIn("event loop blocked", str(websocket.sent_payloads[0].get("error")))
         self.assertNotIn("session_started", {item["type"] for item in websocket.sent_payloads})
+
+    def test_remote_service_receive_loop_uses_nonblocking_audio_enqueue_contract(self) -> None:
+        service = RemoteSessionService(_sample_config(Path(tempfile.mkdtemp())))
+        websocket = _SequencedLiveWebSocket(
+            {"type": "start", "title": "产品周会"},
+            [
+                {"type": "websocket.receive", "bytes": b"\x01\x02", "text": None},
+                {"type": "websocket.receive", "text": json.dumps({"type": "stop"}), "bytes": None},
+            ],
+        )
+        runner = _QueueingRunner()
+
+        asyncio.run(service._receive_live_messages(websocket, runner))
+
+        self.assertEqual([b"\x01\x02"], runner.enqueued_audio)
+        self.assertTrue(runner.stop_requested)
+
+    def test_remote_service_live_session_emits_stop_received_before_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = RemoteSessionService(_sample_config(Path(temp_dir)))
+            websocket = _SequencedLiveWebSocket(
+                {"type": "start", "title": "产品周会"},
+                [
+                    {
+                        "type": "websocket.receive",
+                        "text": json.dumps({"type": "stop"}),
+                        "bytes": None,
+                    },
+                ],
+            )
+            metadata = create_session_metadata(
+                config=service.config,
+                title="产品周会",
+                kind="meeting",
+                language="zh",
+                input_mode="live",
+                source_label="BlackHole 2ch",
+                source_ref="1",
+            )
+
+            class _StubRunner(_QueueingRunner):
+                def __init__(self, on_event=None) -> None:
+                    super().__init__()
+                    self.on_event = on_event
+
+                def start(self):
+                    return metadata
+
+                def join(self, timeout: float | None = None) -> None:
+                    return None
+
+            def _runner_factory(*_args, **kwargs):
+                return _StubRunner(on_event=kwargs.get("on_event"))
+
+            with patch(
+                "live_note.remote.service.RemoteLiveSessionRunner", side_effect=_runner_factory
+            ):
+                asyncio.run(service.live_session(websocket))
+
+        event_types = [item["type"] for item in websocket.sent_payloads]
+        self.assertEqual("session_started", event_types[0])
+        self.assertEqual("stop_received", event_types[1])
+        self.assertEqual("completed", event_types[-1])
+
+    def test_remote_service_live_session_keeps_handoff_when_stop_ack_send_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = RemoteSessionService(_sample_config(Path(temp_dir)))
+            websocket = _FailingSendWebSocket(
+                {"type": "start", "title": "产品周会"},
+                [
+                    {
+                        "type": "websocket.receive",
+                        "text": json.dumps({"type": "stop"}),
+                        "bytes": None,
+                    },
+                ],
+                fail_types={"stop_received", "completed"},
+            )
+            metadata = create_session_metadata(
+                config=service.config,
+                title="产品周会",
+                kind="meeting",
+                language="zh",
+                input_mode="live",
+                source_label="BlackHole 2ch",
+                source_ref="1",
+            )
+
+            class _StubRunner(_QueueingRunner):
+                def __init__(self, on_event=None) -> None:
+                    super().__init__()
+                    self.on_event = on_event
+                    self.postprocess_task_payload = {
+                        "task_id": "task-post-1",
+                        "server_id": "server-1",
+                        "action": "postprocess",
+                        "status": "running",
+                    }
+
+                def start(self):
+                    return metadata
+
+                def join(self, timeout: float | None = None) -> None:
+                    return None
+
+            def _runner_factory(*_args, **kwargs):
+                return _StubRunner(on_event=kwargs.get("on_event"))
+
+            with patch(
+                "live_note.remote.service.RemoteLiveSessionRunner", side_effect=_runner_factory
+            ):
+                asyncio.run(service.live_session(websocket))
+
+        self.assertTrue(websocket.accepted)
+        self.assertTrue(websocket.closed)
+
+    def test_remote_runner_enqueue_audio_bytes_fails_fast_when_ingress_queue_is_full(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = RemoteLiveSessionRunner(
+                config=_sample_config(Path(temp_dir)),
+                request=LiveStartRequest(
+                    title="产品周会",
+                    kind="meeting",
+                    language="zh",
+                    source_label="BlackHole 2ch",
+                    source_ref="1",
+                ),
+                on_progress=lambda _event: None,
+            )
+            runner._ingress_audio_queue = queue.Queue(maxsize=1)
+            runner._ingress_audio_queue.put(b"first")
+
+            accepted = runner.enqueue_audio_bytes(b"second")
+
+        self.assertFalse(accepted)
+        self.assertTrue(runner._stop_event.is_set())
+        self.assertIn("输入过载", str(runner.failure_message))
+
+    def test_remote_service_receive_loop_stops_when_ingress_overflows(self) -> None:
+        service = RemoteSessionService(_sample_config(Path(tempfile.mkdtemp())))
+        websocket = _SequencedLiveWebSocket(
+            {"type": "start", "title": "产品周会"},
+            [
+                {"type": "websocket.receive", "bytes": b"\x01\x02", "text": None},
+                {"type": "websocket.receive", "bytes": b"\x03\x04", "text": None},
+            ],
+        )
+
+        class _OverflowingRunner(_QueueingRunner):
+            def __init__(self) -> None:
+                super().__init__()
+                self._calls = 0
+
+            def enqueue_audio_bytes(self, payload: bytes) -> bool:
+                self._calls += 1
+                if self._calls == 1:
+                    super().enqueue_audio_bytes(payload)
+                    return True
+                self.failure_message = "远端实时音频输入过载，已中止当前会话。"
+                self.request_stop()
+                return False
+
+        runner = _OverflowingRunner()
+
+        asyncio.run(service._receive_live_messages(websocket, runner))
+
+        self.assertTrue(runner.stop_requested)
+        self.assertEqual([b"\x01\x02"], runner.enqueued_audio)
+
+    def test_remote_coordinator_emits_stopping_when_server_acknowledges_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events = []
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+                on_progress=events.append,
+            )
+            coordinator._apply_session_started(
+                {
+                    "session_id": "remote-1",
+                    "started_at": "2026-03-18T10:00:00+00:00",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+
+            coordinator._event_queue.put(
+                {
+                    "type": "stop_received",
+                    "session_id": "remote-1",
+                    "message": "远端已确认停止，正在收尾当前片段。",
+                }
+            )
+            coordinator._drain_remote_events(threading.Event())
+
+        stopping_events = [event for event in events if event.stage == "stopping"]
+        self.assertEqual(1, len(stopping_events))
+        self.assertEqual("远端已确认停止，正在收尾当前片段。", stopping_events[0].message)
 
     def test_remote_coordinator_attaches_postprocess_task_without_fetching_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

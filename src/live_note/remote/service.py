@@ -92,6 +92,7 @@ class RemoteSessionService:
         self._request_upload_locks: dict[str, threading.Lock] = {}
         self._request_upload_locks_lock = threading.Lock()
         self.tasks = RemoteTaskRegistry(config, recover_runner=self._build_recovered_runner)
+        self._recover_stale_remote_live_sessions()
 
     @property
     def api_token(self) -> str | None:
@@ -132,6 +133,26 @@ class RemoteSessionService:
                 }
             )
         return sorted(items, key=lambda item: str(item["started_at"]), reverse=True)
+
+    def _recover_stale_remote_live_sessions(self) -> None:
+        stale_statuses = {"starting", "live", "paused", "finalizing"}
+        disabled_obsidian = _disabled_obsidian_client(self.config)
+        for root in list_sessions(self.config.root_dir):
+            try:
+                workspace = SessionWorkspace.load(root)
+                metadata = workspace.read_session()
+            except Exception:
+                continue
+            if metadata.execution_target != "remote" or metadata.status not in stale_statuses:
+                continue
+            logger = workspace.session_logger()
+            publish_failure_outputs(
+                workspace=workspace,
+                metadata=metadata,
+                obsidian=disabled_obsidian,
+                logger=logger,
+                reason="远端服务重启导致实时会话中断，请重试。",
+            )
 
     def session_payload(self, session_id: str) -> dict[str, object]:
         workspace = build_workspace(self.config.root_dir, session_id)
@@ -623,12 +644,15 @@ class RemoteSessionService:
             await websocket.send_json(payload)
             await websocket.close()
             return
-        await websocket.send_json(
+        client_connected = await self._send_live_payload(
+            websocket,
             {
                 "type": "session_started",
                 "metadata": metadata_to_dict(metadata),
-            }
+            },
         )
+        if not client_connected:
+            runner.request_stop()
 
         receiver = asyncio.create_task(self._receive_live_messages(websocket, runner))
         emitted_entries = 0
@@ -637,22 +661,29 @@ class RemoteSessionService:
                 while emitted_entries < len(runner.entries):
                     entry = runner.entries[emitted_entries]
                     emitted_entries += 1
-                    await websocket.send_json(
-                        {
-                            "type": "segment_final",
-                            "session_id": runner.session_id,
-                            "segment_id": entry.segment_id,
-                            "started_ms": entry.started_ms,
-                            "ended_ms": entry.ended_ms,
-                            "text": entry.text,
-                            "speaker_label": entry.speaker_label,
-                        }
-                    )
+                    if client_connected:
+                        client_connected = await self._send_live_payload(
+                            websocket,
+                            {
+                                "type": "segment_final",
+                                "session_id": runner.session_id,
+                                "segment_id": entry.segment_id,
+                                "started_ms": entry.started_ms,
+                                "ended_ms": entry.ended_ms,
+                                "text": entry.text,
+                                "speaker_label": entry.speaker_label,
+                            },
+                        )
+                        if not client_connected:
+                            runner.request_stop()
                 try:
                     payload = await asyncio.to_thread(event_queue.get, True, 0.2)
                 except queue.Empty:
                     continue
-                await websocket.send_json(payload)
+                if client_connected:
+                    client_connected = await self._send_live_payload(websocket, payload)
+                    if not client_connected:
+                        runner.request_stop()
         finally:
             if not receiver.done():
                 receiver.cancel()
@@ -672,7 +703,22 @@ class RemoteSessionService:
                 "postprocess_task": runner.postprocess_task_payload,
             }
         )
-        await websocket.send_json(terminal)
+        if client_connected:
+            await self._send_live_payload(websocket, terminal)
+        await self._close_live_websocket(websocket)
+
+    async def _send_live_payload(self, websocket: WebSocket, payload: dict[str, object]) -> bool:
+        try:
+            await websocket.send_json(payload)
+        except (RuntimeError, WebSocketDisconnect):
+            return False
+        return True
+
+    async def _close_live_websocket(self, websocket: WebSocket) -> None:
+        try:
+            await websocket.close()
+        except (RuntimeError, WebSocketDisconnect):
+            return
 
     async def _receive_live_messages(
         self,
@@ -686,7 +732,8 @@ class RemoteSessionService:
                     runner.request_stop()
                     return
                 if message.get("bytes") is not None:
-                    runner.feed_audio(message["bytes"])
+                    if not runner.enqueue_audio_bytes(message["bytes"]):
+                        return
                     continue
                 payload = json.loads(message["text"]) if message.get("text") else {}
                 action = str(payload.get("type", "")).strip().lower()
@@ -695,6 +742,14 @@ class RemoteSessionService:
                 elif action == "resume":
                     runner.request_resume()
                 elif action == "stop":
+                    if runner.on_event is not None:
+                        runner.on_event(
+                            {
+                                "type": "stop_received",
+                                "session_id": runner.session_id,
+                                "message": "远端已确认停止，正在收尾当前片段。",
+                            }
+                        )
                     runner.request_stop()
                     return
         except WebSocketDisconnect:
@@ -917,6 +972,9 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         self.segment_queue: queue.Queue[object] = queue.Queue(maxsize=32)
         self._audio_offset_ms = 0
         self._pcm_buffer = bytearray()
+        self._ingress_audio_queue: queue.Queue[bytes] = queue.Queue(
+            maxsize=max(1, self.config.audio.queue_size)
+        )
         self._capture = _RemoteCaptureState()
         self._thread: threading.Thread | None = None
         self.workspace: SessionWorkspace | None = None
@@ -994,6 +1052,34 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                     pcm16=frame_pcm16,
                 )
             )
+
+    def enqueue_audio_bytes(self, pcm16: bytes) -> bool:
+        if not pcm16:
+            return True
+        try:
+            self._ingress_audio_queue.put_nowait(pcm16)
+        except queue.Full:
+            message = "远端实时音频输入过载，已中止当前会话。"
+            self.failure_message = message
+            self.request_stop()
+            if self.on_event is not None:
+                self.on_event(
+                    {
+                        "type": "error",
+                        "session_id": self.session_id,
+                        "error": message,
+                    }
+                )
+            return False
+        return True
+
+    def _drain_ingress_audio_queue(self) -> None:
+        while True:
+            try:
+                payload = self._ingress_audio_queue.get_nowait()
+            except queue.Empty:
+                return
+            self.feed_audio(payload)
 
     def run(self) -> int:
         assert self.workspace is not None
@@ -1114,8 +1200,10 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                     metadata=metadata,
                     logger=logger,
                 )
+                self._drain_ingress_audio_queue()
                 self._raise_thread_error_if_any()
                 if self._stop_event.wait(0.1):
+                    self._drain_ingress_audio_queue()
                     capture_finished = True
                     break
             if capture_finished and not capture_announced:
@@ -1156,6 +1244,7 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                     metadata=metadata,
                     logger=logger,
                 )
+                self._drain_ingress_audio_queue()
                 self._drain_funasr_messages(connection, tracker, workspace, metadata, current_ms)
                 try:
                     if self._stop_event.is_set():
@@ -1250,9 +1339,13 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         connection.send_stop()
         deadline = time.monotonic() + min(max(self.config.remote.timeout_seconds, 1), 8)
         while time.monotonic() < deadline:
+            if self._stop_event.is_set() and awaiting_result:
+                break
             try:
                 message = connection.recv_message(timeout=0.2)
             except TimeoutError:
+                if self._stop_event.is_set() and awaiting_result:
+                    break
                 if not awaiting_result:
                     return
                 continue

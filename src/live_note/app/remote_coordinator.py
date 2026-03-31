@@ -339,6 +339,13 @@ class RemoteLiveCoordinator:
                     session_id=self.session_id,
                 )
                 continue
+            if event_type == "stop_received":
+                self._emit(
+                    "stopping",
+                    str(payload.get("message") or "远端已确认停止，正在收尾当前片段。"),
+                    session_id=self.session_id,
+                )
+                continue
             if event_type == "completed":
                 postprocess_task = payload.get("postprocess_task")
                 if isinstance(postprocess_task, dict):
@@ -410,6 +417,7 @@ class RemoteLiveCoordinator:
         metadata = self.workspace.read_session()
         segment_id = str(payload["segment_id"])
         is_partial = not emit_final_progress
+        segment_already_finalized = segment_id in self._finalized_segment_ids
         if is_partial and segment_id in self._finalized_segment_ids:
             return
         started_ms = int(payload["started_ms"])
@@ -449,7 +457,7 @@ class RemoteLiveCoordinator:
         self.workspace.write_transcript(content)
         if not is_partial:
             self._finalized_segment_ids.add(segment_id)
-        if emit_final_progress:
+        if emit_final_progress and not segment_already_finalized:
             self._emit(
                 "segment_transcribed",
                 f"片段 {segment_id} 已转写",

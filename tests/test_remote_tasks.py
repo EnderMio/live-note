@@ -709,6 +709,57 @@ class RemoteSessionServiceRecoveryTests(unittest.TestCase):
             recovered.tasks.shutdown()
             service.tasks.shutdown()
 
+    def test_service_restart_marks_stale_remote_live_sessions_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = build_config(root)
+            live_metadata = create_session_metadata(
+                config=config,
+                title="远端股票课",
+                kind="lecture",
+                language="en",
+                input_mode="live",
+                source_label="BlackHole 2ch",
+                source_ref="2",
+            )
+            live_metadata = replace(
+                live_metadata,
+                status="live",
+                execution_target="remote",
+                remote_session_id=live_metadata.session_id,
+            )
+            live_workspace = SessionWorkspace.create(Path(live_metadata.session_dir), live_metadata)
+            live_workspace.record_segment_text("seg-00001", 0, 1200, "stale live draft")
+
+            local_metadata = create_session_metadata(
+                config=config,
+                title="本地会话",
+                kind="meeting",
+                language="zh",
+                input_mode="live",
+                source_label="MacBook Mic",
+                source_ref="1",
+            )
+            SessionWorkspace.create(Path(local_metadata.session_dir), local_metadata)
+
+            service = RemoteSessionService(config)
+            session_payload = service.session_payload(live_metadata.session_id)
+            sessions = service.list_sessions_payload()
+            local_payload = service.session_payload(local_metadata.session_id)
+            transcript = live_workspace.transcript_md.read_text(encoding="utf-8")
+            structured = live_workspace.structured_md.read_text(encoding="utf-8")
+            service.tasks.shutdown()
+
+        self.assertEqual("failed", session_payload["status"])
+        self.assertEqual(local_metadata.status, local_payload["status"])
+        self.assertEqual("live", local_payload["transcript_source"])
+        stale_summary = next(
+            item for item in sessions if item["session_id"] == live_metadata.session_id
+        )
+        self.assertEqual("failed", stale_summary["status"])
+        self.assertIn("远端服务重启", transcript)
+        self.assertIn("远端服务重启", structured)
+
     def test_postprocess_failure_writes_syncable_failure_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = build_config(Path(temp_dir))
