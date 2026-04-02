@@ -81,10 +81,32 @@ class _FakeFunAsrConnection:
 
 
 class _FakeRemoteLiveConnection:
-    def __init__(self, *, completed_payload: dict[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        stop_received_payload: dict[str, object] | None = None,
+        completed_payload: dict[str, object] | None = None,
+    ) -> None:
         self.sent_audio: list[bytes] = []
         self.sent_controls: list[str] = []
         self._stop_received = threading.Event()
+        self._stop_received_payload = stop_received_payload or {
+            "type": "stop_received",
+            "session_id": "remote-1",
+            "message": "远端已确认停止，后台整理任务已创建。",
+            "postprocess_task": {
+                "task_id": "task-post-1",
+                "server_id": "server-1",
+                "action": "postprocess",
+                "label": "后台整理",
+                "session_id": "remote-1",
+                "status": "running",
+                "stage": "handoff",
+                "message": "后台整理已接管。",
+                "result_version": 0,
+                "can_cancel": False,
+            },
+        }
         self._completed_payload = completed_payload or {
             "type": "completed",
             "session_id": "remote-1",
@@ -116,6 +138,7 @@ class _FakeRemoteLiveConnection:
             "source_ref": "1",
         }
         self._stop_received.wait(1)
+        yield dict(self._stop_received_payload)
         yield dict(self._completed_payload)
 
 
@@ -153,6 +176,27 @@ class _DisconnectAfterStartConnection(_FakeRemoteLiveConnection):
             "source_ref": "1",
         }
         self._stop_received.wait(0.2)
+        return
+
+
+class _DisconnectAfterStopAckConnection(_FakeRemoteLiveConnection):
+    def iter_events(self):
+        yield {
+            "type": "session_started",
+            "session_id": "remote-1",
+            "started_at": "2026-03-18T10:00:00+00:00",
+            "title": "产品周会",
+            "kind": "meeting",
+            "language": "zh",
+            "source_label": "BlackHole 2ch",
+            "source_ref": "1",
+        }
+        self._stop_received.wait(1)
+        yield {
+            "type": "stop_received",
+            "session_id": "remote-1",
+            "message": "远端已确认停止，等待后台整理接管。",
+        }
         return
 
 
@@ -260,6 +304,9 @@ class _QueueingRunner:
     def enqueue_audio_bytes(self, payload: bytes) -> None:
         self.enqueued_audio.append(payload)
         return True
+
+    def ensure_postprocess_task_payload(self):
+        return self.postprocess_task_payload
 
     def request_stop(self) -> None:
         self.stop_requested = True
@@ -407,6 +454,38 @@ class RemoteCoordinatorTests(unittest.TestCase):
         self.assertEqual(1, len(second_batch))
         self.assertEqual((0, 30), (first_batch[0].started_ms, first_batch[0].ended_ms))
         self.assertEqual((30, 60), (second_batch[0].started_ms, second_batch[0].ended_ms))
+
+    def test_remote_runner_postprocess_factory_forwards_start_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            forwarded: dict[str, object] = {}
+            ready_event = threading.Event()
+            request = LiveStartRequest(
+                title="产品周会",
+                kind="meeting",
+                language="zh",
+                source_label="BlackHole 2ch",
+                source_ref="1",
+            )
+
+            def _create_postprocess_task(session_id: str, start_event=None):
+                forwarded["session_id"] = session_id
+                forwarded["start_event"] = start_event
+                return {"task_id": "task-post-1"}
+
+            runner = RemoteLiveSessionRunner(
+                config=_sample_config(Path(temp_dir)),
+                request=request,
+                on_progress=lambda _event: None,
+                create_postprocess_task=_create_postprocess_task,
+            )
+            runner.session_id = "remote-1"
+            runner._postprocess_ready_event = ready_event
+
+            payload = runner.ensure_postprocess_task_payload()
+
+        self.assertEqual({"task_id": "task-post-1"}, payload)
+        self.assertEqual("remote-1", forwarded["session_id"])
+        self.assertIs(ready_event, forwarded["start_event"])
 
     def test_apply_session_started_creates_local_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2195,12 +2274,27 @@ class RemoteCoordinatorTests(unittest.TestCase):
                 def __init__(self, on_event=None) -> None:
                     super().__init__()
                     self.on_event = on_event
+                    self.postprocess_task_payload = {
+                        "task_id": "task-post-1",
+                        "server_id": "server-1",
+                        "action": "postprocess",
+                        "label": "后台整理",
+                        "session_id": "remote-1",
+                        "status": "running",
+                        "stage": "handoff",
+                        "message": "后台整理已接管。",
+                        "result_version": 0,
+                        "can_cancel": False,
+                    }
 
                 def start(self):
                     return metadata
 
                 def join(self, timeout: float | None = None) -> None:
                     return None
+
+                def ensure_postprocess_task_payload(self):
+                    return self.postprocess_task_payload
 
             def _runner_factory(*_args, **kwargs):
                 return _StubRunner(on_event=kwargs.get("on_event"))
@@ -2213,6 +2307,7 @@ class RemoteCoordinatorTests(unittest.TestCase):
         event_types = [item["type"] for item in websocket.sent_payloads]
         self.assertEqual("session_started", event_types[0])
         self.assertEqual("stop_received", event_types[1])
+        self.assertEqual("task-post-1", websocket.sent_payloads[1]["postprocess_task"]["task_id"])
         self.assertEqual("completed", event_types[-1])
 
     def test_remote_service_live_session_keeps_handoff_when_stop_ack_send_fails(self) -> None:
@@ -2267,7 +2362,9 @@ class RemoteCoordinatorTests(unittest.TestCase):
         self.assertTrue(websocket.accepted)
         self.assertTrue(websocket.closed)
 
-    def test_remote_runner_enqueue_audio_bytes_fails_fast_when_ingress_queue_is_full(self) -> None:
+    def test_remote_runner_enqueue_audio_bytes_waits_for_capacity_when_ingress_queue_is_full(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             runner = RemoteLiveSessionRunner(
                 config=_sample_config(Path(temp_dir)),
@@ -2282,14 +2379,30 @@ class RemoteCoordinatorTests(unittest.TestCase):
             )
             runner._ingress_audio_queue = queue.Queue(maxsize=1)
             runner._ingress_audio_queue.put(b"first")
+            release_done = threading.Event()
+
+            def _release_capacity_later() -> None:
+                time.sleep(0.05)
+                runner._ingress_audio_queue.get_nowait()
+                release_done.set()
+
+            releaser = threading.Thread(target=_release_capacity_later, daemon=True)
+            releaser.start()
+            started_at = time.monotonic()
 
             accepted = runner.enqueue_audio_bytes(b"second")
+            waited_seconds = time.monotonic() - started_at
 
-        self.assertFalse(accepted)
-        self.assertTrue(runner._stop_event.is_set())
-        self.assertIn("输入过载", str(runner.failure_message))
+            releaser.join(timeout=1)
 
-    def test_remote_service_receive_loop_stops_when_ingress_overflows(self) -> None:
+        self.assertTrue(accepted)
+        self.assertFalse(runner._stop_event.is_set())
+        self.assertIsNone(runner.failure_message)
+        self.assertTrue(release_done.is_set())
+        self.assertGreaterEqual(waited_seconds, 0.04)
+        self.assertEqual(1, runner._ingress_audio_queue.qsize())
+
+    def test_remote_service_receive_loop_waits_for_ingress_backpressure(self) -> None:
         service = RemoteSessionService(_sample_config(Path(tempfile.mkdtemp())))
         websocket = _SequencedLiveWebSocket(
             {"type": "start", "title": "产品周会"},
@@ -2299,26 +2412,59 @@ class RemoteCoordinatorTests(unittest.TestCase):
             ],
         )
 
-        class _OverflowingRunner(_QueueingRunner):
+        class _BackpressureRunner(_QueueingRunner):
             def __init__(self) -> None:
                 super().__init__()
                 self._calls = 0
+                self.waited = threading.Event()
 
             def enqueue_audio_bytes(self, payload: bytes) -> bool:
                 self._calls += 1
-                if self._calls == 1:
-                    super().enqueue_audio_bytes(payload)
-                    return True
-                self.failure_message = "远端实时音频输入过载，已中止当前会话。"
-                self.request_stop()
-                return False
+                if self._calls == 2:
+                    time.sleep(0.05)
+                    self.waited.set()
+                super().enqueue_audio_bytes(payload)
+                return True
 
-        runner = _OverflowingRunner()
+        runner = _BackpressureRunner()
 
         asyncio.run(service._receive_live_messages(websocket, runner))
 
         self.assertTrue(runner.stop_requested)
-        self.assertEqual([b"\x01\x02"], runner.enqueued_audio)
+        self.assertTrue(runner.waited.is_set())
+        self.assertEqual([b"\x01\x02", b"\x03\x04"], runner.enqueued_audio)
+
+    def test_remote_runner_ingress_drain_thread_moves_audio_without_backend_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            drained = threading.Event()
+
+            class _SignalRunner(RemoteLiveSessionRunner):
+                def feed_audio(self, pcm16: bytes) -> None:
+                    super().feed_audio(pcm16)
+                    drained.set()
+
+            runner = _SignalRunner(
+                config=_sample_config(Path(temp_dir)),
+                request=LiveStartRequest(
+                    title="产品周会",
+                    kind="meeting",
+                    language="zh",
+                    source_label="BlackHole 2ch",
+                    source_ref="1",
+                ),
+                on_progress=lambda _event: None,
+            )
+            runner._start_ingress_thread()
+            try:
+                accepted = runner.enqueue_audio_bytes(b"\x00\x00" * 480)
+                self.assertTrue(accepted)
+                self.assertTrue(drained.wait(timeout=1))
+                diagnostics = runner.ingress_diagnostics()
+                self.assertGreaterEqual(int(diagnostics["enqueue_count"]), 1)
+                self.assertIn("enqueue_wait_max_ms", diagnostics)
+            finally:
+                runner.request_stop()
+                runner._stop_ingress_thread(drain_pending=False)
 
     def test_remote_coordinator_emits_stopping_when_server_acknowledges_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2363,18 +2509,6 @@ class RemoteCoordinatorTests(unittest.TestCase):
                 completed_payload={
                     "type": "completed",
                     "session_id": "remote-1",
-                    "postprocess_task": {
-                        "task_id": "task-post-1",
-                        "server_id": "server-1",
-                        "action": "postprocess",
-                        "label": "后台整理",
-                        "session_id": "remote-1",
-                        "status": "running",
-                        "stage": "refining",
-                        "message": "正在后台整理。",
-                        "result_version": 0,
-                        "can_cancel": False,
-                    },
                 }
             )
             client = _FakeRemoteClient(connection)
@@ -2492,6 +2626,100 @@ class RemoteCoordinatorTests(unittest.TestCase):
                     coordinator.run()
 
         publish_mock.assert_not_called()
+
+    def test_disconnect_after_stop_ack_detaches_to_pending_postprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events = []
+            connection = _DisconnectAfterStopAckConnection()
+            client = _FakeRemoteClient(connection)
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+                client=client,
+                on_progress=events.append,
+            )
+            coordinator.request_stop()
+
+            with (
+                patch(
+                    "live_note.app.remote_coordinator.resolve_input_device",
+                    return_value=SimpleNamespace(index=1, name="BlackHole 2ch"),
+                ),
+                patch(
+                    "live_note.app.remote_coordinator.AudioCaptureService",
+                    _FakeAudioCaptureService,
+                ),
+            ):
+                exit_code = coordinator.run()
+
+            attachments = load_remote_tasks(root / ".live-note" / "remote_tasks.json")
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual([], client.artifact_calls)
+        self.assertEqual(1, len(attachments.records))
+        self.assertEqual("postprocess", attachments.records[0].action)
+        self.assertEqual("remote-1", attachments.records[0].session_id)
+        self.assertEqual("awaiting_rebind", attachments.records[0].attachment_state)
+        self.assertEqual("running", attachments.records[0].last_known_status)
+        attached_events = [event for event in events if event.stage == "postprocess_attached"]
+        self.assertEqual(1, len(attached_events))
+        self.assertIn("等待后台整理接管", attached_events[0].message)
+
+    def test_remote_coordinator_attaches_postprocess_task_on_stop_received(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events = []
+            coordinator = RemoteLiveCoordinator(
+                config=_sample_config(root),
+                title="产品周会",
+                source="1",
+                kind="meeting",
+                on_progress=events.append,
+            )
+            coordinator._apply_session_started(
+                {
+                    "session_id": "remote-1",
+                    "started_at": "2026-03-18T10:00:00+00:00",
+                    "title": "产品周会",
+                    "kind": "meeting",
+                    "language": "zh",
+                    "source_label": "BlackHole 2ch",
+                    "source_ref": "1",
+                }
+            )
+
+            coordinator._event_queue.put(
+                {
+                    "type": "stop_received",
+                    "session_id": "remote-1",
+                    "message": "远端已确认停止，后台整理任务已创建。",
+                    "postprocess_task": {
+                        "task_id": "task-post-1",
+                        "server_id": "server-1",
+                        "action": "postprocess",
+                        "label": "后台整理",
+                        "session_id": "remote-1",
+                        "status": "running",
+                        "stage": "handoff",
+                        "message": "后台整理已接管。",
+                        "result_version": 0,
+                        "can_cancel": False,
+                    },
+                }
+            )
+            coordinator._drain_remote_events(threading.Event())
+            attachments = load_remote_tasks(root / ".live-note" / "remote_tasks.json")
+
+        self.assertEqual(1, len(attachments.records))
+        self.assertEqual("task-post-1", attachments.records[0].remote_task_id)
+        self.assertEqual("attached", attachments.records[0].attachment_state)
+        self.assertEqual("postprocess", attachments.records[0].action)
+        attached_events = [event for event in events if event.stage == "postprocess_attached"]
+        self.assertEqual(1, len(attached_events))
+        self.assertIn("后台整理任务已创建", attached_events[0].message)
 
 
 def _sample_config(

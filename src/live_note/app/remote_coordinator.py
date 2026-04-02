@@ -115,6 +115,8 @@ class RemoteLiveCoordinator:
         self._live_entries: list[TranscriptEntry] = []
         self._finalized_segment_ids: set[str] = set()
         self._explicit_remote_failure_reason: str | None = None
+        self._remote_stop_acknowledged = False
+        self._attached_postprocess_task_id: str | None = None
 
     def request_stop(self) -> None:
         self._stop_event.set()
@@ -144,6 +146,8 @@ class RemoteLiveCoordinator:
         batcher = _RemoteAudioBatcher(chunk_ms=self.config.remote.live_chunk_ms)
         self._session_started_event.clear()
         self._explicit_remote_failure_reason = None
+        self._remote_stop_acknowledged = False
+        self._attached_postprocess_task_id = None
         try:
             with self.client.connect_live(self._live_start_payload(device)) as connection:
                 reader = threading.Thread(
@@ -200,7 +204,11 @@ class RemoteLiveCoordinator:
                         self._drain_remote_events(done_event)
                     self._flush_audio_batch(connection, batcher)
                     reader.join(timeout=max(self.config.remote.timeout_seconds, 10))
-                    self._raise_if_error(error_queue)
+                    try:
+                        self._raise_if_error(error_queue)
+                    except RuntimeError as exc:
+                        if not self._handle_post_stop_disconnect(exc):
+                            raise
                 finally:
                     capture.stop()
                     capture.join(timeout=5)
@@ -340,6 +348,29 @@ class RemoteLiveCoordinator:
                 )
                 continue
             if event_type == "stop_received":
+                self._remote_stop_acknowledged = True
+                postprocess_task = payload.get("postprocess_task")
+                if isinstance(postprocess_task, dict):
+                    task_payload = dict(postprocess_task)
+                    upsert_remote_task_payload(
+                        self._remote_tasks_path(),
+                        task_payload,
+                        fallback_session_id=str(payload.get("session_id") or self.session_id or ""),
+                        fallback_label="后台整理",
+                    )
+                    task_id = str(task_payload.get("task_id") or "").strip() or None
+                    if task_id and task_id != self._attached_postprocess_task_id:
+                        self._attached_postprocess_task_id = task_id
+                        self._emit(
+                            "postprocess_attached",
+                            str(payload.get("message") or "远端已确认停止，后台整理任务已创建。"),
+                            session_id=self.session_id,
+                            task_id=task_id,
+                        )
+                else:
+                    self._ensure_pending_postprocess_attachment(
+                        message=str(payload.get("message") or "远端已确认停止，正在收尾当前片段。")
+                    )
                 self._emit(
                     "stopping",
                     str(payload.get("message") or "远端已确认停止，正在收尾当前片段。"),
@@ -356,12 +387,21 @@ class RemoteLiveCoordinator:
                         fallback_session_id=str(payload.get("session_id") or self.session_id or ""),
                         fallback_label="后台整理",
                     )
-                    self._emit(
-                        "postprocess_attached",
-                        "录音已结束，后台整理已转为远端任务。",
-                        session_id=self.session_id,
-                        task_id=str(task_payload.get("task_id") or "") or None,
-                    )
+                    task_id = str(task_payload.get("task_id") or "").strip() or None
+                    if task_id != self._attached_postprocess_task_id:
+                        self._attached_postprocess_task_id = task_id
+                        self._emit(
+                            "postprocess_attached",
+                            "录音已结束，后台整理已转为远端任务。",
+                            session_id=self.session_id,
+                            task_id=task_id,
+                        )
+                    done_event.set()
+                    continue
+                if (
+                    self._remote_stop_acknowledged
+                    and self._attached_postprocess_task_id is not None
+                ):
                     done_event.set()
                     continue
                 self._sync_remote_artifacts(
@@ -537,6 +577,38 @@ class RemoteLiveCoordinator:
 
     def _remote_tasks_path(self) -> Path:
         return (self.config.root_dir / ".live-note" / "remote_tasks.json").resolve()
+
+    def _ensure_pending_postprocess_attachment(self, *, message: str) -> None:
+        if self.session_id is None:
+            return
+        upsert_remote_task_payload(
+            self._remote_tasks_path(),
+            {
+                "action": "postprocess",
+                "label": "后台整理",
+                "session_id": self.session_id,
+                "status": "running",
+                "stage": "handoff",
+                "message": message,
+                "result_version": 0,
+                "can_cancel": False,
+            },
+            fallback_session_id=self.session_id,
+            fallback_label="后台整理",
+        )
+
+    def _handle_post_stop_disconnect(self, exc: RuntimeError) -> bool:
+        if not self._remote_stop_acknowledged:
+            return False
+        if str(exc) != "远端连接已断开。":
+            return False
+        self._ensure_pending_postprocess_attachment(message="远端已确认停止，等待后台整理接管。")
+        self._emit(
+            "postprocess_attached",
+            "远端已确认停止，等待后台整理接管。",
+            session_id=self.session_id,
+        )
+        return True
 
     def _raise_if_error(self, error_queue: queue.Queue[BaseException]) -> None:
         try:

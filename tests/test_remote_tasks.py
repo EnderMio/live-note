@@ -586,6 +586,8 @@ class RemoteSessionServiceRecoveryTests(unittest.TestCase):
             session_id: str,
             *,
             speaker_enabled: bool | None = None,
+            start_event: threading.Event | None = None,
+            cancel_event: threading.Event | None = None,
         ):
             def run() -> None:
                 self.recovered_runs.append(("postprocess", session_id))
