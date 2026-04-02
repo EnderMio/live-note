@@ -184,9 +184,27 @@ class _FakeRemoteService:
             raise AssertionError("expected stop event")
         await websocket.send_json(
             {
+                "type": "stop_received",
+                "session_id": "session-1",
+                "message": "远端已确认停止，后台整理任务已创建。",
+                "postprocess_task": {
+                    "task_id": "task-post-1",
+                    "server_id": "server-1",
+                    "action": "postprocess",
+                    "label": "后台整理",
+                    "session_id": "session-1",
+                    "status": "running",
+                    "stage": "handoff",
+                    "message": "后台整理已接管。",
+                    "result_version": 0,
+                    "can_cancel": False,
+                },
+            }
+        )
+        await websocket.send_json(
+            {
                 "type": "completed",
                 "session_id": "session-1",
-                "status": "done",
             }
         )
         await websocket.close()
@@ -228,10 +246,14 @@ class RemoteApiTests(unittest.TestCase):
             started = websocket.receive_json()
             websocket.send_bytes(b"\x00\x00" * 320)
             websocket.send_json({"type": "stop"})
+            stop_received = websocket.receive_json()
             completed = websocket.receive_json()
 
         self.assertEqual("session_started", started["type"])
+        self.assertEqual("stop_received", stop_received["type"])
+        self.assertEqual("task-post-1", stop_received["postprocess_task"]["task_id"])
         self.assertEqual("completed", completed["type"])
+        self.assertNotIn("postprocess_task", completed)
 
     def test_create_import_endpoint_passes_uploaded_audio_to_service(self) -> None:
         response = self.client.post(

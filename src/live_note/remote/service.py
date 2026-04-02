@@ -30,6 +30,7 @@ from live_note.app.coordinator import (
 from live_note.app.events import ProgressEvent
 from live_note.app.journal import SessionWorkspace, build_workspace, list_sessions
 from live_note.app.session_outputs import publish_failure_outputs, publish_final_outputs
+from live_note.app.task_errors import TaskCancelledError
 from live_note.audio.segmentation import SpeechSegmenter
 from live_note.config import AppConfig
 from live_note.domain import AudioFrame, SessionMetadata, TranscriptEntry
@@ -436,6 +437,7 @@ class RemoteSessionService:
         session_id: str,
         *,
         speaker_enabled: bool | None = None,
+        start_event: threading.Event | None = None,
     ) -> dict[str, object]:
         return self.tasks.create_task(
             action="postprocess",
@@ -446,10 +448,12 @@ class RemoteSessionService:
                 "session_id": session_id,
                 "speaker_enabled": speaker_enabled,
             },
-            build_runner=lambda task_id, _cancel_event: self._build_postprocess_runner(
+            build_runner=lambda task_id, cancel_event: self._build_postprocess_runner(
                 task_id,
                 session_id,
                 speaker_enabled=speaker_enabled,
+                start_event=start_event,
+                cancel_event=cancel_event,
             ),
         )
 
@@ -499,8 +503,14 @@ class RemoteSessionService:
         session_id: str,
         *,
         speaker_enabled: bool | None = None,
+        start_event: threading.Event | None = None,
+        cancel_event: threading.Event | None = None,
     ):
         def run() -> None:
+            if start_event is not None:
+                while not start_event.wait(0.1):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise TaskCancelledError("远端后台整理已取消。")
             workspace = build_workspace(self.config.root_dir, session_id)
             config = self.config
             if speaker_enabled is not None:
@@ -510,6 +520,8 @@ class RemoteSessionService:
                 )
             logger = workspace.session_logger()
             disabled_obsidian = _disabled_obsidian_client(config)
+            if workspace.read_session().status == "failed":
+                raise RuntimeError("远端实时会话失败，后台整理未启动。")
             try:
                 _run_remote_postprocess(
                     config,
@@ -622,9 +634,11 @@ class RemoteSessionService:
             request=request,
             on_progress=lambda event: event_queue.put(progress_to_payload(event)),
             on_event=event_queue.put,
-            create_postprocess_task=lambda session_id: self._create_postprocess_task(
+            create_postprocess_task=lambda session_id,
+            start_event=None: self._create_postprocess_task(
                 session_id,
                 speaker_enabled=request.speaker_enabled,
+                start_event=start_event,
             ),
         )
         try:
@@ -641,8 +655,8 @@ class RemoteSessionService:
             }
             if runner.session_id:
                 payload["session_id"] = runner.session_id
-            await websocket.send_json(payload)
-            await websocket.close()
+            await self._send_live_payload(websocket, payload)
+            await self._close_live_websocket(websocket)
             return
         client_connected = await self._send_live_payload(
             websocket,
@@ -700,7 +714,6 @@ class RemoteSessionService:
             else {
                 "type": "completed",
                 "session_id": runner.session_id,
-                "postprocess_task": runner.postprocess_task_payload,
             }
         )
         if client_connected:
@@ -732,7 +745,8 @@ class RemoteSessionService:
                     runner.request_stop()
                     return
                 if message.get("bytes") is not None:
-                    if not runner.enqueue_audio_bytes(message["bytes"]):
+                    accepted = await asyncio.to_thread(runner.enqueue_audio_bytes, message["bytes"])
+                    if not accepted:
                         return
                     continue
                 payload = json.loads(message["text"]) if message.get("text") else {}
@@ -742,14 +756,16 @@ class RemoteSessionService:
                 elif action == "resume":
                     runner.request_resume()
                 elif action == "stop":
+                    postprocess_task = runner.ensure_postprocess_task_payload()
                     if runner.on_event is not None:
-                        runner.on_event(
-                            {
-                                "type": "stop_received",
-                                "session_id": runner.session_id,
-                                "message": "远端已确认停止，正在收尾当前片段。",
-                            }
-                        )
+                        payload = {
+                            "type": "stop_received",
+                            "session_id": runner.session_id,
+                            "message": "远端已确认停止，后台整理任务已创建。",
+                        }
+                        if postprocess_task is not None:
+                            payload["postprocess_task"] = postprocess_task
+                        runner.on_event(payload)
                     runner.request_stop()
                     return
         except WebSocketDisconnect:
@@ -941,6 +957,8 @@ def _is_funasr_final_message(message: FunAsrMessage) -> bool:
 
 
 class RemoteLiveSessionRunner(SessionCoordinator):
+    _INGRESS_STOP = object()
+
     def __init__(
         self,
         *,
@@ -972,18 +990,29 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         self.segment_queue: queue.Queue[object] = queue.Queue(maxsize=32)
         self._audio_offset_ms = 0
         self._pcm_buffer = bytearray()
-        self._ingress_audio_queue: queue.Queue[bytes] = queue.Queue(
+        self._ingress_audio_queue: queue.Queue[bytes | object] = queue.Queue(
             maxsize=max(1, self.config.audio.queue_size)
         )
         self._capture = _RemoteCaptureState()
         self._thread: threading.Thread | None = None
+        self._ingress_thread: threading.Thread | None = None
+        self._ingress_logger: logging.Logger | None = None
         self.workspace: SessionWorkspace | None = None
         self.metadata: SessionMetadata | None = None
         self.failure_message: str | None = None
         self.postprocess_task_payload: dict[str, object] | None = None
         self._create_postprocess_task = create_postprocess_task
+        self._postprocess_ready_event = threading.Event()
         self._backend_ready_event = threading.Event()
         self._startup_error: str | None = None
+        self._ingress_stats_lock = threading.Lock()
+        self._ingress_enqueue_count = 0
+        self._ingress_enqueue_wait_total_ms = 0.0
+        self._ingress_enqueue_wait_max_ms = 0.0
+        self._ingress_enqueue_wait_slow_count = 0
+        self._ingress_max_depth = 0
+        self._frame_max_depth = 0
+        self._ingress_last_stats_logged_at = 0.0
 
     @property
     def is_alive(self) -> bool:
@@ -1030,6 +1059,17 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         if self._thread is not None:
             self._thread.join(timeout=timeout)
 
+    def ensure_postprocess_task_payload(self) -> dict[str, object] | None:
+        if self.postprocess_task_payload is not None:
+            return self.postprocess_task_payload
+        if self._create_postprocess_task is None or self.session_id is None:
+            return None
+        self.postprocess_task_payload = self._create_postprocess_task(
+            self.session_id,
+            start_event=self._postprocess_ready_event,
+        )
+        return self.postprocess_task_payload
+
     def feed_audio(self, pcm16: bytes) -> None:
         if not pcm16 or self._capture.is_paused:
             return
@@ -1056,30 +1096,125 @@ class RemoteLiveSessionRunner(SessionCoordinator):
     def enqueue_audio_bytes(self, pcm16: bytes) -> bool:
         if not pcm16:
             return True
-        try:
-            self._ingress_audio_queue.put_nowait(pcm16)
-        except queue.Full:
-            message = "远端实时音频输入过载，已中止当前会话。"
-            self.failure_message = message
-            self.request_stop()
-            if self.on_event is not None:
-                self.on_event(
-                    {
-                        "type": "error",
-                        "session_id": self.session_id,
-                        "error": message,
-                    }
-                )
-            return False
-        return True
-
-    def _drain_ingress_audio_queue(self) -> None:
-        while True:
+        enqueue_started_at = time.monotonic()
+        while not self._stop_event.is_set():
             try:
-                payload = self._ingress_audio_queue.get_nowait()
-            except queue.Empty:
+                self._ingress_audio_queue.put(pcm16, timeout=0.2)
+            except queue.Full:
+                self._track_queue_depths()
+                continue
+            wait_ms = (time.monotonic() - enqueue_started_at) * 1000.0
+            self._record_ingress_enqueue_wait(wait_ms)
+            self._maybe_log_ingress_stats()
+            return True
+        return False
+
+    def ingress_diagnostics(self) -> dict[str, float | int]:
+        with self._ingress_stats_lock:
+            avg_wait_ms = (
+                self._ingress_enqueue_wait_total_ms / self._ingress_enqueue_count
+                if self._ingress_enqueue_count
+                else 0.0
+            )
+            return {
+                "ingress_depth": self._ingress_audio_queue.qsize(),
+                "ingress_max_depth": self._ingress_max_depth,
+                "frame_depth": self.frame_queue.qsize(),
+                "frame_max_depth": self._frame_max_depth,
+                "enqueue_count": self._ingress_enqueue_count,
+                "enqueue_wait_avg_ms": round(avg_wait_ms, 3),
+                "enqueue_wait_max_ms": round(self._ingress_enqueue_wait_max_ms, 3),
+                "enqueue_wait_slow_count": self._ingress_enqueue_wait_slow_count,
+            }
+
+    def _start_ingress_thread(self) -> None:
+        if self._ingress_thread is not None and self._ingress_thread.is_alive():
+            return
+        self._ingress_thread = threading.Thread(
+            target=self._ingress_drain_loop,
+            name=f"remote-ingress-{self.session_id or 'unknown'}",
+            daemon=True,
+        )
+        self._ingress_thread.start()
+
+    def _stop_ingress_thread(self, *, drain_pending: bool) -> None:
+        if self._ingress_thread is None:
+            return
+        if drain_pending:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if self._ingress_audio_queue.empty():
+                    break
+                time.sleep(0.01)
+        while self._ingress_thread.is_alive():
+            try:
+                self._ingress_audio_queue.put(self._INGRESS_STOP, timeout=0.1)
+                break
+            except queue.Full:
+                continue
+        self._ingress_thread.join(timeout=2)
+        self._maybe_log_ingress_stats(force=True)
+
+    def _ingress_drain_loop(self) -> None:
+        try:
+            while True:
+                try:
+                    payload = self._ingress_audio_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if self._stop_event.is_set() and self._ingress_audio_queue.empty():
+                        return
+                    self._maybe_log_ingress_stats()
+                    continue
+                if payload is self._INGRESS_STOP:
+                    return
+                assert isinstance(payload, bytes)
+                self.feed_audio(payload)
+                self._track_queue_depths()
+                self._maybe_log_ingress_stats()
+        except BaseException as exc:
+            self._thread_errors.put(exc)
+            self.request_stop()
+
+    def _track_queue_depths(self) -> None:
+        ingress_depth = self._ingress_audio_queue.qsize()
+        frame_depth = self.frame_queue.qsize()
+        with self._ingress_stats_lock:
+            self._ingress_max_depth = max(self._ingress_max_depth, ingress_depth)
+            self._frame_max_depth = max(self._frame_max_depth, frame_depth)
+
+    def _record_ingress_enqueue_wait(self, wait_ms: float) -> None:
+        slow_threshold_ms = 60.0
+        with self._ingress_stats_lock:
+            self._ingress_enqueue_count += 1
+            self._ingress_enqueue_wait_total_ms += wait_ms
+            self._ingress_enqueue_wait_max_ms = max(self._ingress_enqueue_wait_max_ms, wait_ms)
+            if wait_ms >= slow_threshold_ms:
+                self._ingress_enqueue_wait_slow_count += 1
+        self._track_queue_depths()
+
+    def _maybe_log_ingress_stats(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        with self._ingress_stats_lock:
+            if not force and now - self._ingress_last_stats_logged_at < 2.0:
                 return
-            self.feed_audio(payload)
+            self._ingress_last_stats_logged_at = now
+        diagnostics = self.ingress_diagnostics()
+        logger = self._ingress_logger or logging.getLogger(__name__)
+        logger.info(
+            (
+                "remote ingress stats session=%s ingress=%s/%s frame=%s/%s "
+                "enq=%s wait_avg=%.2fms wait_max=%.2fms slow=%s"
+            ),
+            self.session_id,
+            diagnostics["ingress_depth"],
+            diagnostics["ingress_max_depth"],
+            diagnostics["frame_depth"],
+            diagnostics["frame_max_depth"],
+            diagnostics["enqueue_count"],
+            diagnostics["enqueue_wait_avg_ms"],
+            diagnostics["enqueue_wait_max_ms"],
+            diagnostics["enqueue_wait_slow_count"],
+        )
 
     def run(self) -> int:
         assert self.workspace is not None
@@ -1087,6 +1222,7 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         workspace = self.workspace
         metadata = self.metadata
         logger = workspace.session_logger()
+        self._ingress_logger = logger
         disabled_obsidian = _disabled_obsidian_client(self.config)
         try:
             _attach_console_logging()
@@ -1116,7 +1252,8 @@ class RemoteLiveSessionRunner(SessionCoordinator):
 
             self._raise_thread_error_if_any()
             if self._create_postprocess_task is not None:
-                self.postprocess_task_payload = self._create_postprocess_task(metadata.session_id)
+                self.ensure_postprocess_task_payload()
+                self._postprocess_ready_event.set()
                 _emit_progress(
                     self.on_progress,
                     "postprocess_queued",
@@ -1149,6 +1286,8 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                 exc=exc,
                 on_progress=self.on_progress,
             )
+            if self.postprocess_task_payload is not None:
+                self._postprocess_ready_event.set()
             raise
 
     def _mark_backend_ready(self) -> None:
@@ -1191,21 +1330,23 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         with whisper_server:
             segment_thread.start()
             transcribe_thread.start()
+            self._start_ingress_thread()
             self._mark_backend_ready()
-            while True:
-                self._drain_control_commands(
-                    capture=self._capture,
-                    frame_queue=self.frame_queue,
-                    workspace=workspace,
-                    metadata=metadata,
-                    logger=logger,
-                )
-                self._drain_ingress_audio_queue()
-                self._raise_thread_error_if_any()
-                if self._stop_event.wait(0.1):
-                    self._drain_ingress_audio_queue()
-                    capture_finished = True
-                    break
+            try:
+                while True:
+                    self._drain_control_commands(
+                        capture=self._capture,
+                        frame_queue=self.frame_queue,
+                        workspace=workspace,
+                        metadata=metadata,
+                        logger=logger,
+                    )
+                    self._raise_thread_error_if_any()
+                    if self._stop_event.wait(0.1):
+                        capture_finished = True
+                        break
+            finally:
+                self._stop_ingress_thread(drain_pending=True)
             if capture_finished and not capture_announced:
                 workspace.update_status("finalizing")
                 _emit_progress(
@@ -1229,6 +1370,7 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         current_ms = 0
         tracker.start_stream(current_ms)
         connection = self._open_funasr_connection(metadata.session_id)
+        self._start_ingress_thread()
         self._mark_backend_ready()
 
         with _open_session_audio_writer(
@@ -1236,6 +1378,7 @@ class RemoteLiveSessionRunner(SessionCoordinator):
             self.config.audio.sample_rate,
             enabled=self.config.audio.save_session_wav,
         ) as session_audio:
+            ingress_stopped = False
             while True:
                 self._drain_control_commands(
                     capture=self._capture,
@@ -1244,7 +1387,6 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                     metadata=metadata,
                     logger=logger,
                 )
-                self._drain_ingress_audio_queue()
                 self._drain_funasr_messages(connection, tracker, workspace, metadata, current_ms)
                 try:
                     if self._stop_event.is_set():
@@ -1253,7 +1395,11 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                         item = self.frame_queue.get(timeout=0.1)
                 except queue.Empty:
                     if self._stop_event.is_set():
-                        break
+                        if not ingress_stopped:
+                            self._stop_ingress_thread(drain_pending=True)
+                            ingress_stopped = True
+                        if self.frame_queue.empty():
+                            break
                     continue
                 if item is FRAME_PAUSE:
                     self._flush_funasr_stream(
@@ -1292,6 +1438,9 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                         metadata,
                         current_ms,
                     )
+
+            if not ingress_stopped:
+                self._stop_ingress_thread(drain_pending=True)
 
             workspace.update_status("finalizing")
             _emit_progress(
