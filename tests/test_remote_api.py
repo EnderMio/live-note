@@ -240,7 +240,7 @@ class RemoteApiTests(unittest.TestCase):
         self.assertEqual("# 原文\n", payload["transcript_content"])
         self.assertEqual("# 整理\n", payload["structured_content"])
 
-    def test_live_websocket_emits_start_and_complete_events(self) -> None:
+    def test_live_websocket_emits_stop_ack_before_completed(self) -> None:
         with self.client.websocket_connect("/api/v1/live") as websocket:
             websocket.send_json({"type": "start", "title": "机器学习导论"})
             started = websocket.receive_json()

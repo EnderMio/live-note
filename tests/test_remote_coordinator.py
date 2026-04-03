@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import queue
 import tempfile
 import threading
 import time
@@ -2362,12 +2361,14 @@ class RemoteCoordinatorTests(unittest.TestCase):
         self.assertTrue(websocket.accepted)
         self.assertTrue(websocket.closed)
 
-    def test_remote_runner_enqueue_audio_bytes_waits_for_capacity_when_ingress_queue_is_full(
+    def test_remote_runner_enqueue_audio_bytes_not_blocked_by_frame_queue_backpressure(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = _sample_config(root)
             runner = RemoteLiveSessionRunner(
-                config=_sample_config(Path(temp_dir)),
+                config=config,
                 request=LiveStartRequest(
                     title="产品周会",
                     kind="meeting",
@@ -2377,30 +2378,30 @@ class RemoteCoordinatorTests(unittest.TestCase):
                 ),
                 on_progress=lambda _event: None,
             )
-            runner._ingress_audio_queue = queue.Queue(maxsize=1)
-            runner._ingress_audio_queue.put(b"first")
-            release_done = threading.Event()
-
-            def _release_capacity_later() -> None:
-                time.sleep(0.05)
-                runner._ingress_audio_queue.get_nowait()
-                release_done.set()
-
-            releaser = threading.Thread(target=_release_capacity_later, daemon=True)
-            releaser.start()
+            metadata = create_session_metadata(
+                config=config,
+                title="产品周会",
+                kind="meeting",
+                language="zh",
+                input_mode="live",
+                source_label="BlackHole 2ch",
+                source_ref="1",
+            )
+            runner.workspace = SessionWorkspace.create(Path(metadata.session_dir), metadata)
+            runner._initialize_ingest_spool()
+            runner.frame_queue.put(AudioFrame(started_ms=0, ended_ms=20, pcm16=b"\x00\x00" * 320))
             started_at = time.monotonic()
 
-            accepted = runner.enqueue_audio_bytes(b"second")
+            accepted = runner.enqueue_audio_bytes(b"\x00\x00" * 640)
             waited_seconds = time.monotonic() - started_at
-
-            releaser.join(timeout=1)
+            diagnostics = runner.ingress_diagnostics()
+            runner._seal_ingest_spool()
+            runner._close_ingest_spool()
 
         self.assertTrue(accepted)
-        self.assertFalse(runner._stop_event.is_set())
-        self.assertIsNone(runner.failure_message)
-        self.assertTrue(release_done.is_set())
-        self.assertGreaterEqual(waited_seconds, 0.04)
-        self.assertEqual(1, runner._ingress_audio_queue.qsize())
+        self.assertLess(waited_seconds, 0.05)
+        self.assertEqual(1280, diagnostics["captured_bytes"])
+        self.assertEqual(1280, diagnostics["backlog_bytes"])
 
     def test_remote_service_receive_loop_waits_for_ingress_backpressure(self) -> None:
         service = RemoteSessionService(_sample_config(Path(tempfile.mkdtemp())))
@@ -2434,7 +2435,7 @@ class RemoteCoordinatorTests(unittest.TestCase):
         self.assertTrue(runner.waited.is_set())
         self.assertEqual([b"\x01\x02", b"\x03\x04"], runner.enqueued_audio)
 
-    def test_remote_runner_ingress_drain_thread_moves_audio_without_backend_loop(self) -> None:
+    def test_remote_runner_spool_drain_moves_audio_without_backend_loop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             drained = threading.Event()
 
@@ -2443,8 +2444,10 @@ class RemoteCoordinatorTests(unittest.TestCase):
                     super().feed_audio(pcm16)
                     drained.set()
 
+            root = Path(temp_dir)
+            config = _sample_config(root)
             runner = _SignalRunner(
-                config=_sample_config(Path(temp_dir)),
+                config=config,
                 request=LiveStartRequest(
                     title="产品周会",
                     kind="meeting",
@@ -2454,17 +2457,31 @@ class RemoteCoordinatorTests(unittest.TestCase):
                 ),
                 on_progress=lambda _event: None,
             )
-            runner._start_ingress_thread()
+            metadata = create_session_metadata(
+                config=config,
+                title="产品周会",
+                kind="meeting",
+                language="zh",
+                input_mode="live",
+                source_label="BlackHole 2ch",
+                source_ref="1",
+            )
+            runner.workspace = SessionWorkspace.create(Path(metadata.session_dir), metadata)
+            runner._initialize_ingest_spool()
             try:
                 accepted = runner.enqueue_audio_bytes(b"\x00\x00" * 480)
                 self.assertTrue(accepted)
+                drained_once = runner._drain_spool_to_frames(wait_timeout=0.01)
+                self.assertTrue(drained_once)
                 self.assertTrue(drained.wait(timeout=1))
                 diagnostics = runner.ingress_diagnostics()
                 self.assertGreaterEqual(int(diagnostics["enqueue_count"]), 1)
+                self.assertGreaterEqual(int(diagnostics["processed_bytes"]), 960)
+                self.assertGreaterEqual(int(diagnostics["captured_bytes"]), 960)
                 self.assertIn("enqueue_wait_max_ms", diagnostics)
             finally:
                 runner.request_stop()
-                runner._stop_ingress_thread(drain_pending=False)
+                runner._close_ingest_spool()
 
     def test_remote_coordinator_emits_stopping_when_server_acknowledges_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

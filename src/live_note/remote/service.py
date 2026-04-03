@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import queue
 import threading
 import time
@@ -957,8 +958,6 @@ def _is_funasr_final_message(message: FunAsrMessage) -> bool:
 
 
 class RemoteLiveSessionRunner(SessionCoordinator):
-    _INGRESS_STOP = object()
-
     def __init__(
         self,
         *,
@@ -990,13 +989,9 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         self.segment_queue: queue.Queue[object] = queue.Queue(maxsize=32)
         self._audio_offset_ms = 0
         self._pcm_buffer = bytearray()
-        self._ingress_audio_queue: queue.Queue[bytes | object] = queue.Queue(
-            maxsize=max(1, self.config.audio.queue_size)
-        )
         self._capture = _RemoteCaptureState()
         self._thread: threading.Thread | None = None
-        self._ingress_thread: threading.Thread | None = None
-        self._ingress_logger: logging.Logger | None = None
+        self._spool_logger: logging.Logger | None = None
         self.workspace: SessionWorkspace | None = None
         self.metadata: SessionMetadata | None = None
         self.failure_message: str | None = None
@@ -1005,14 +1000,20 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         self._postprocess_ready_event = threading.Event()
         self._backend_ready_event = threading.Event()
         self._startup_error: str | None = None
-        self._ingress_stats_lock = threading.Lock()
-        self._ingress_enqueue_count = 0
-        self._ingress_enqueue_wait_total_ms = 0.0
-        self._ingress_enqueue_wait_max_ms = 0.0
-        self._ingress_enqueue_wait_slow_count = 0
-        self._ingress_max_depth = 0
+        self._spool_lock = threading.Condition()
+        self._spool_path: Path | None = None
+        self._spool_writer = None
+        self._spool_read_offset = 0
+        self._spool_write_offset = 0
+        self._spool_sealed = False
+        self._spool_stats_lock = threading.Lock()
+        self._spool_enqueue_count = 0
+        self._spool_enqueue_wait_total_ms = 0.0
+        self._spool_enqueue_wait_max_ms = 0.0
+        self._spool_enqueue_wait_slow_count = 0
+        self._spool_processed_bytes = 0
         self._frame_max_depth = 0
-        self._ingress_last_stats_logged_at = 0.0
+        self._spool_last_stats_logged_at = 0.0
 
     @property
     def is_alive(self) -> bool:
@@ -1059,6 +1060,10 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         if self._thread is not None:
             self._thread.join(timeout=timeout)
 
+    def request_stop(self) -> None:
+        super().request_stop()
+        self._seal_ingest_spool()
+
     def ensure_postprocess_task_payload(self) -> dict[str, object] | None:
         if self.postprocess_task_payload is not None:
             return self.postprocess_task_payload
@@ -1097,119 +1102,165 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         if not pcm16:
             return True
         enqueue_started_at = time.monotonic()
-        while not self._stop_event.is_set():
-            try:
-                self._ingress_audio_queue.put(pcm16, timeout=0.2)
-            except queue.Full:
-                self._track_queue_depths()
-                continue
-            wait_ms = (time.monotonic() - enqueue_started_at) * 1000.0
-            self._record_ingress_enqueue_wait(wait_ms)
-            self._maybe_log_ingress_stats()
-            return True
-        return False
+        if not self._append_to_ingest_spool(pcm16):
+            return False
+        wait_ms = (time.monotonic() - enqueue_started_at) * 1000.0
+        self._record_spool_enqueue(wait_ms=wait_ms)
+        self._maybe_log_spool_stats()
+        return True
 
     def ingress_diagnostics(self) -> dict[str, float | int]:
-        with self._ingress_stats_lock:
+        with self._spool_stats_lock:
             avg_wait_ms = (
-                self._ingress_enqueue_wait_total_ms / self._ingress_enqueue_count
-                if self._ingress_enqueue_count
+                self._spool_enqueue_wait_total_ms / self._spool_enqueue_count
+                if self._spool_enqueue_count
                 else 0.0
             )
+            captured_bytes = self._spool_write_offset
+            processed_bytes = self._spool_processed_bytes
+            backlog_bytes = max(0, captured_bytes - processed_bytes)
+            captured_ms = int(captured_bytes / 2 / max(1, self.config.audio.sample_rate) * 1000)
+            processed_ms = int(processed_bytes / 2 / max(1, self.config.audio.sample_rate) * 1000)
+            backlog_ms = max(0, captured_ms - processed_ms)
             return {
-                "ingress_depth": self._ingress_audio_queue.qsize(),
-                "ingress_max_depth": self._ingress_max_depth,
                 "frame_depth": self.frame_queue.qsize(),
                 "frame_max_depth": self._frame_max_depth,
-                "enqueue_count": self._ingress_enqueue_count,
+                "enqueue_count": self._spool_enqueue_count,
                 "enqueue_wait_avg_ms": round(avg_wait_ms, 3),
-                "enqueue_wait_max_ms": round(self._ingress_enqueue_wait_max_ms, 3),
-                "enqueue_wait_slow_count": self._ingress_enqueue_wait_slow_count,
+                "enqueue_wait_max_ms": round(self._spool_enqueue_wait_max_ms, 3),
+                "enqueue_wait_slow_count": self._spool_enqueue_wait_slow_count,
+                "captured_bytes": captured_bytes,
+                "processed_bytes": processed_bytes,
+                "backlog_bytes": backlog_bytes,
+                "captured_ms": captured_ms,
+                "processed_ms": processed_ms,
+                "backlog_ms": backlog_ms,
+                "spool_sealed": int(self._spool_sealed),
             }
 
-    def _start_ingress_thread(self) -> None:
-        if self._ingress_thread is not None and self._ingress_thread.is_alive():
-            return
-        self._ingress_thread = threading.Thread(
-            target=self._ingress_drain_loop,
-            name=f"remote-ingress-{self.session_id or 'unknown'}",
-            daemon=True,
-        )
-        self._ingress_thread.start()
+    def _initialize_ingest_spool(self) -> None:
+        if self.workspace is None:
+            raise RuntimeError("会话工作区尚未初始化，无法创建实时音频缓冲。")
+        with self._spool_lock:
+            self._spool_path = self.workspace.root / "live.ingest.pcm"
+            self._spool_path.parent.mkdir(parents=True, exist_ok=True)
+            self._spool_path.write_bytes(b"")
+            self._spool_writer = self._spool_path.open("ab")
+            self._spool_read_offset = 0
+            self._spool_write_offset = 0
+            self._spool_processed_bytes = 0
+            self._spool_sealed = False
+        if self._stop_event.is_set():
+            self._seal_ingest_spool()
 
-    def _stop_ingress_thread(self, *, drain_pending: bool) -> None:
-        if self._ingress_thread is None:
-            return
-        if drain_pending:
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
-                if self._ingress_audio_queue.empty():
-                    break
-                time.sleep(0.01)
-        while self._ingress_thread.is_alive():
-            try:
-                self._ingress_audio_queue.put(self._INGRESS_STOP, timeout=0.1)
-                break
-            except queue.Full:
-                continue
-        self._ingress_thread.join(timeout=2)
-        self._maybe_log_ingress_stats(force=True)
+    def _append_to_ingest_spool(self, pcm16: bytes) -> bool:
+        with self._spool_lock:
+            if self._spool_sealed or self._spool_writer is None:
+                return False
+            self._spool_writer.write(pcm16)
+            self._spool_writer.flush()
+            os.fsync(self._spool_writer.fileno())
+            self._spool_write_offset += len(pcm16)
+            self._spool_lock.notify_all()
+            return True
 
-    def _ingress_drain_loop(self) -> None:
-        try:
-            while True:
-                try:
-                    payload = self._ingress_audio_queue.get(timeout=0.1)
-                except queue.Empty:
-                    if self._stop_event.is_set() and self._ingress_audio_queue.empty():
-                        return
-                    self._maybe_log_ingress_stats()
-                    continue
-                if payload is self._INGRESS_STOP:
-                    return
-                assert isinstance(payload, bytes)
-                self.feed_audio(payload)
-                self._track_queue_depths()
-                self._maybe_log_ingress_stats()
-        except BaseException as exc:
-            self._thread_errors.put(exc)
-            self.request_stop()
+    def _seal_ingest_spool(self) -> None:
+        with self._spool_lock:
+            if self._spool_sealed:
+                return
+            self._spool_sealed = True
+            if self._spool_writer is not None:
+                self._spool_writer.flush()
+                os.fsync(self._spool_writer.fileno())
+                self._spool_writer.close()
+                self._spool_writer = None
+            self._spool_lock.notify_all()
 
-    def _track_queue_depths(self) -> None:
-        ingress_depth = self._ingress_audio_queue.qsize()
+    def _close_ingest_spool(self) -> None:
+        with self._spool_lock:
+            if self._spool_writer is not None:
+                self._spool_writer.close()
+                self._spool_writer = None
+
+    def _drain_spool_to_frames(self, *, wait_timeout: float) -> bool:
+        read_path: Path | None = None
+        read_offset = 0
+        read_size = 0
+        with self._spool_lock:
+            if self._spool_path is None:
+                return False
+            if self._spool_read_offset >= self._spool_write_offset:
+                if self._spool_sealed:
+                    return False
+                self._spool_lock.wait(timeout=max(wait_timeout, 0.0))
+                if self._spool_read_offset >= self._spool_write_offset:
+                    return False
+            read_path = self._spool_path
+            read_offset = self._spool_read_offset
+            read_size = self._spool_write_offset - self._spool_read_offset
+        if read_path is None or read_size <= 0:
+            return False
+        with read_path.open("rb") as handle:
+            handle.seek(read_offset)
+            payload = handle.read(read_size)
+        if not payload:
+            return False
+        self.feed_audio(payload)
+        with self._spool_lock:
+            self._spool_read_offset += len(payload)
+        self._record_spool_processed(len(payload))
+        self._track_frame_depth()
+        self._maybe_log_spool_stats()
+        return True
+
+    def _spool_drained_after_stop(self) -> bool:
+        with self._spool_lock:
+            if self._spool_path is None:
+                return True
+            return self._spool_sealed and self._spool_read_offset >= self._spool_write_offset
+
+    def _track_frame_depth(self) -> None:
         frame_depth = self.frame_queue.qsize()
-        with self._ingress_stats_lock:
-            self._ingress_max_depth = max(self._ingress_max_depth, ingress_depth)
+        with self._spool_stats_lock:
             self._frame_max_depth = max(self._frame_max_depth, frame_depth)
 
-    def _record_ingress_enqueue_wait(self, wait_ms: float) -> None:
+    def _record_spool_enqueue(self, *, wait_ms: float) -> None:
         slow_threshold_ms = 60.0
-        with self._ingress_stats_lock:
-            self._ingress_enqueue_count += 1
-            self._ingress_enqueue_wait_total_ms += wait_ms
-            self._ingress_enqueue_wait_max_ms = max(self._ingress_enqueue_wait_max_ms, wait_ms)
+        with self._spool_stats_lock:
+            self._spool_enqueue_count += 1
+            self._spool_enqueue_wait_total_ms += wait_ms
+            self._spool_enqueue_wait_max_ms = max(self._spool_enqueue_wait_max_ms, wait_ms)
             if wait_ms >= slow_threshold_ms:
-                self._ingress_enqueue_wait_slow_count += 1
-        self._track_queue_depths()
+                self._spool_enqueue_wait_slow_count += 1
 
-    def _maybe_log_ingress_stats(self, *, force: bool = False) -> None:
+    def _record_spool_processed(self, consumed_bytes: int) -> None:
+        with self._spool_stats_lock:
+            self._spool_processed_bytes += max(0, consumed_bytes)
+
+    def _maybe_log_spool_stats(self, *, force: bool = False) -> None:
         now = time.monotonic()
-        with self._ingress_stats_lock:
-            if not force and now - self._ingress_last_stats_logged_at < 2.0:
+        with self._spool_stats_lock:
+            if not force and now - self._spool_last_stats_logged_at < 2.0:
                 return
-            self._ingress_last_stats_logged_at = now
+            self._spool_last_stats_logged_at = now
         diagnostics = self.ingress_diagnostics()
-        logger = self._ingress_logger or logging.getLogger(__name__)
+        logger = self._spool_logger or logging.getLogger(__name__)
         logger.info(
             (
-                "remote ingress stats session=%s ingress=%s/%s frame=%s/%s "
-                "enq=%s wait_avg=%.2fms wait_max=%.2fms slow=%s"
+                "remote spool stats session=%s captured=%sB(%sms) processed=%sB(%sms) "
+                "backlog=%sB(%sms) frame=%s/%s sealed=%s enq=%s wait_avg=%.2fms "
+                "wait_max=%.2fms slow=%s"
             ),
             self.session_id,
-            diagnostics["ingress_depth"],
-            diagnostics["ingress_max_depth"],
+            diagnostics["captured_bytes"],
+            diagnostics["captured_ms"],
+            diagnostics["processed_bytes"],
+            diagnostics["processed_ms"],
+            diagnostics["backlog_bytes"],
+            diagnostics["backlog_ms"],
             diagnostics["frame_depth"],
             diagnostics["frame_max_depth"],
+            diagnostics["spool_sealed"],
             diagnostics["enqueue_count"],
             diagnostics["enqueue_wait_avg_ms"],
             diagnostics["enqueue_wait_max_ms"],
@@ -1222,10 +1273,11 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         workspace = self.workspace
         metadata = self.metadata
         logger = workspace.session_logger()
-        self._ingress_logger = logger
+        self._spool_logger = logger
         disabled_obsidian = _disabled_obsidian_client(self.config)
         try:
             _attach_console_logging()
+            self._initialize_ingest_spool()
             workspace.write_transcript(build_transcript_note(metadata, [], status="live"))
             metadata = workspace.update_status("live")
             _emit_progress(
@@ -1289,6 +1341,10 @@ class RemoteLiveSessionRunner(SessionCoordinator):
             if self.postprocess_task_payload is not None:
                 self._postprocess_ready_event.set()
             raise
+        finally:
+            self._seal_ingest_spool()
+            self._close_ingest_spool()
+            self._maybe_log_spool_stats(force=True)
 
     def _mark_backend_ready(self) -> None:
         self._backend_ready_event.set()
@@ -1330,23 +1386,20 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         with whisper_server:
             segment_thread.start()
             transcribe_thread.start()
-            self._start_ingress_thread()
             self._mark_backend_ready()
-            try:
-                while True:
-                    self._drain_control_commands(
-                        capture=self._capture,
-                        frame_queue=self.frame_queue,
-                        workspace=workspace,
-                        metadata=metadata,
-                        logger=logger,
-                    )
-                    self._raise_thread_error_if_any()
-                    if self._stop_event.wait(0.1):
-                        capture_finished = True
-                        break
-            finally:
-                self._stop_ingress_thread(drain_pending=True)
+            while True:
+                self._drain_control_commands(
+                    capture=self._capture,
+                    frame_queue=self.frame_queue,
+                    workspace=workspace,
+                    metadata=metadata,
+                    logger=logger,
+                )
+                self._raise_thread_error_if_any()
+                self._drain_spool_to_frames(wait_timeout=0.1)
+                if self._stop_event.is_set() and self._spool_drained_after_stop():
+                    capture_finished = True
+                    break
             if capture_finished and not capture_announced:
                 workspace.update_status("finalizing")
                 _emit_progress(
@@ -1370,7 +1423,6 @@ class RemoteLiveSessionRunner(SessionCoordinator):
         current_ms = 0
         tracker.start_stream(current_ms)
         connection = self._open_funasr_connection(metadata.session_id)
-        self._start_ingress_thread()
         self._mark_backend_ready()
 
         with _open_session_audio_writer(
@@ -1378,7 +1430,6 @@ class RemoteLiveSessionRunner(SessionCoordinator):
             self.config.audio.sample_rate,
             enabled=self.config.audio.save_session_wav,
         ) as session_audio:
-            ingress_stopped = False
             while True:
                 self._drain_control_commands(
                     capture=self._capture,
@@ -1387,19 +1438,17 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                     metadata=metadata,
                     logger=logger,
                 )
+                self._drain_spool_to_frames(wait_timeout=0.05)
                 self._drain_funasr_messages(connection, tracker, workspace, metadata, current_ms)
                 try:
-                    if self._stop_event.is_set():
-                        item = self.frame_queue.get_nowait()
-                    else:
-                        item = self.frame_queue.get(timeout=0.1)
+                    item = self.frame_queue.get(timeout=0.1)
                 except queue.Empty:
-                    if self._stop_event.is_set():
-                        if not ingress_stopped:
-                            self._stop_ingress_thread(drain_pending=True)
-                            ingress_stopped = True
-                        if self.frame_queue.empty():
-                            break
+                    if (
+                        self._stop_event.is_set()
+                        and self._spool_drained_after_stop()
+                        and self.frame_queue.empty()
+                    ):
+                        break
                     continue
                 if item is FRAME_PAUSE:
                     self._flush_funasr_stream(
@@ -1438,9 +1487,6 @@ class RemoteLiveSessionRunner(SessionCoordinator):
                         metadata,
                         current_ms,
                     )
-
-            if not ingress_stopped:
-                self._stop_ingress_thread(drain_pending=True)
 
             workspace.update_status("finalizing")
             _emit_progress(
