@@ -57,7 +57,9 @@ class RemoteDeployTests(unittest.TestCase):
         plist_payload = plistlib.loads(base64.b64decode(encoded))
         self.assertEqual("com.live-note.remote", plist_payload["Label"])
         self.assertIn("config.remote.toml", plist_payload["ProgramArguments"][4])
-        self.assertIn("launchd.out", plist_payload["StandardOutPath"])
+        self.assertIn(
+            "Application Support/live-note/logs/launchd.out", plist_payload["StandardOutPath"]
+        )
 
     def test_build_plan_can_install_pyannote_speaker_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

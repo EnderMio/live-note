@@ -50,7 +50,7 @@ def build_remote_deploy_plan(
     data_dir_abs = _resolve_remote_path(options.data_dir, remote_home)
     config_path_abs = _resolve_remote_path(options.config_path, remote_home)
     launch_agent_path = f"{remote_home}/Library/LaunchAgents/{options.label}.plist"
-    logs_dir = f"{remote_dir_abs}/logs"
+    logs_dir = f"{data_dir_abs}/logs"
     funasr_dir_abs = _resolve_remote_path(options.funasr_dir, remote_home)
     funasr_repo_dir = f"{funasr_dir_abs}/FunASR"
     funasr_venv_dir = f"{funasr_dir_abs}/.venv"
