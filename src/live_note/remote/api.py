@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Protocol
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket
@@ -66,8 +67,9 @@ def create_remote_app(
     *,
     api_token: str | None = None,
     live_gateway: LiveGateway | None = None,
+    lifespan=None,
 ) -> FastAPI:
-    app = FastAPI(title="live-note-remote")
+    app = FastAPI(title="live-note-remote", lifespan=lifespan)
 
     @app.get("/api/v1/health")
     def health(authorization: str | None = Header(default=None)) -> dict[str, object]:
@@ -244,14 +246,22 @@ def build_remote_app(config: AppConfig) -> FastAPI:
         config,
         commit_postprocess_handoff=commands.commit_postprocess_handoff,
     )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        commands.start()
+        try:
+            yield
+        finally:
+            commands.shutdown()
+
     app = create_remote_app(
         views,
         commands,
         api_token=config.serve.api_token or config.remote.api_token,
         live_gateway=gateway,
+        lifespan=lifespan,
     )
-    app.add_event_handler("startup", commands.start)
-    app.add_event_handler("shutdown", commands.shutdown)
     return app
 
 

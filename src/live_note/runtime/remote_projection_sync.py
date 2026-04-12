@@ -7,6 +7,7 @@ from live_note.config import AppConfig
 from live_note.remote.client import RemoteClient
 from live_note.remote.protocol import entry_from_dict, metadata_from_dict
 from live_note.remote_sync import apply_remote_artifacts, sync_remote_transcript_snapshot
+from live_note.runtime.remote_projection_target import reconcile_remote_projection_target
 from live_note.runtime.domain.remote_task_projection import RemoteTaskProjectionRecord
 from live_note.runtime.remote_task_projections import (
     get_remote_task_projection_by_task_id,
@@ -25,6 +26,7 @@ def sync_remote_task_projections(
     client: RemoteClient | None = None,
     now=iso_now,
 ) -> list[RemoteTaskProjectionRecord]:
+    reconcile_remote_projection_target(config.root_dir, config.remote.base_url)
     records = list_remote_task_projections(config.root_dir)
     if not config.remote.enabled:
         return records
@@ -54,6 +56,7 @@ def sync_single_remote_task(
 ) -> dict[str, object]:
     if not config.remote.enabled:
         raise RuntimeError("远端模式未启用。")
+    reconcile_remote_projection_target(config.root_dir, config.remote.base_url)
     record = get_remote_task_projection_by_task_id(config.root_dir, remote_task_id)
     if record is None:
         raise FileNotFoundError(f"未找到远端任务投影：{remote_task_id}")
