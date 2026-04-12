@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Protocol
 
-from .task_queue import QueuedTaskRecord
+
+class QueueTaskLike(Protocol):
+    action: str
+    label: str
+    payload: dict[str, object]
 
 
-def queue_target_text(record: QueuedTaskRecord) -> str:
+def queue_target_text(record: QueueTaskLike) -> str:
     payload = record.payload
     if record.action == "import":
         return Path(str(payload.get("file_path", ""))).name or "本地文件"
@@ -14,6 +19,6 @@ def queue_target_text(record: QueuedTaskRecord) -> str:
         if isinstance(session_ids, list):
             return f"{len(session_ids)} 条会话"
         return "多条会话"
-    if record.action == "session_action":
+    if payload.get("session_id") is not None:
         return str(payload.get("session_id") or "会话")
     return record.label

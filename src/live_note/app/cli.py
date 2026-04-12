@@ -163,27 +163,35 @@ def main(argv: list[str] | None = None) -> int:
         if not title:
             print("start 命令需要提供 --title", file=sys.stderr)
             return 1
-        return service.start_live_session(
+        task_id = service.start_live_session(
             title=title,
             source=args.source,
             kind=_resolve_kind(args.kind, args.profile_legacy),
             language=args.lang,
         )
+        print(task_id)
+        return 0
     if args.command == "import":
-        return service.import_audio_file(
+        task_id = service.import_audio_file(
             file_path=args.file,
             title=args.title,
             kind=args.kind,
             language=args.lang,
         )
+        print(task_id)
+        return 0
     if args.command == "finalize":
-        return service.finalize(args.session)
+        print(service.finalize(args.session))
+        return 0
     if args.command == "retranscribe":
-        return service.retranscribe(args.session)
+        print(service.retranscribe(args.session))
+        return 0
     if args.command == "refine":
-        return service.refine(args.session)
+        print(service.refine(args.session))
+        return 0
     if args.command == "merge":
-        return service.merge(args.session, title=args.title)
+        print(service.merge(args.session, title=args.title))
+        return 0
     return 1
 
 

@@ -11,11 +11,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
-from live_note.app.events import ProgressCallback, ProgressEvent
-from live_note.app.journal import SessionWorkspace
-from live_note.app.task_errors import TaskCancelledError
 from live_note.config import AppConfig
 from live_note.domain import SessionMetadata, TranscriptEntry
+from live_note.runtime.session_mutations import update_workspace_session
+from live_note.runtime.types import ProgressCallback, ProgressEvent
+from live_note.session_workspace import SessionWorkspace, workspace_root_dir
+from live_note.task_errors import TaskCancelledError
 from live_note.utils import compact_text
 
 _SPEAKER_JOURNAL_TMP = "segments.speaker.jsonl.tmp"
@@ -71,15 +72,40 @@ def apply_speaker_labels(
 ) -> SessionMetadata:
     source_path = audio_path or workspace.session_live_wav
     if not config.speaker.enabled:
-        return workspace.update_session(speaker_status="disabled")
+        return update_workspace_session(
+            workspace_root_dir(workspace.root),
+            workspace,
+            event_kind="speaker_disabled",
+            speaker_status="disabled",
+        )
     if not source_path.exists():
-        return workspace.update_session(speaker_status="failed")
+        return update_workspace_session(
+            workspace_root_dir(workspace.root),
+            workspace,
+            event_kind="speaker_failed",
+            speaker_status="failed",
+        )
     if not _backend_configured(config):
-        return workspace.update_session(speaker_status="failed")
+        return update_workspace_session(
+            workspace_root_dir(workspace.root),
+            workspace,
+            event_kind="speaker_failed",
+            speaker_status="failed",
+        )
     if not _backend_dependency_available(config.speaker.backend):
-        return workspace.update_session(speaker_status="failed")
+        return update_workspace_session(
+            workspace_root_dir(workspace.root),
+            workspace,
+            event_kind="speaker_failed",
+            speaker_status="failed",
+        )
     _check_cancel(cancel_callback)
-    workspace.update_session(speaker_status="running")
+    update_workspace_session(
+        workspace_root_dir(workspace.root),
+        workspace,
+        event_kind="speaker_started",
+        speaker_status="running",
+    )
     _emit_progress(
         on_progress,
         "speaker",
@@ -105,7 +131,12 @@ def apply_speaker_labels(
             total=3,
             error=str(exc),
         )
-        return workspace.update_session(speaker_status="failed")
+        return update_workspace_session(
+            workspace_root_dir(workspace.root),
+            workspace,
+            event_kind="speaker_failed",
+            speaker_status="failed",
+        )
 
     _check_cancel(cancel_callback)
     _emit_progress(
@@ -126,7 +157,12 @@ def apply_speaker_labels(
             current=3,
             total=3,
         )
-        return workspace.update_session(speaker_status="done")
+        return update_workspace_session(
+            workspace_root_dir(workspace.root),
+            workspace,
+            event_kind="speaker_completed",
+            speaker_status="done",
+        )
 
     aligned_entries = _with_speaker_labels(entries, turns)
     _rewrite_canonical_transcript(
@@ -144,7 +180,12 @@ def apply_speaker_labels(
         current=3,
         total=3,
     )
-    return workspace.update_session(speaker_status="done")
+    return update_workspace_session(
+        workspace_root_dir(workspace.root),
+        workspace,
+        event_kind="speaker_completed",
+        speaker_status="done",
+    )
 
 
 def _with_speaker_labels(

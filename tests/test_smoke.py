@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from live_note.app.cli import main
-from live_note.app.journal import build_workspace
+from live_note.session_workspace import build_workspace
 from live_note.app.services import AppService, SettingsDraft
 from live_note.domain import TranscriptEntry
 
@@ -78,19 +78,19 @@ class SmokeTests(unittest.TestCase):
 
             with (
                 patch(
-                    "live_note.app.coordinator.convert_audio_to_wav",
+                    "live_note.runtime.local_runners.convert_audio_to_wav",
                     side_effect=fake_convert_audio_to_wav,
                 ),
                 patch(
-                    "live_note.app.coordinator._runtime_whisper_config",
+                    "live_note.runtime.local_runners._runtime_whisper_config",
                     side_effect=lambda config, _language: config,
                 ),
                 patch(
-                    "live_note.app.coordinator.WhisperServerProcess",
+                    "live_note.runtime.local_runners.WhisperServerProcess",
                     side_effect=lambda *_args, **_kwargs: nullcontext(),
                 ),
                 patch(
-                    "live_note.app.coordinator._process_segment",
+                    "live_note.runtime.local_runners._process_segment",
                     side_effect=fake_process_segment,
                 ),
             ):

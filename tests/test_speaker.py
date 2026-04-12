@@ -8,8 +8,8 @@ from queue import Empty
 from types import ModuleType
 from unittest.mock import patch
 
-from live_note.app.journal import SessionWorkspace
-from live_note.app.task_errors import TaskCancelledError
+from live_note.session_workspace import SessionWorkspace
+from live_note.task_errors import TaskCancelledError
 from live_note.config import (
     AppConfig,
     AudioConfig,

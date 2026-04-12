@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from live_note.app.events import ProgressEvent
 from live_note.domain import SessionMetadata, TranscriptEntry
+from live_note.runtime.types import ProgressEvent
 
 
 @dataclass(frozen=True, slots=True)

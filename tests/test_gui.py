@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import queue
 import tempfile
-import threading
 import unittest
 import wave
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, Mock, patch
 
-from live_note.app.events import ProgressEvent
 from live_note.app.gui import (
     LiveNoteGui,
     _apply_visual_theme,
@@ -25,8 +22,69 @@ from live_note.app.gui import (
     _summary_supports_refine,
     _wrap_action_rows,
 )
-from live_note.app.services import DoctorCheck
-from live_note.app.task_queue import QueueLoadResult, build_task_record
+from live_note.app.services import DoctorCheck, LiveTaskSnapshot
+from live_note.runtime.domain.task_state import TaskRecord, TaskStatus
+
+
+def build_task_record(
+    *,
+    task_id: str,
+    action: str,
+    label: str,
+    payload: dict[str, object],
+    created_at: str,
+    status: str = TaskStatus.QUEUED.value,
+    started_at: str | None = None,
+) -> TaskRecord:
+    value = payload.get("session_id")
+    session_id = str(value) if value is not None else None
+    updated_at = started_at or created_at
+    if status == TaskStatus.RUNNING.value:
+        stage = "running"
+    elif status == TaskStatus.QUEUED.value:
+        stage = "queued"
+    else:
+        stage = status
+    return TaskRecord(
+        task_id=task_id,
+        session_id=session_id,
+        action=action,
+        label=label,
+        status=status,
+        stage=stage,
+        created_at=created_at,
+        updated_at=updated_at,
+        payload=dict(payload),
+        can_cancel=action == "import",
+        started_at=started_at,
+    )
+
+
+def build_live_task_snapshot(
+    *,
+    task_id: str,
+    label: str = "实时录音",
+    status: str = TaskStatus.RUNNING.value,
+    stage: str = "running",
+    message: str = "正在录音",
+    current: int | None = None,
+    total: int | None = None,
+    session_id: str | None = None,
+    is_paused: bool = False,
+    stop_requested: bool = False,
+) -> LiveTaskSnapshot:
+    return LiveTaskSnapshot(
+        task_id=task_id,
+        label=label,
+        status=status,
+        stage=stage,
+        message=message,
+        current=current,
+        total=total,
+        session_id=session_id,
+        is_paused=is_paused,
+        stop_requested=stop_requested,
+    )
 
 
 class GuiLanguageTests(unittest.TestCase):
@@ -296,7 +354,7 @@ class GuiRemoteTaskTests(unittest.TestCase):
         from live_note.app.gui_remote import remote_task_status_text
 
         record = SimpleNamespace(
-            status="completed",
+            status="succeeded",
             attachment_state="attached",
             result_version=4,
             last_synced_result_version=1,
@@ -311,7 +369,7 @@ class GuiRemoteTaskTests(unittest.TestCase):
         record = SimpleNamespace(
             remote_task_id="task-1",
             session_id="session-1",
-            status="completed",
+            status="succeeded",
             attachment_state="attached",
             result_version=4,
             last_synced_result_version=4,
@@ -337,67 +395,6 @@ class GuiRemoteTaskTests(unittest.TestCase):
         primary = _primary_remote_task([queued, running])
 
         self.assertIs(primary, running)
-
-
-class GuiQueueLifecycleHelperTests(unittest.TestCase):
-    def test_queue_lifecycle_helper_returns_next_record_when_gui_is_idle(self) -> None:
-        from live_note.app.gui_queue_lifecycle import next_queued_record_to_start
-
-        record = build_task_record(
-            task_id="task-0001",
-            action="session_action",
-            label="重转写并重写",
-            payload={"action": "retranscribe", "session_id": "session-1"},
-            created_at="2026-03-24T00:00:00+00:00",
-        )
-        runtime = SimpleNamespace(next_queued=Mock(return_value=record))
-
-        result = next_queued_record_to_start(
-            runtime,
-            queue_worker=None,
-            busy=False,
-            background_tasks={},
-            config_exists=True,
-        )
-
-        self.assertIs(record, result)
-        runtime.next_queued.assert_called_once_with()
-
-    def test_queue_lifecycle_helper_posts_done_event_on_success(self) -> None:
-        from live_note.app.gui_queue_lifecycle import run_queue_task_worker
-
-        record = build_task_record(
-            task_id="task-0001",
-            action="session_action",
-            label="重转写并重写",
-            payload={"action": "retranscribe", "session_id": "session-1"},
-            created_at="2026-03-24T00:00:00+00:00",
-        )
-        service = SimpleNamespace(run_queue_task=Mock(return_value=0))
-        remove_record = Mock()
-        event_queue = queue.Queue()
-        cancel_event = threading.Event()
-        on_progress = Mock()
-
-        run_queue_task_worker(
-            service,
-            record,
-            on_progress=on_progress,
-            cancel_event=cancel_event,
-            remove_record=remove_record,
-            event_queue=event_queue,
-        )
-
-        service.run_queue_task.assert_called_once_with(
-            record,
-            on_progress=on_progress,
-            cancel_event=cancel_event,
-        )
-        remove_record.assert_called_once_with(record.task_id)
-        self.assertEqual(
-            ("task_done", "queue", record.task_id, record.label, 0),
-            event_queue.get_nowait(),
-        )
 
 
 class GuiHistoryTests(unittest.TestCase):
@@ -548,7 +545,7 @@ class GuiHistoryTests(unittest.TestCase):
                 can_cancel=False,
                 session_id="remote-1",
                 attachment_state="attached",
-                status="completed",
+                status="succeeded",
                 result_version=4,
                 last_synced_result_version=1,
                 last_error="同步失败",
@@ -926,12 +923,11 @@ class GuiTaskTests(unittest.TestCase):
 
     def test_start_live_session_logs_current_execution_target(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
-        runner = Mock()
         gui._ensure_ready_for_run = Mock(return_value=True)
         gui.live_title_var = SimpleNamespace(get=lambda: "产品周会")
         gui.live_devices = [SimpleNamespace(index=2)]
         gui.live_device_combo = SimpleNamespace(current=lambda: 0)
-        gui.service = SimpleNamespace(create_live_coordinator=Mock(return_value=runner))
+        gui.service = SimpleNamespace()
         gui.live_kind_var = SimpleNamespace(get=lambda: "meeting")
         gui.live_language_var = SimpleNamespace(get=lambda: "沿用默认设置")
         gui.live_auto_refine_var = SimpleNamespace(get=lambda: True)
@@ -939,7 +935,6 @@ class GuiTaskTests(unittest.TestCase):
         gui.live_stop_after_minutes_var = SimpleNamespace(get=lambda: "")
         gui.refine_enabled_var = SimpleNamespace(get=lambda: True)
         gui.save_session_wav_var = SimpleNamespace(get=lambda: True)
-        gui._progress_callback = Mock(return_value=Mock())
         gui._next_task_id = Mock(return_value="task-1")
         gui._start_live_task = Mock()
         gui._arm_live_auto_stop = Mock()
@@ -957,12 +952,11 @@ class GuiTaskTests(unittest.TestCase):
 
     def test_start_live_session_passes_auto_refine_choice(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
-        runner = Mock()
         gui._ensure_ready_for_run = Mock(return_value=True)
         gui.live_title_var = SimpleNamespace(get=lambda: "产品周会")
         gui.live_devices = [SimpleNamespace(index=2)]
         gui.live_device_combo = SimpleNamespace(current=lambda: 0)
-        gui.service = SimpleNamespace(create_live_coordinator=Mock(return_value=runner))
+        gui.service = SimpleNamespace()
         gui.live_kind_var = SimpleNamespace(get=lambda: "meeting")
         gui.live_language_var = SimpleNamespace(get=lambda: "沿用默认设置")
         gui.live_auto_refine_var = SimpleNamespace(get=lambda: False)
@@ -970,7 +964,6 @@ class GuiTaskTests(unittest.TestCase):
         gui.live_stop_after_minutes_var = SimpleNamespace(get=lambda: "15")
         gui.refine_enabled_var = SimpleNamespace(get=lambda: True)
         gui.save_session_wav_var = SimpleNamespace(get=lambda: True)
-        gui._progress_callback = Mock(return_value=Mock())
         gui._next_task_id = Mock(return_value="task-1")
         gui._start_live_task = Mock()
         gui._arm_live_auto_stop = Mock()
@@ -981,76 +974,28 @@ class GuiTaskTests(unittest.TestCase):
 
         gui._start_live_session()
 
-        gui.service.create_live_coordinator.assert_called_once_with(
+        gui._start_live_task.assert_called_once_with(
+            "task-1",
+            "实时录音",
             title="产品周会",
             source="2",
             kind="meeting",
             language=None,
-            on_progress=ANY,
             auto_refine_after_live=False,
             speaker_enabled=True,
         )
         gui._arm_live_auto_stop.assert_called_once_with(900)
 
-    def test_start_live_session_progress_callback_still_routes_regular_progress_events(
-        self,
-    ) -> None:
+    def test_set_live_input_meter_updates_widgets(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
-        runner = Mock()
-        gui.event_queue = queue.Queue()
-        gui._ensure_ready_for_run = Mock(return_value=True)
-        gui.live_title_var = SimpleNamespace(get=lambda: "产品周会")
-        gui.live_devices = [SimpleNamespace(index=2)]
-        gui.live_device_combo = SimpleNamespace(current=lambda: 0)
-        gui.service = SimpleNamespace(create_live_coordinator=Mock(return_value=runner))
-        gui.live_kind_var = SimpleNamespace(get=lambda: "meeting")
-        gui.live_language_var = SimpleNamespace(get=lambda: "沿用默认设置")
-        gui.live_auto_refine_var = SimpleNamespace(get=lambda: True)
-        gui.live_speaker_enabled_var = SimpleNamespace(get=lambda: False)
-        gui.live_stop_after_minutes_var = SimpleNamespace(get=lambda: "")
-        gui.refine_enabled_var = SimpleNamespace(get=lambda: True)
-        gui.save_session_wav_var = SimpleNamespace(get=lambda: True)
-        gui._next_task_id = Mock(return_value="task-1")
-        gui._start_live_task = Mock()
-        gui._arm_live_auto_stop = Mock()
-        gui.stop_live_button = MagicMock()
-        gui.pause_live_button = MagicMock()
-        gui.execution_target_var = SimpleNamespace(get=lambda: "当前转写：本机")
-        gui._append_log = Mock()
-
-        gui._start_live_session()
-
-        callback = gui.service.create_live_coordinator.call_args.kwargs["on_progress"]
-        callback(ProgressEvent(stage="listening", message="正在监听输入设备：Mic"))
-        queued = gui.event_queue.get_nowait()
-
-        self.assertEqual("listening", queued.stage)
-        self.assertEqual("live", queued.source)
-        self.assertEqual("task-1", queued.task_id)
-
-    def test_handle_live_progress_updates_input_meter_without_logging(self) -> None:
-        gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui.current_live_task_id = "task-1"
-        gui.background_tasks = {}
-        gui.status_var = SimpleNamespace(set=Mock())
-        gui._append_log = Mock()
         gui.live_input_level_var = SimpleNamespace(set=Mock())
         gui.live_input_meter = MagicMock()
         gui.live_input_meter_status = MagicMock()
 
-        gui._handle_live_progress(
-            ProgressEvent(
-                stage="input_level",
-                message="High",
-                current=78,
-                total=100,
-                task_id="task-1",
-            )
-        )
+        gui._set_live_input_meter(level=78, state="High")
 
-        gui.status_var.set.assert_not_called()
-        gui._append_log.assert_not_called()
         gui.live_input_level_var.set.assert_called_once_with("High")
+        gui.live_input_meter.stop.assert_called_once_with()
         gui.live_input_meter.configure.assert_any_call(mode="determinate")
         gui.live_input_meter.configure.assert_any_call(
             style="InputMeter.High.Horizontal.TProgressbar"
@@ -1060,83 +1005,97 @@ class GuiTaskTests(unittest.TestCase):
             style="InputMeter.High.TLabel"
         )
 
-    def test_start_import_enqueues_speaker_choice(self) -> None:
+    def test_start_import_submits_with_speaker_choice(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             media_path = Path(temp_dir) / "demo.mp3"
             media_path.write_bytes(b"fake-audio")
             gui = LiveNoteGui.__new__(LiveNoteGui)
             gui._ensure_queue_ready = Mock(return_value=True)
+            gui.service = SimpleNamespace(import_audio_file=Mock(return_value="task-import-1"))
             gui.import_file_var = SimpleNamespace(get=lambda: str(media_path))
             gui.import_title_var = SimpleNamespace(get=lambda: "课程录音")
             gui.import_kind_var = SimpleNamespace(get=lambda: "lecture")
             gui.import_language_var = SimpleNamespace(get=lambda: "沿用默认设置")
             gui.import_speaker_enabled_var = SimpleNamespace(get=lambda: True)
-            gui._enqueue_queue_task = Mock()
+            gui._append_log = Mock()
+            gui._refresh_queue_tree = Mock()
+            gui._refresh_remote_tasks = Mock()
+            gui._update_idle_status = Mock()
 
             gui._start_import()
 
-        gui._enqueue_queue_task.assert_called_once()
-        payload = gui._enqueue_queue_task.call_args.kwargs["payload"]
-        self.assertTrue(payload["speaker_enabled"])
+        gui.service.import_audio_file.assert_called_once_with(
+            file_path=str(media_path),
+            title="课程录音",
+            kind="lecture",
+            language=None,
+            speaker_enabled=True,
+        )
+        gui._append_log.assert_called_once_with("文件导入 已提交：task-import-1")
+        gui._refresh_queue_tree.assert_called_once_with()
+        gui._refresh_remote_tasks.assert_called_once_with()
+        gui._update_idle_status.assert_called_once_with()
 
-    def test_toggle_live_pause_pauses_and_resumes_auto_stop(self) -> None:
+    def test_toggle_live_pause_requests_pause_and_updates_ui(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
-        runner = SimpleNamespace(is_paused=False, request_pause=Mock(), request_resume=Mock())
-        gui.current_live_runner = runner
-        gui.pause_live_button = MagicMock()
+        gui._live_task_projection = build_live_task_snapshot(task_id="task-1", is_paused=False)
+        gui.service = SimpleNamespace(
+            request_live_task_pause=Mock(return_value=True),
+            request_live_task_resume=Mock(return_value=True),
+        )
         gui._append_log = Mock()
         gui._pause_live_auto_stop = Mock()
         gui._resume_live_auto_stop = Mock()
+        gui._refresh_live_runtime_state = Mock()
 
         gui._toggle_live_pause()
 
-        runner.request_pause.assert_called_once_with()
+        gui.service.request_live_task_pause.assert_called_once_with("task-1")
         gui._pause_live_auto_stop.assert_called_once_with()
+        gui._refresh_live_runtime_state.assert_called_once_with()
+        gui._append_log.assert_called_once_with("已请求暂停录音。")
 
-        runner = SimpleNamespace(is_paused=True, request_pause=Mock(), request_resume=Mock())
-        gui.current_live_runner = runner
-        gui.pause_live_button = MagicMock()
+    def test_toggle_live_pause_requests_resume_and_updates_ui(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui._live_task_projection = build_live_task_snapshot(task_id="task-1", is_paused=True)
+        gui.service = SimpleNamespace(
+            request_live_task_pause=Mock(return_value=True),
+            request_live_task_resume=Mock(return_value=True),
+        )
         gui._append_log = Mock()
         gui._pause_live_auto_stop = Mock()
         gui._resume_live_auto_stop = Mock()
+        gui._refresh_live_runtime_state = Mock()
 
         gui._toggle_live_pause()
 
-        runner.request_resume.assert_called_once_with()
+        gui.service.request_live_task_resume.assert_called_once_with("task-1")
         gui._resume_live_auto_stop.assert_called_once_with()
+        gui._refresh_live_runtime_state.assert_called_once_with()
+        gui._append_log.assert_called_once_with("已请求继续录音。")
 
     def test_request_live_stop_cancels_auto_stop_timer(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui.current_live_runner = SimpleNamespace(request_stop=Mock())
-        gui.stop_live_button = MagicMock()
-        gui.pause_live_button = MagicMock()
+        gui._live_task_projection = build_live_task_snapshot(task_id="task-1")
+        gui.service = SimpleNamespace(request_live_task_stop=Mock(return_value=True))
         gui._cancel_live_auto_stop = Mock()
+        gui._refresh_live_runtime_state = Mock()
         gui._append_log = Mock()
 
         gui._request_live_stop("已到自动停止时间，等待当前片段收尾。")
 
-        gui.current_live_runner.request_stop.assert_called_once_with()
+        gui.service.request_live_task_stop.assert_called_once_with("task-1")
         gui._cancel_live_auto_stop.assert_called_once_with()
+        gui._refresh_live_runtime_state.assert_called_once_with()
         gui._append_log.assert_called_once_with("已到自动停止时间，等待当前片段收尾。")
 
     def test_on_close_uses_stopping_prompt_after_stop_requested(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
         gui.root = SimpleNamespace(destroy=Mock())
-        gui._task_state = SimpleNamespace(
-            busy=True,
-            current_task_id="task-1",
-            current_task_label="实时录音",
-            current_task_session_id="session-1",
-            current_live_task_id="task-1",
-            queue_current_task_id=None,
-            queue_current_task_label=None,
-            background_tasks={},
-            background_task_sessions={},
-            foreground_live_detachable=False,
-            foreground_detached_to_background=False,
+        gui._live_task_projection = build_live_task_snapshot(
+            task_id="task-1",
+            stop_requested=True,
         )
-        gui._live_control = SimpleNamespace(runner=object(), is_stopping=True)
-        gui.queue_worker = None
         gui._queued_count = Mock(return_value=0)
 
         with patch("live_note.app.gui.messagebox.askyesno", return_value=True) as askyesno_mock:
@@ -1147,6 +1106,42 @@ class GuiTaskTests(unittest.TestCase):
             "当前录音正在停止中。关闭窗口后会继续等待后台收尾。是否继续关闭窗口？",
         )
         gui.root.destroy.assert_called_once_with()
+
+    def test_start_live_task_submits_runtime_task_and_refreshes_projection(self) -> None:
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.service = SimpleNamespace(start_live_task=Mock())
+        gui.start_live_button = MagicMock()
+        gui.status_var = SimpleNamespace(set=Mock())
+        gui._set_live_progress_state = Mock()
+        gui._append_log = Mock()
+        gui._refresh_live_runtime_state = Mock()
+
+        gui._start_live_task(
+            "task-0001",
+            "实时录音",
+            title="产品周会",
+            source="2",
+            kind="meeting",
+            language=None,
+            auto_refine_after_live=False,
+            speaker_enabled=True,
+        )
+
+        gui.start_live_button.configure.assert_called_once_with(state="disabled")
+        gui.status_var.set.assert_called_once_with("实时录音：准备中")
+        gui._set_live_progress_state.assert_called_once_with("实时录音：准备中")
+        gui.service.start_live_task.assert_called_once_with(
+            task_id="task-0001",
+            label="实时录音",
+            title="产品周会",
+            source="2",
+            kind="meeting",
+            language=None,
+            auto_refine_after_live=False,
+            speaker_enabled=True,
+        )
+        gui._append_log.assert_called_once_with("实时录音 已提交，等待 runtime 接管。")
+        gui._refresh_live_runtime_state.assert_called_once_with()
 
     def test_summary_supports_refine_when_live_segments_can_be_reconstructed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1192,95 +1187,81 @@ class GuiTaskTests(unittest.TestCase):
         self.assertIs(gui.window_logo_image, image)
         self.assertIs(gui.header_logo_image, header_image)
 
-    def test_handle_progress_updates_history_progress_for_determinate_event(self) -> None:
+    def test_set_queue_progress_state_updates_progress_widgets_for_determinate_state(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui.current_task_id = "task-0001"
-        gui.current_task_session_id = "session-1"
-        gui.current_live_task_id = None
-        gui.background_task_sessions = {}
-        gui.status_var = SimpleNamespace(set=Mock())
         gui.task_progress_var = SimpleNamespace(set=Mock())
         gui.history_progress = MagicMock()
         gui.progress = MagicMock()
-        gui._append_log = Mock()
 
-        gui._handle_progress(
-            ProgressEvent(
-                stage="merging",
-                message="正在合并会话 2/3：课程记录",
-                session_id="session-1",
-                current=2,
-                total=3,
-            )
-        )
+        gui._set_queue_progress_state("正在转写片段 2/4", current=2, total=4, active=True)
 
-        gui.status_var.set.assert_called_once_with("正在合并会话 2/3：课程记录")
-        gui.task_progress_var.set.assert_called_once_with("正在合并会话 2/3：课程记录")
-        gui.history_progress.stop.assert_called_once()
+        gui.task_progress_var.set.assert_called_once_with("正在转写片段 2/4")
+        gui.history_progress.stop.assert_called_once_with()
         gui.history_progress.configure.assert_called_once_with(mode="determinate")
-        self.assertEqual(gui.history_progress.__setitem__.call_args_list, [(("value", 67),)])
-
-    def test_handle_queue_progress_updates_primary_progress_for_determinate_event(self) -> None:
-        gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui.queue_current_task_id = "task-queue-1"
-        gui.busy = False
-        gui.status_var = SimpleNamespace(set=Mock())
-        gui.task_progress_var = SimpleNamespace(set=Mock())
-        gui.history_progress = MagicMock()
-        gui.progress = MagicMock()
-        gui._append_log = Mock()
-
-        gui._handle_progress(
-            ProgressEvent(
-                stage="transcribing",
-                message="正在转写片段 2/4",
-                current=2,
-                total=4,
-                source="queue",
-                task_id="task-queue-1",
-            )
-        )
-
-        gui.status_var.set.assert_called_once_with("正在转写片段 2/4")
-        gui.progress.stop.assert_called_once()
+        self.assertEqual(("value", 50), gui.history_progress.__setitem__.call_args.args)
+        gui.progress.stop.assert_called_once_with()
         gui.progress.configure.assert_called_once_with(mode="determinate")
-        self.assertEqual(gui.progress.__setitem__.call_args_list, [(("value", 50),)])
+        self.assertEqual(("value", 50), gui.progress.__setitem__.call_args.args)
 
-    def test_finish_task_resets_input_meter(self) -> None:
+    def test_refresh_live_runtime_state_clears_input_meter_when_live_task_ends(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui._live_controller = Mock(return_value=SimpleNamespace(clear=Mock()))
-        gui._task_state_model = Mock(return_value=SimpleNamespace(finish_foreground=Mock()))
+        gui._live_task_projection = build_live_task_snapshot(task_id="task-1")
+        gui.service = SimpleNamespace(get_active_live_task=Mock(return_value=None))
         gui.start_live_button = MagicMock()
         gui._reset_live_controls = Mock()
         gui.progress = MagicMock()
         gui._reset_live_input_meter = Mock()
         gui._update_idle_status = Mock()
-        gui._maybe_start_next_queue_task = Mock()
 
-        gui._finish_task()
+        result = gui._refresh_live_runtime_state()
 
+        self.assertIsNone(result)
+        gui.start_live_button.configure.assert_called_once_with(state="normal")
+        gui._reset_live_controls.assert_called_once_with()
         gui._reset_live_input_meter.assert_called_once_with()
+        gui.progress.stop.assert_called_once_with()
+        gui.progress.configure.assert_called_once_with(mode="determinate", value=0)
+        gui._update_idle_status.assert_called_once_with()
+        self.assertIsNone(gui.current_live_task_id)
 
-    def test_detach_live_task_resets_input_meter(self) -> None:
+    def test_refresh_live_runtime_state_applies_live_projection(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui._task_state_model = Mock(
-            return_value=SimpleNamespace(detach_live=Mock(return_value="task-1"))
+        snapshot = build_live_task_snapshot(
+            task_id="task-1",
+            message="正在整理",
+            current=2,
+            total=4,
+            is_paused=True,
         )
-        gui._live_controller = Mock(return_value=SimpleNamespace(clear=Mock()))
+        gui._live_task_projection = None
+        gui.service = SimpleNamespace(get_active_live_task=Mock(return_value=snapshot))
         gui.start_live_button = MagicMock()
-        gui._reset_live_controls = Mock()
-        gui.progress = MagicMock()
+        gui.stop_live_button = MagicMock()
+        gui.pause_live_button = MagicMock()
+        gui.status_var = SimpleNamespace(set=Mock())
+        gui._set_live_progress_state = Mock()
         gui._reset_live_input_meter = Mock()
-        gui._update_idle_status = Mock()
 
-        gui._detach_live_task("session-1")
+        result = gui._refresh_live_runtime_state()
 
+        self.assertIs(result, snapshot)
         gui._reset_live_input_meter.assert_called_once_with()
+        gui.start_live_button.configure.assert_called_once_with(state="disabled")
+        gui.stop_live_button.configure.assert_called_once_with(state="normal")
+        gui.pause_live_button.configure.assert_called_once_with(
+            state="normal",
+            text="继续录音",
+        )
+        gui.status_var.set.assert_called_once_with("正在整理")
+        gui._set_live_progress_state.assert_called_once_with(
+            "正在整理",
+            current=2,
+            total=4,
+            active=True,
+        )
 
     def test_update_idle_status_resets_history_progress_when_no_tasks(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui.busy = False
-        gui.background_tasks = {}
         gui.status_var = SimpleNamespace(set=Mock())
         gui.task_progress_var = SimpleNamespace(set=Mock())
         gui.history_progress = MagicMock()
@@ -1292,37 +1273,26 @@ class GuiTaskTests(unittest.TestCase):
         gui.history_progress.stop.assert_called_once()
         gui.history_progress.configure.assert_called_once_with(mode="determinate", value=0)
 
-    def test_handle_progress_detaches_live_task_after_capture_finished(self) -> None:
+    def test_refresh_live_runtime_state_resets_meter_when_capture_finished(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui.current_task_id = "task-0001"
-        gui.current_task_session_id = "session-1"
-        gui.current_live_task_id = "task-0001"
-        gui.background_task_sessions = {}
-        gui._append_log = Mock()
-        gui._detach_live_task = Mock()
-        gui._refresh_history = Mock()
-
-        gui._handle_progress(
-            ProgressEvent(
-                stage="capture_finished",
-                message="录音已停止，后台继续转写、精修和整理。",
-                session_id="session-1",
+        gui._live_task_projection = build_live_task_snapshot(task_id="task-0001")
+        gui.service = SimpleNamespace(
+            get_active_live_task=Mock(
+                return_value=build_live_task_snapshot(
+                    task_id="task-0001",
+                    stage="capture_finished",
+                    message="录音已停止，后台继续转写、精修和整理。",
+                )
             )
         )
+        gui._cancel_live_auto_stop = Mock()
+        gui._reset_live_input_meter = Mock()
+        gui._set_live_progress_state = Mock()
 
-        gui._append_log.assert_called_once_with("录音已停止，后台继续转写、精修和整理。")
-        gui._detach_live_task.assert_called_once_with("session-1")
-        gui._refresh_history.assert_called_once()
+        gui._refresh_live_runtime_state()
 
-    def test_find_background_task_by_session_falls_back_to_unknown_slot(self) -> None:
-        gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui.background_task_sessions = {
-            "task-0001": "session-1",
-            "task-0002": None,
-        }
-
-        self.assertEqual("task-0001", gui._find_background_task_by_session("session-1"))
-        self.assertEqual("task-0002", gui._find_background_task_by_session("session-2"))
+        gui._cancel_live_auto_stop.assert_called_once_with()
+        gui._reset_live_input_meter.assert_called_once_with()
 
     def test_retry_refine_skips_session_without_session_live_wav(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1335,12 +1305,10 @@ class GuiTaskTests(unittest.TestCase):
                 )
             )
             gui._ensure_ready_for_run = Mock(return_value=True)
-            gui._run_background = Mock()
 
             with patch("live_note.app.gui.messagebox.showinfo") as showinfo_mock:
                 gui._retry_refine()
 
-        gui._run_background.assert_not_called()
         showinfo_mock.assert_called_once_with(
             "无法离线精修",
             "所选会话没有可用的整场录音（session.live.wav），无法执行离线精修并重写。",
@@ -1390,16 +1358,17 @@ class GuiTaskTests(unittest.TestCase):
 
     def test_retry_retranscribe_enqueues_queue_task(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.service = SimpleNamespace(retranscribe=Mock())
         gui._selected_summary = Mock(return_value=SimpleNamespace(session_id="session-1"))
         gui._ensure_queue_ready = Mock(return_value=True)
-        gui._enqueue_queue_task = Mock()
+        gui._submit_session_operation = Mock()
 
         gui._retry_retranscribe()
 
-        gui._enqueue_queue_task.assert_called_once_with(
-            label="重转写并重写",
-            action="session_action",
-            payload={"action": "retranscribe", "session_id": "session-1"},
+        gui._submit_session_operation.assert_called_once_with(
+            "重转写并重写",
+            "session-1",
+            gui.service.retranscribe,
         )
 
     def test_merge_selected_sessions_rejects_remote_sessions(self) -> None:
@@ -1421,27 +1390,6 @@ class GuiTaskTests(unittest.TestCase):
             "暂不支持",
             "远端会话暂不支持在桌面端直接合并，请先分别完成整理或后续在服务端处理。",
         )
-
-    def test_maybe_start_next_queue_task_starts_first_record_when_idle(self) -> None:
-        gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui.queue_records = [
-            build_task_record(
-                task_id="task-0001",
-                action="session_action",
-                label="重转写并重写",
-                payload={"action": "retranscribe", "session_id": "session-1"},
-                created_at="2026-03-16T10:00:00+00:00",
-            )
-        ]
-        gui.queue_lock = threading.Lock()
-        gui.queue_worker = None
-        gui.busy = False
-        gui.background_tasks = {}
-        gui._start_queue_task = Mock()
-
-        gui._maybe_start_next_queue_task()
-
-        gui._start_queue_task.assert_called_once_with(gui.queue_records[0])
 
     def test_set_live_progress_state_uses_lower_frequency_animation(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
@@ -1476,7 +1424,6 @@ class GuiTaskTests(unittest.TestCase):
         gui = LiveNoteGui.__new__(LiveNoteGui)
         gui.cancel_queue_button = MagicMock()
         gui.queue_tree = SimpleNamespace(selection=lambda: ("task-0001",))
-        gui.queue_current_task_id = "task-0001"
         gui._queue_record = Mock(return_value=running_import)
 
         gui._on_queue_select(None)
@@ -1494,12 +1441,10 @@ class GuiTaskTests(unittest.TestCase):
             started_at="2026-03-19T10:01:00+00:00",
         )
         gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.service = SimpleNamespace(cancel_queued_tasks=Mock(return_value=0))
         gui.queue_tree = SimpleNamespace(selection=lambda: ("task-0001",))
-        gui.queue_current_task_id = "task-0001"
         gui._queue_record = Mock(return_value=running_import)
-        gui._queue_runtime = Mock(return_value=SimpleNamespace(cancel=Mock(return_value=0)))
         gui._request_running_queue_import_cancel = Mock(return_value=True)
-        gui._sync_queue_compat_state = Mock()
         gui._append_log = Mock()
         gui._refresh_queue_tree = Mock()
         gui._update_idle_status = Mock()
@@ -1510,146 +1455,71 @@ class GuiTaskTests(unittest.TestCase):
         gui._append_log.assert_called_once_with("已请求取消当前导入任务。")
         gui._refresh_queue_tree.assert_called_once_with()
 
+    def test_cancel_selected_queue_task_marks_queued_runtime_task_cancelled(self) -> None:
+        queued = build_task_record(
+            task_id="task-0002",
+            action="retranscribe",
+            label="重转写并重写",
+            payload={"session_id": "session-1"},
+            created_at="2026-03-19T10:00:00+00:00",
+        )
+        gui = LiveNoteGui.__new__(LiveNoteGui)
+        gui.service = SimpleNamespace(cancel_queued_tasks=Mock(return_value=1))
+        gui.queue_tree = SimpleNamespace(selection=lambda: ("task-0002",))
+        gui._queue_record = Mock(return_value=queued)
+        gui._append_log = Mock()
+        gui._refresh_queue_tree = Mock()
+        gui._update_idle_status = Mock()
+
+        gui._cancel_selected_queue_task()
+
+        gui.service.cancel_queued_tasks.assert_called_once_with({"task-0002"})
+        gui._append_log.assert_called_once_with("已取消所选排队任务。")
+
     def test_poll_events_uses_faster_interval_while_busy(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui.event_queue = queue.Queue()
         gui.root = MagicMock()
-        gui.busy = True
-        gui.queue_worker = None
-        gui.background_tasks = {}
+        gui._live_task_projection = build_live_task_snapshot(task_id="task-1")
+        gui._refresh_live_runtime_state = Mock()
+        gui._refresh_queue_tree = Mock()
+        gui._update_idle_status = Mock()
 
         gui._poll_events()
 
+        gui._refresh_live_runtime_state.assert_called_once_with()
+        gui._refresh_queue_tree.assert_called_once_with()
+        gui._update_idle_status.assert_called_once_with()
         gui.root.after.assert_called_once_with(120, gui._poll_events)
 
     def test_poll_events_uses_slower_interval_when_idle(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui.event_queue = queue.Queue()
         gui.root = MagicMock()
-        gui.busy = False
-        gui.queue_worker = None
-        gui.background_tasks = {}
+        gui._refresh_live_runtime_state = Mock()
+        gui._refresh_queue_tree = Mock()
+        gui._update_idle_status = Mock()
 
         gui._poll_events()
 
+        gui._refresh_live_runtime_state.assert_called_once_with()
+        gui._refresh_queue_tree.assert_called_once_with()
+        gui._update_idle_status.assert_called_once_with()
         gui.root.after.assert_called_once_with(400, gui._poll_events)
 
-    def test_maybe_start_next_queue_task_skips_when_live_or_background_busy(self) -> None:
-        record = build_task_record(
-            task_id="task-0001",
-            action="session_action",
-            label="重转写并重写",
-            payload={"action": "retranscribe", "session_id": "session-1"},
-            created_at="2026-03-16T10:00:00+00:00",
-        )
-
+    def test_load_task_queue_state_starts_runtime_once(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui.queue_records = [record]
-        gui.queue_lock = threading.Lock()
-        gui.queue_worker = None
-        gui.busy = True
-        gui.background_tasks = {}
-        gui.status_var = SimpleNamespace(set=Mock())
-        gui.task_progress_var = SimpleNamespace(set=Mock())
-        gui.history_progress = MagicMock()
-        gui._start_queue_task = Mock()
-        gui._maybe_start_next_queue_task()
-        gui._start_queue_task.assert_not_called()
-
-        gui.busy = False
-        gui.background_tasks = {"live-task": "实时录音"}
-        gui._maybe_start_next_queue_task()
-        gui._start_queue_task.assert_not_called()
-
-    def test_load_task_queue_state_keeps_queued_and_collects_interrupted_messages(self) -> None:
-        queued = build_task_record(
-            task_id="task-0001",
-            action="session_action",
-            label="重转写并重写",
-            payload={"action": "retranscribe", "session_id": "session-1"},
-            created_at="2026-03-16T10:00:00+00:00",
+        gui.service = SimpleNamespace(
+            start_runtime=Mock(),
         )
-        interrupted = build_task_record(
-            task_id="task-0002",
-            action="import",
-            label="导入文件",
-            payload={"file_path": "~/demo.mp3", "kind": "generic"},
-            created_at="2026-03-16T10:01:00+00:00",
-            status="running",
-            started_at="2026-03-16T10:02:00+00:00",
-        )
-        gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui.queue_store = SimpleNamespace(
-            load=Mock(
-                return_value=QueueLoadResult(
-                    active=[queued],
-                    interrupted=[interrupted],
-                    warnings=["队列文件损坏，已忽略。"],
-                )
-            ),
-            save=Mock(),
-        )
-        gui.queue_lock = threading.Lock()
-        gui.queue_records = []
-        gui.queue_worker = None
-        gui.busy = False
-        gui.background_tasks = {}
         gui.queue_tree = MagicMock()
         gui._refresh_queue_tree = Mock()
-        gui._append_log = Mock()
-        gui._maybe_start_next_queue_task = Mock()
+        gui._refresh_live_runtime_state = Mock()
+        gui._update_idle_status = Mock()
 
         gui._load_task_queue_state()
 
-        self.assertEqual([queued], gui.queue_records)
-        gui._refresh_queue_tree.assert_called_once()
-        gui._append_log.assert_any_call("队列文件损坏，已忽略。")
-        gui._append_log.assert_any_call("上次未完成的任务已标记为中断：导入文件")
-        gui._maybe_start_next_queue_task.assert_called_once()
-
-    def test_load_task_queue_state_persists_clean_queue_after_interrupted_recovery(self) -> None:
-        queued = build_task_record(
-            task_id="task-0007",
-            action="session_action",
-            label="重转写并重写",
-            payload={"action": "retranscribe", "session_id": "session-1"},
-            created_at="2026-03-16T10:00:00+00:00",
-        )
-        interrupted = build_task_record(
-            task_id="task-0003",
-            action="import",
-            label="导入文件",
-            payload={"file_path": "~/demo.mp3", "kind": "generic"},
-            created_at="2026-03-16T10:01:00+00:00",
-            status="running",
-            started_at="2026-03-16T10:02:00+00:00",
-        )
-        gui = LiveNoteGui.__new__(LiveNoteGui)
-        gui.queue_store = SimpleNamespace(
-            load=Mock(
-                return_value=QueueLoadResult(
-                    active=[queued],
-                    interrupted=[interrupted],
-                    warnings=[],
-                )
-            ),
-            save=Mock(),
-        )
-        gui.queue_lock = threading.Lock()
-        gui.queue_records = []
-        gui.queue_worker = None
-        gui.task_sequence = 0
-        gui.busy = False
-        gui.background_tasks = {}
-        gui.queue_tree = MagicMock()
-        gui._refresh_queue_tree = Mock()
-        gui._append_log = Mock()
-        gui._maybe_start_next_queue_task = Mock()
-
-        gui._load_task_queue_state()
-
-        gui.queue_store.save.assert_called_once_with([queued])
-        self.assertEqual("task-0008", gui._next_task_id())
+        gui.service.start_runtime.assert_called_once_with()
+        gui._refresh_live_runtime_state.assert_called_once_with()
+        gui._update_idle_status.assert_called_once_with()
 
 
 class GuiLayoutTests(unittest.TestCase):

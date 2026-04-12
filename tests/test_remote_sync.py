@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from live_note.app.remote_sync import apply_remote_artifacts, sync_remote_transcript_snapshot
+from live_note.remote_sync import apply_remote_artifacts, sync_remote_transcript_snapshot
 from live_note.config import (
     AppConfig,
     AudioConfig,
@@ -16,6 +16,7 @@ from live_note.config import (
     WhisperConfig,
 )
 from live_note.domain import SessionMetadata, TranscriptEntry
+from live_note.runtime import RuntimeHost
 
 
 class RemoteSyncTests(unittest.TestCase):
@@ -34,7 +35,7 @@ class RemoteSyncTests(unittest.TestCase):
             ]
 
             with patch(
-                "live_note.app.remote_sync.try_sync_note",
+                "live_note.remote_sync.try_sync_note",
                 side_effect=AssertionError("远端 snapshot 不应同步到 Obsidian"),
             ):
                 local_metadata = sync_remote_transcript_snapshot(config, metadata, entries)
@@ -66,7 +67,7 @@ class RemoteSyncTests(unittest.TestCase):
             structured_content = "# 远端整理\n\n- 要点 1\n"
 
             with patch(
-                "live_note.app.remote_sync.publish_final_outputs",
+                "live_note.remote_sync.publish_final_outputs",
                 side_effect=AssertionError("提供远端成品后不应再本地重写"),
             ):
                 local_metadata = apply_remote_artifacts(
@@ -86,6 +87,26 @@ class RemoteSyncTests(unittest.TestCase):
         self.assertEqual("remote-import-1", local_metadata.session_id)
         self.assertEqual(transcript_content, transcript_value)
         self.assertEqual(structured_content, structured_value)
+
+    def test_apply_remote_artifacts_preserves_remote_updated_at_as_runtime_truth(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = _sample_config(root)
+            metadata = _sample_metadata(root, "remote-import-1")
+
+            apply_remote_artifacts(
+                config,
+                metadata,
+                [],
+                remote_updated_at="2026-03-19T09:30:00+00:00",
+                transcript_content="# 远端原文\n",
+            )
+
+            record = RuntimeHost.for_root(root).sessions.get("remote-import-1")
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual("2026-03-19T09:30:00+00:00", record.updated_at)
 
 
 def _sample_config(root: Path) -> AppConfig:

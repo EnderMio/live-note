@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .coordinator import can_reconstruct_session_live_audio
-from .journal import SessionWorkspace
+from live_note.runtime.workflow_support import can_reconstruct_session_live_audio
+from live_note.session_workspace import SessionWorkspace
 
 
 class SessionSummaryLike(Protocol):
@@ -27,43 +27,6 @@ class TaskRequest:
     label: str
     action: str
     payload: dict[str, object]
-
-
-def build_import_task_request(
-    *,
-    file_path: Path,
-    title: str | None,
-    kind: str,
-    language: str | None,
-    speaker_enabled: bool | None = None,
-) -> TaskRequest:
-    return TaskRequest(
-        label="文件导入",
-        action="import",
-        payload={
-            "file_path": str(file_path),
-            "title": title or None,
-            "kind": kind,
-            "language": language,
-            "speaker_enabled": speaker_enabled,
-        },
-    )
-
-
-def build_session_task_request(
-    *,
-    label: str,
-    operation: str,
-    session_id: str,
-) -> TaskRequest:
-    return TaskRequest(
-        label=label,
-        action="session_action",
-        payload={
-            "action": operation,
-            "session_id": session_id,
-        },
-    )
 
 
 def build_merge_task_request(

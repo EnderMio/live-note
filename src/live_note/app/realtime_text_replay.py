@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from live_note.app.journal import SessionWorkspace
-from live_note.domain import SegmentEvent, SegmentState, SessionMetadata, TranscriptEntry
+from live_note.session_workspace import SessionWorkspace
+from live_note.domain import SegmentEvent, SegmentState, TranscriptEntry
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,39 +29,50 @@ class ReplayCheckpointRecord:
     final_truth: ReplayFinalTruth
 
 
+@dataclass(frozen=True, slots=True)
+class ReplayFixtureManifest:
+    transcript_source: str
+    refine_status: str
+    execution_target: str
+
+
 def load_replay_checkpoints(fixtures_root: Path) -> list[ReplayCheckpointRecord]:
     records: list[ReplayCheckpointRecord] = []
     for fixture_dir in sorted(path for path in fixtures_root.iterdir() if path.is_dir()):
         workspace = SessionWorkspace.load(fixture_dir)
-        metadata = workspace.read_session()
-        final_truth = _build_final_truth(fixture_dir.name, workspace, metadata)
-        records.extend(_load_fixture_records(fixture_dir.name, workspace, metadata, final_truth))
+        manifest = _load_fixture_manifest(fixture_dir)
+        final_truth = _build_final_truth(fixture_dir.name, workspace, manifest)
+        records.extend(_load_fixture_records(fixture_dir.name, workspace, final_truth))
     return records
 
 
 def _build_final_truth(
     fixture_id: str,
     workspace: SessionWorkspace,
-    metadata: SessionMetadata,
+    manifest: ReplayFixtureManifest,
 ) -> ReplayFinalTruth:
-    transcript_status = _read_note_status(workspace.transcript_md)
-    structured_status = _read_note_status(workspace.structured_md)
+    transcript_status = _read_note_field(workspace.transcript_md, "status") or "unknown"
+    structured_status = _read_note_field(workspace.structured_md, "status") or "unknown"
     transcript_text = _join_entries(workspace.transcript_entries())
     return ReplayFinalTruth(
         fixture_id=fixture_id,
         transcript_text=transcript_text,
         transcript_status=transcript_status,
         structured_status=structured_status,
-        transcript_source=metadata.transcript_source,
-        refine_status=metadata.refine_status,
-        execution_target=metadata.execution_target,
+        transcript_source=(
+            _read_note_field(workspace.transcript_md, "transcript_source")
+            or manifest.transcript_source
+        ),
+        refine_status=(
+            _read_note_field(workspace.transcript_md, "refine_status") or manifest.refine_status
+        ),
+        execution_target=manifest.execution_target,
     )
 
 
 def _load_fixture_records(
     fixture_id: str,
     workspace: SessionWorkspace,
-    metadata: SessionMetadata,
     final_truth: ReplayFinalTruth,
 ) -> list[ReplayCheckpointRecord]:
     records: list[ReplayCheckpointRecord] = []
@@ -73,7 +85,7 @@ def _load_fixture_records(
                 final_truth=final_truth,
             )
         )
-    canonical_source = "live_draft" if metadata.transcript_source == "live" else "canonical_final"
+    canonical_source = "live_draft" if final_truth.transcript_source == "live" else "canonical_final"
     records.extend(
         _build_records_from_events(
             fixture_id=fixture_id,
@@ -170,7 +182,25 @@ def _join_entries(entries: list[TranscriptEntry]) -> str:
     return "\n".join(entry.text.strip() for entry in entries if entry.text.strip())
 
 
-def _read_note_status(note_path: Path) -> str:
+def _load_fixture_manifest(fixture_dir: Path) -> ReplayFixtureManifest:
+    transcript_source = _read_note_field(fixture_dir / "transcript.md", "transcript_source")
+    refine_status = _read_note_field(fixture_dir / "transcript.md", "refine_status")
+    execution_target = "local"
+    session_toml = fixture_dir / "session.toml"
+    if session_toml.exists():
+        with session_toml.open("rb") as handle:
+            data = tomllib.load(handle)
+        transcript_source = _fixture_string(data.get("transcript_source")) or transcript_source
+        refine_status = _fixture_string(data.get("refine_status")) or refine_status
+        execution_target = _fixture_string(data.get("execution_target")) or execution_target
+    return ReplayFixtureManifest(
+        transcript_source=transcript_source or "live",
+        refine_status=refine_status or "disabled",
+        execution_target=execution_target,
+    )
+
+
+def _read_note_field(note_path: Path, key: str) -> str | None:
     in_frontmatter = False
     for line in note_path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
@@ -181,7 +211,14 @@ def _read_note_status(note_path: Path) -> str:
             continue
         if not in_frontmatter or not stripped or ":" not in stripped:
             continue
-        key, value = stripped.split(":", 1)
-        if key.strip() == "status":
+        field, value = stripped.split(":", 1)
+        if field.strip() == key:
             return value.strip().strip('"')
-    return "unknown"
+    return None
+
+
+def _fixture_string(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None

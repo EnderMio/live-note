@@ -7,6 +7,39 @@ from fastapi.testclient import TestClient
 from live_note.remote.api import create_remote_app
 
 
+class _FakeLiveGateway:
+    async def handle(self, websocket) -> None:
+        await websocket.accept()
+        payload = await websocket.receive_json()
+        if payload["type"] != "start":
+            raise AssertionError("expected start event")
+        await websocket.send_json(
+            {
+                "type": "session_started",
+                "session_id": "session-1",
+                "status": "listening",
+            }
+        )
+        await websocket.receive_bytes()
+        stop_payload = await websocket.receive_json()
+        if stop_payload["type"] != "stop":
+            raise AssertionError("expected stop event")
+        await websocket.send_json(
+            {
+                "type": "stop_accepted",
+                "session_id": "session-1",
+                "message": "远端已接受停止请求，正在封口与排空。",
+            }
+        )
+        await websocket.send_json(
+            {
+                "type": "completed",
+                "session_id": "session-1",
+            }
+        )
+        await websocket.close()
+
+
 class _FakeRemoteService:
     def __init__(self) -> None:
         self.import_request: dict[str, object] | None = None
@@ -21,14 +54,27 @@ class _FakeRemoteService:
         }
 
     def list_sessions_payload(self) -> list[dict[str, object]]:
-        return [{"session_id": "session-1", "title": "机器学习导论"}]
+        return [
+            {
+                "session_id": "session-1",
+                "title": "机器学习导论",
+                "updated_at": "2026-04-11T00:00:00+00:00",
+            }
+        ]
 
     def session_payload(self, session_id: str) -> dict[str, object]:
-        return {"session_id": session_id, "status": "finalized"}
+        return {
+            "session_id": session_id,
+            "status": "finalized",
+            "runtime_status": "completed",
+            "updated_at": "2026-04-11T00:00:00+00:00",
+        }
 
     def artifacts_payload(self, session_id: str) -> dict[str, object]:
         return {
             "session_id": session_id,
+            "runtime_status": "completed",
+            "updated_at": "2026-04-11T00:00:00+00:00",
             "metadata": {
                 "session_id": session_id,
                 "title": "机器学习导论",
@@ -166,54 +212,17 @@ class _FakeRemoteService:
             "message": "已取消。",
         }
 
-    async def live_session(self, websocket) -> None:
-        await websocket.accept()
-        payload = await websocket.receive_json()
-        if payload["type"] != "start":
-            raise AssertionError("expected start event")
-        await websocket.send_json(
-            {
-                "type": "session_started",
-                "session_id": "session-1",
-                "status": "listening",
-            }
-        )
-        await websocket.receive_bytes()
-        stop_payload = await websocket.receive_json()
-        if stop_payload["type"] != "stop":
-            raise AssertionError("expected stop event")
-        await websocket.send_json(
-            {
-                "type": "stop_received",
-                "session_id": "session-1",
-                "message": "远端已确认停止，后台整理任务已创建。",
-                "postprocess_task": {
-                    "task_id": "task-post-1",
-                    "server_id": "server-1",
-                    "action": "postprocess",
-                    "label": "后台整理",
-                    "session_id": "session-1",
-                    "status": "running",
-                    "stage": "handoff",
-                    "message": "后台整理已接管。",
-                    "result_version": 0,
-                    "can_cancel": False,
-                },
-            }
-        )
-        await websocket.send_json(
-            {
-                "type": "completed",
-                "session_id": "session-1",
-            }
-        )
-        await websocket.close()
-
 
 class RemoteApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = _FakeRemoteService()
-        self.client = TestClient(create_remote_app(self.service))
+        self.client = TestClient(
+            create_remote_app(
+                self.service,
+                self.service,
+                live_gateway=_FakeLiveGateway(),
+            )
+        )
 
     def test_health_endpoint_returns_service_payload(self) -> None:
         response = self.client.get("/api/v1/health")
@@ -236,6 +245,8 @@ class RemoteApiTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         payload = response.json()
         self.assertEqual("session-1", payload["session_id"])
+        self.assertEqual("completed", payload["runtime_status"])
+        self.assertEqual("2026-04-11T00:00:00+00:00", payload["updated_at"])
         self.assertEqual("Speaker 1", payload["entries"][0]["speaker_label"])
         self.assertEqual("# 原文\n", payload["transcript_content"])
         self.assertEqual("# 整理\n", payload["structured_content"])
@@ -246,12 +257,11 @@ class RemoteApiTests(unittest.TestCase):
             started = websocket.receive_json()
             websocket.send_bytes(b"\x00\x00" * 320)
             websocket.send_json({"type": "stop"})
-            stop_received = websocket.receive_json()
+            stop_accepted = websocket.receive_json()
             completed = websocket.receive_json()
 
         self.assertEqual("session_started", started["type"])
-        self.assertEqual("stop_received", stop_received["type"])
-        self.assertEqual("task-post-1", stop_received["postprocess_task"]["task_id"])
+        self.assertEqual("stop_accepted", stop_accepted["type"])
         self.assertEqual("completed", completed["type"])
         self.assertNotIn("postprocess_task", completed)
 

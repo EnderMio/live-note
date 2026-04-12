@@ -4,8 +4,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from live_note.app.journal import SessionWorkspace
+from live_note.session_workspace import SessionWorkspace
 from live_note.domain import SessionMetadata
+from live_note.runtime import RuntimeHost
+from live_note.runtime.domain.session_state import SessionCommandKind, SessionStatus
+from live_note.runtime.session_mutations import (
+    apply_workspace_session_command,
+    create_workspace_session,
+    update_workspace_session,
+)
 
 
 def sample_metadata(session_dir: str) -> SessionMetadata:
@@ -21,11 +28,68 @@ def sample_metadata(session_dir: str) -> SessionMetadata:
         transcript_note_path="Sessions/Transcripts/2026-03-15/机器学习导论-210500.md",
         structured_note_path="Sessions/Summaries/2026-03-15/机器学习导论-210500.md",
         session_dir=session_dir,
-        status="live",
+        status=SessionStatus.STARTING.value,
     )
 
 
 class SessionWorkspaceTests(unittest.TestCase):
+    def test_create_is_artifact_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_dir = root / ".live-note" / "sessions" / "20260315-210500-机器学习"
+            workspace = SessionWorkspace.create(session_dir, sample_metadata(str(session_dir)))
+            self.assertTrue(workspace.session_toml.exists())
+
+            record = RuntimeHost.for_root(root).sessions.get(
+                "20260315-210500-机器学习"
+            )
+
+        self.assertIsNone(record)
+
+    def test_runtime_session_creation_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_dir = root / ".live-note" / "sessions" / "20260315-210500-机器学习"
+            workspace = create_workspace_session(root, sample_metadata(str(session_dir)))
+            record = RuntimeHost.for_root(root).sessions.get("20260315-210500-机器学习")
+
+        self.assertIsNotNone(record)
+        self.assertEqual("lecture", record.kind)
+        self.assertEqual(str(workspace.root), record.session_dir)
+
+    def test_runtime_session_command_updates_workspace_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_dir = root / ".live-note" / "sessions" / "20260315-210500-机器学习"
+            workspace = create_workspace_session(root, sample_metadata(str(session_dir)))
+            persisted = apply_workspace_session_command(
+                root,
+                workspace,
+                SessionCommandKind.BEGIN_INGEST.value,
+            )
+            record = RuntimeHost.for_root(root).sessions.get(
+                "20260315-210500-机器学习"
+            )
+
+        self.assertIsNotNone(record)
+        self.assertEqual("ingesting", record.status)
+        self.assertEqual("ingesting", record.display_status)
+        self.assertEqual("ingesting", persisted.status)
+
+    def test_runtime_status_update_via_metadata_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_dir = root / ".live-note" / "sessions" / "20260315-210500-机器学习"
+            workspace = create_workspace_session(root, sample_metadata(str(session_dir)))
+
+            with self.assertRaisesRegex(ValueError, "session lifecycle status"):
+                update_workspace_session(
+                    root,
+                    workspace,
+                    event_kind="test_status_change",
+                    runtime_status="paused",
+                )
+
     def test_rebuild_segment_states_and_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = SessionWorkspace.create(Path(temp_dir), sample_metadata(temp_dir))

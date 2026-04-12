@@ -7,20 +7,30 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from live_note.app.journal import SessionWorkspace
+from live_note.config import (
+    AppConfig,
+    AudioConfig,
+    ImportConfig,
+    LlmConfig,
+    ObsidianConfig,
+    RefineConfig,
+    WhisperConfig,
+)
 from live_note.domain import SessionMetadata
-from live_note.remote.server import build_session_artifacts_payload, serve_remote_app
+from live_note.remote.server import serve_remote_app
+from live_note.remote.session_views import RemoteSessionViews
+from live_note.runtime.session_mutations import create_workspace_session
 
 
 class RemoteServerTests(unittest.TestCase):
-    def test_build_session_artifacts_payload_includes_entries_and_session_audio_flag(self) -> None:
+    def test_remote_session_views_artifacts_payload_includes_entries_and_session_audio_flag(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            session_root = root / "session-1"
-            workspace = SessionWorkspace.create(
-                session_root,
-                _sample_metadata(session_root),
-            )
+            session_root = root / ".live-note" / "sessions" / "session-1"
+            views = RemoteSessionViews(_build_config(root), server_id="server-1")
+            workspace = create_workspace_session(root, _sample_metadata(session_root))
             wav_path = workspace.next_wav_path("seg-00001")
             wav_path.parent.mkdir(parents=True, exist_ok=True)
             wav_path.write_bytes(b"wav")
@@ -36,9 +46,10 @@ class RemoteServerTests(unittest.TestCase):
             workspace.write_transcript("# 原文\n")
             workspace.write_structured("# 整理\n")
 
-            payload = build_session_artifacts_payload(workspace)
+            payload = views.artifacts_payload("session-1")
 
         self.assertEqual("session-1", payload["metadata"]["session_id"])
+        self.assertEqual("completed", payload["runtime_status"])
         self.assertTrue(payload["has_session_audio"])
         self.assertEqual("Speaker 1", payload["entries"][0]["speaker_label"])
         self.assertEqual("# 原文\n", payload["transcript_content"])
@@ -114,4 +125,31 @@ def _sample_metadata(session_dir: Path) -> SessionMetadata:
         execution_target="remote",
         remote_session_id="session-1",
         speaker_status="done",
+    )
+
+
+def _build_config(root: Path) -> AppConfig:
+    model_path = root / "model.bin"
+    model_path.write_bytes(b"model")
+    return AppConfig(
+        audio=AudioConfig(),
+        importer=ImportConfig(),
+        refine=RefineConfig(),
+        whisper=WhisperConfig(
+            binary="/tmp/whisper-server",
+            model=model_path,
+            language="zh",
+        ),
+        obsidian=ObsidianConfig(
+            enabled=False,
+            base_url="https://127.0.0.1:27124",
+            transcript_dir="Sessions/Transcripts",
+            structured_dir="Sessions/Summaries",
+        ),
+        llm=LlmConfig(
+            enabled=False,
+            base_url="https://api.openai.com/v1",
+            model="gpt-4.1-mini",
+        ),
+        root_dir=root,
     )

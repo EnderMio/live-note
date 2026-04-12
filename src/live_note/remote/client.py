@@ -159,15 +159,21 @@ class RemoteClient:
         return self.get_session_artifacts(session_id)
 
     def refine_session(self, session_id: str, *, request_id: str | None = None) -> dict[str, Any]:
-        encoded_session_id = _quote_path_segment(session_id)
-        return self._request_json(
-            "POST",
-            f"/api/v1/sessions/{encoded_session_id}/actions/refine",
-            query={"request_id": request_id} if request_id else None,
-        )
+        return self._request_remote_session_task(session_id, "refine", request_id=request_id)
 
     def refine(self, session_id: str, *, request_id: str | None = None) -> dict[str, Any]:
         return self.refine_session(session_id, request_id=request_id)
+
+    def republish_session(
+        self,
+        session_id: str,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request_remote_session_task(session_id, "republish", request_id=request_id)
+
+    def republish(self, session_id: str, *, request_id: str | None = None) -> dict[str, Any]:
+        return self.republish_session(session_id, request_id=request_id)
 
     def retranscribe_session(
         self,
@@ -175,15 +181,25 @@ class RemoteClient:
         *,
         request_id: str | None = None,
     ) -> dict[str, Any]:
-        encoded_session_id = _quote_path_segment(session_id)
-        return self._request_json(
-            "POST",
-            f"/api/v1/sessions/{encoded_session_id}/actions/retranscribe",
-            query={"request_id": request_id} if request_id else None,
+        return self._request_remote_session_task(
+            session_id,
+            "retranscribe",
+            request_id=request_id,
         )
 
     def retranscribe(self, session_id: str, *, request_id: str | None = None) -> dict[str, Any]:
         return self.retranscribe_session(session_id, request_id=request_id)
+
+    def finalize_session(
+        self,
+        session_id: str,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request_remote_session_task(session_id, "finalize", request_id=request_id)
+
+    def finalize(self, session_id: str, *, request_id: str | None = None) -> dict[str, Any]:
+        return self.finalize_session(session_id, request_id=request_id)
 
     def open_live(self) -> RemoteLiveConnection:
         return self.connect_live({})
@@ -251,6 +267,23 @@ class RemoteClient:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
             raise RemoteClientError("远端返回了无效 JSON。") from exc
+
+    def _request_remote_session_task(
+        self,
+        session_id: str,
+        action: str,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        encoded_session_id = _quote_path_segment(session_id)
+        payload = self._request_json(
+            "POST",
+            f"/api/v1/sessions/{encoded_session_id}/actions/{action}",
+            query={"request_id": request_id} if request_id else None,
+        )
+        if not isinstance(payload, dict):
+            raise RemoteClientError("远端会话任务响应格式无效。")
+        return payload
 
 
 def _quote_path_segment(value: str) -> str:

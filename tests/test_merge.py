@@ -7,10 +7,11 @@ from array import array
 from pathlib import Path
 from unittest.mock import patch
 
-from live_note.app.coordinator import merge_sessions, refine_session
-from live_note.app.journal import SessionWorkspace, list_sessions
+from live_note.session_workspace import SessionWorkspace, list_sessions
 from live_note.app.services import AppService, SettingsDraft
 from live_note.domain import SessionMetadata
+from live_note.runtime.domain.session_state import SessionStatus
+from live_note.runtime.session_workflows import merge_sessions, refine_session
 
 
 def _write_wav(path: Path, sample_rate: int, samples: list[int]) -> None:
@@ -42,7 +43,7 @@ def _build_metadata(
         transcript_note_path=f"Sessions/Transcripts/2026-03-15/{session_id}.md",
         structured_note_path=f"Sessions/Summaries/2026-03-15/{session_id}.md",
         session_dir=str(session_dir),
-        status="live",
+        status=SessionStatus.INGESTING.value,
         transcript_source="live",
         refine_status="pending",
     )
@@ -112,12 +113,12 @@ class MergeSessionTests(unittest.TestCase):
             self.assertFalse(workspace.session_live_wav.exists())
 
             with (
-                patch("live_note.app.coordinator._attach_console_logging"),
-                patch("live_note.app.coordinator.ObsidianClient"),
-                patch("live_note.app.coordinator.OpenAiCompatibleClient"),
-                patch("live_note.app.coordinator.publish_final_outputs"),
+                patch("live_note.runtime.session_workflows._attach_console_logging"),
+                patch("live_note.runtime.session_workflows.ObsidianClient"),
+                patch("live_note.runtime.session_workflows.OpenAiCompatibleClient"),
+                patch("live_note.runtime.session_workflows.publish_final_outputs"),
                 patch(
-                    "live_note.app.coordinator._run_live_refinement",
+                    "live_note.runtime.session_workflows._run_live_refinement",
                     side_effect=lambda **kwargs: kwargs["metadata"],
                 ),
             ):

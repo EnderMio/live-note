@@ -6,49 +6,34 @@ import wave
 from pathlib import Path
 from types import SimpleNamespace
 
-from live_note.app.session_actions import (
-    build_history_detail,
-    build_import_task_request,
-    build_session_task_request,
-    supports_refine,
-)
+from live_note.app.session_actions import build_history_detail, can_merge_summaries, supports_refine
 
 
 class SessionActionsTests(unittest.TestCase):
-    def test_build_import_task_request_preserves_payload(self) -> None:
-        request = build_import_task_request(
-            file_path=Path("/tmp/demo.mp3"),
-            title="课程录音",
-            kind="lecture",
-            language="zh",
-            speaker_enabled=True,
+    def test_can_merge_summaries_requires_all_local(self) -> None:
+        self.assertTrue(
+            can_merge_summaries(
+                [
+                    SimpleNamespace(execution_target="local"),
+                    SimpleNamespace(execution_target="local"),
+                ]
+            )
         )
-
-        self.assertEqual("文件导入", request.label)
-        self.assertEqual("import", request.action)
-        self.assertEqual("/tmp/demo.mp3", request.payload["file_path"])
-        self.assertEqual("课程录音", request.payload["title"])
-        self.assertEqual("lecture", request.payload["kind"])
-        self.assertEqual("zh", request.payload["language"])
-        self.assertTrue(request.payload["speaker_enabled"])
-
-    def test_build_session_task_request_uses_session_action_channel(self) -> None:
-        request = build_session_task_request(
-            label="重新生成整理",
-            operation="republish",
-            session_id="20260318-demo",
+        self.assertFalse(
+            can_merge_summaries(
+                [
+                    SimpleNamespace(execution_target="remote"),
+                    SimpleNamespace(execution_target="local"),
+                ]
+            )
         )
-
-        self.assertEqual("session_action", request.action)
-        self.assertEqual("republish", request.payload["action"])
-        self.assertEqual("20260318-demo", request.payload["session_id"])
 
     def test_build_history_detail_for_multiple_summaries(self) -> None:
         summaries = [
-            SimpleNamespace(title="周会 A"),
-            SimpleNamespace(title="周会 B"),
-            SimpleNamespace(title="周会 C"),
-            SimpleNamespace(title="周会 D"),
+            SimpleNamespace(title="周会 A", execution_target="local"),
+            SimpleNamespace(title="周会 B", execution_target="local"),
+            SimpleNamespace(title="周会 C", execution_target="local"),
+            SimpleNamespace(title="周会 D", execution_target="local"),
         ]
 
         detail = build_history_detail(summaries)
@@ -60,7 +45,7 @@ class SessionActionsTests(unittest.TestCase):
         summaries = [
             SimpleNamespace(title="远端课程 A", execution_target="remote"),
             SimpleNamespace(title="远端课程 B", execution_target="remote"),
-            SimpleNamespace(title="周会 D"),
+            SimpleNamespace(title="周会 D", execution_target="local"),
         ]
 
         detail = build_history_detail(summaries)
