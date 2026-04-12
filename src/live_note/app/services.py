@@ -26,7 +26,6 @@ from live_note.runtime import (
     control_db_path as runtime_control_db_path,
 )
 from live_note.runtime.domain.remote_task_projection import RemoteTaskProjectionRecord
-from live_note.runtime.remote_projection_target import reconcile_remote_projection_target
 from live_note.runtime.domain.task_state import TaskRecord, TaskStatus
 from live_note.runtime.remote_task_projections import (
     list_remote_task_projections,
@@ -282,8 +281,6 @@ class AppService:
             config = self.load_config()
         except Exception:
             return []
-        if config.remote.enabled:
-            reconcile_remote_projection_target(config.root_dir, config.remote.base_url)
         return load_session_summaries(config.root_dir)
 
     def list_remote_task_summaries(self) -> RemoteTaskSnapshot:
@@ -302,7 +299,6 @@ class AppService:
                 availability_message="远端模式未启用。",
                 tasks=_remote_task_summaries(list_remote_task_projections(config.root_dir)),
             )
-        reconcile_remote_projection_target(config.root_dir, config.remote.base_url)
         synced = list_remote_task_projections(config.root_dir)
         return RemoteTaskSnapshot(
             remote_available=True,

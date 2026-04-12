@@ -44,8 +44,7 @@
 ## 常用命令
 
 - `make gui`：启动桌面界面，包含首启向导、实时录音、文件导入和历史会话
-- `make serve`：启动局域网远端转写服务，适合放在 Mac mini 等常电机器上
-- `make deploy-remote ARGS='--host ender@mini.local'`：把当前代码同步到远端，并安装或更新 `launchd` 常驻服务
+- `make serve`：启动局域网远端转写服务，适合放在常电的远端机器上
 - `make setup-speaker`：安装 sherpa 说话人区分依赖
 - `make setup-speaker-pyannote`：安装 `pyannote.audio` 说话人区分依赖
 - `make dev ARGS='--title 周会 --source 2 --kind meeting'`：实时转写
@@ -56,22 +55,20 @@
 - `make merge ARGS='--session 20260315-210500-上半场 --session 20260315-223000-下半场'`：把多条会话按开始时间顺序合并成一条新会话，原始会话保留
 - `make test`：运行单元测试
 
-## 远端模式（Mac mini）
+## 远端模式
 
 目标是把高功耗实时转写挪到局域网里的另一台机器上跑，桌面端只负责录音、控制和回写 Obsidian。
 
-1. 在 Mac mini 上准备好 `ffmpeg`、`whisper.cpp`、模型文件和同一份项目代码
-2. 在本机执行 `make deploy-remote ARGS='--host ender@mini.local'`。它会用 `rsync` 同步仓库、在远端建立 `.venv`、安装依赖，并写入 `~/Library/LaunchAgents/com.live-note.remote.plist`
-3. 如果要把实时稿切到 FunASR，可直接执行 `make deploy-remote ARGS='--host ender@mini.local --funasr'`。这会额外在远端创建 `~/live-note-funasr/`、拉取官方 `FunASR` 仓库、安装 `modelscope + funasr`，并注册 `~/Library/LaunchAgents/com.live-note.funasr.plist`
-4. 首次部署时，命令只会在远端缺少配置时自动复制 [config.remote.example.toml](config.remote.example.toml) 到 `~/Library/Application Support/live-note/config.remote.toml`，不会覆盖你已经调整过的远端配置
-5. 登录 Mac mini，编辑 `~/Library/Application Support/live-note/config.remote.toml`；在这份文件里保持 `remote.enabled = false`，配置 `[serve]`、`[whisper]`，并按需打开 `[funasr].enabled` 与 `[speaker]`
-6. 如需启用 sherpa 说话人区分，可执行 `make deploy-remote ARGS='--host ender@mini.local --speaker'`；如需启用 `pyannote`，执行 `make deploy-remote ARGS='--host ender@mini.local --speaker-pyannote'`
-7. 在桌面端把 `[remote]` 打开，例如：
+1. 在远端机器上准备好 `ffmpeg`、`whisper.cpp`、模型文件、项目代码和 Python 运行环境
+2. 复制 [config.remote.example.toml](config.remote.example.toml) 为远端运行配置，并填写 `[serve]`、`[whisper]`，按需打开 `[funasr]` 与 `[speaker]`
+3. 远端运行配置中的 `[remote].enabled` 保持 `false`
+4. 在远端机器上用你自己的进程管理方式启动 `make serve`
+5. 在桌面端把 `[remote]` 打开，例如：
 
 ```toml
 [remote]
 enabled = true
-base_url = "http://mini.local:8765"
+base_url = "http://remote-host.local:8765"
 api_token = "your-remote-token"
 upload_timeout_seconds = 180
 live_chunk_ms = 240
@@ -87,23 +84,18 @@ live_chunk_ms = 240
 - 因为远端导入使用 HTTP 直接上传，第一次点击导入后会先经历一个“上传音频到远端”的阶段；大文件在这个阶段不会立即出现分段进度
 - 大文件上传超时时，可提高 `[remote].upload_timeout_seconds`；默认 `180` 秒
 - 远端导入拿到 `session_id` 后，会持续把原文快照回写到本机会话目录，并按本机 Obsidian 设置增量同步；不必等整场导入完成才看到 transcript
-- 如果本机代码已升级到支持远端导入，但 Mac mini 还没重新执行 `make deploy-remote ...`，桌面端会直接提示“远端服务版本过旧”，需要先更新远端服务
-- `remote-deploy --funasr` 只负责把 FunASR websocket runtime 部署到远端，并注册 `com.live-note.funasr`；它默认按本机回环口的明文 `ws://127.0.0.1:10095` 启动，不启用 TLS；真正切换到 FunASR 仍要把远端 `config.remote.toml` 的 `[funasr].enabled = true` 打开
-- `remote-deploy` 在 `--python-bin` 保持默认 `python3` 时，会先尝试复用远端现有 `.venv` 的 base Python，避免把已经运行的 conda / pyenv 环境意外重建成系统 Python
 - 如果远端默认 `python3` 低于 3.10，官方 FunASR websocket server 会因语法不兼容而启动失败；这类机器上部署时请显式追加 `--python-bin /opt/miniconda3/bin/python3`
 - 如果把远端配置中的 `[funasr].enabled = true` 打开，远端实时稿会改走 FunASR WebSocket；停止录音后仍会按当前 `[whisper]` 配置执行最终精修
-- GUI 设置页里的 FunASR 项只负责保存桌面端的远端配置模板，不会直接切换已运行的 Mac mini 服务；实际后端以“设置与诊断”里的 `backend=...` 为准，切换仍需修改远端 `config.remote.toml` 并重启服务
-- 远端运行配置不要直接放在仓库根目录；否则后续 `rsync --delete`、拉新分支或重建工作区时容易被覆盖
-- `remote-deploy` 默认会重启远端 `launchd` 服务；如果你只想更新代码不重启，可追加 `--no-start`
+- GUI 设置页里的 FunASR 项只负责保存桌面端的远端配置模板；实际后端以“设置与诊断”里的 `backend=...` 为准，切换时需要修改远端运行配置并重启服务
+- 远端运行配置不要直接放在仓库根目录
 - 远端会话完成后，桌面端会把远端 artifacts 回写成本地 `.live-note/sessions/<session_id>/` 镜像，再按本地设置同步到 Obsidian
 - 远端会话的本地镜像会沿用服务端返回的笔记路径，不会因为本地重连或最终同步再额外创建一份空白原文笔记
 - 远端导入同样会回写成本地镜像，所以历史列表、离线任务、重转写和重新导出仍然按本地会话工作
 - 客户端关闭或断线时，远端托管任务会继续在服务端执行；重新打开 GUI 后，可在“记录库”顶部的“远端任务”区重新附着查看进度，并在结果同步失败时手动点击“重试同步”
 - 远端任务附着信息保存在本地 `.live-note/remote_tasks.json`；它不是执行队列，只用于记录“我正在关注哪些服务端任务”以及这些任务的同步状态。本机“任务队列”负责提交顺序，真正的远端执行顺序以服务端队列为准
-- v1 不做“服务端重启后任务恢复”。如果 Mac mini 上的远端服务被重启，桌面端会把原先仍在活动中的附着记录标成“已丢失 / 服务端已重置，任务无法恢复”；已经完成、失败或取消的历史任务会保留原状态，不会被误标成丢失
+- v1 不做“服务端重启后任务恢复”。如果远端服务被重启，桌面端会把原先仍在活动中的附着记录标成“已丢失 / 服务端已重置，任务无法恢复”；已经完成、失败或取消的历史任务会保留原状态，不会被误标成丢失
 - 远端会话标题可以直接使用中文；桌面端会正确编码带中文的 `session_id` 请求路径，避免完成后同步 artifacts 失败
 - 建议为 `[serve].api_token` 和 `[remote].api_token` 配同一值，不要在无认证状态下直接暴露到更大网络
-- Mac mini 场景建议使用 `launchd` 常驻 `make serve`；至少保证系统重启后服务能自动恢复
 - 远端机器上运行 `make doctor` 时，会按当前 `speaker.backend` 检查对应依赖：`sherpa_onnx` 或 `pyannote.audio`
 
 ## 说话人区分

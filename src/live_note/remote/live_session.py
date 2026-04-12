@@ -1068,7 +1068,7 @@ class RemoteLiveSessionRunner:
             self._drain_funasr_messages(connection, tracker, workspace, metadata, current_ms)
             awaiting_result = tracker.has_open_segment
         connection.send_stop()
-        deadline = time.monotonic() + min(max(self.config.remote.timeout_seconds, 1), 8)
+        deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
             if self._stop_event.is_set() and awaiting_result:
                 break

@@ -6,6 +6,9 @@ from pathlib import Path
 
 from live_note.config import load_config, render_config
 
+TEST_WHISPER_BINARY = "/test-bin/whisper-server"
+TEST_REMOTE_BASE_URL = "http://example.invalid:8765"
+
 
 class RemoteConfigTests(unittest.TestCase):
     def test_load_config_reads_remote_runtime_sections(self) -> None:
@@ -28,7 +31,7 @@ class RemoteConfigTests(unittest.TestCase):
                         "auto_after_live = true",
                         "",
                         "[whisper]",
-                        'binary = "/Users/demo/whisper-server"',
+                        f'binary = "{TEST_WHISPER_BINARY}"',
                         f'model = "{model_path}"',
                         "",
                         "[obsidian]",
@@ -39,7 +42,7 @@ class RemoteConfigTests(unittest.TestCase):
                         "",
                         "[remote]",
                         "enabled = true",
-                        'base_url = "http://mini.local:8765"',
+                        f'base_url = "{TEST_REMOTE_BASE_URL}"',
                         'api_token = "remote-token"',
                         "timeout_seconds = 22",
                         "ws_ping_interval_seconds = 35",
@@ -75,7 +78,7 @@ class RemoteConfigTests(unittest.TestCase):
             config = load_config(config_path)
 
         self.assertTrue(config.remote.enabled)
-        self.assertEqual("http://mini.local:8765", config.remote.base_url)
+        self.assertEqual(TEST_REMOTE_BASE_URL, config.remote.base_url)
         self.assertEqual("remote-token", config.remote.api_token)
         self.assertEqual(22, config.remote.timeout_seconds)
         self.assertEqual(35, config.remote.ws_ping_interval_seconds)
@@ -114,7 +117,7 @@ class RemoteConfigTests(unittest.TestCase):
                         "[refine]",
                         "",
                         "[whisper]",
-                        'binary = "/Users/demo/whisper-server"',
+                        f'binary = "{TEST_WHISPER_BINARY}"',
                         f'model = "{model_path}"',
                         "",
                         "[obsidian]",
@@ -154,7 +157,7 @@ class RemoteConfigTests(unittest.TestCase):
                         "[refine]",
                         "",
                         "[whisper]",
-                        'binary = "/Users/demo/whisper-server"',
+                        f'binary = "{TEST_WHISPER_BINARY}"',
                         f'model = "{model_path}"',
                         "",
                         "[obsidian]",

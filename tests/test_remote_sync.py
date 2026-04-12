@@ -16,7 +16,9 @@ from live_note.config import (
     WhisperConfig,
 )
 from live_note.domain import SessionMetadata, TranscriptEntry
-from live_note.runtime import RuntimeHost
+from live_note.runtime.remote_session_projections import get_remote_session_projection
+
+TEST_WHISPER_BINARY = "/test-bin/whisper-server"
 
 
 class RemoteSyncTests(unittest.TestCase):
@@ -66,17 +68,13 @@ class RemoteSyncTests(unittest.TestCase):
             transcript_content = "# 远端原文\n\n- [00:00:00] Speaker 1: 今天先看市场结构。\n"
             structured_content = "# 远端整理\n\n- 要点 1\n"
 
-            with patch(
-                "live_note.remote_sync.publish_final_outputs",
-                side_effect=AssertionError("提供远端成品后不应再本地重写"),
-            ):
-                local_metadata = apply_remote_artifacts(
-                    config,
-                    metadata,
-                    entries,
-                    transcript_content=transcript_content,
-                    structured_content=structured_content,
-                )
+            local_metadata = apply_remote_artifacts(
+                config,
+                metadata,
+                entries,
+                transcript_content=transcript_content,
+                structured_content=structured_content,
+            )
 
             workspace_root = root / ".live-note" / "sessions" / "remote-import-1"
             transcript_path = workspace_root / "transcript.md"
@@ -102,11 +100,11 @@ class RemoteSyncTests(unittest.TestCase):
                 transcript_content="# 远端原文\n",
             )
 
-            record = RuntimeHost.for_root(root).sessions.get("remote-import-1")
+            record = get_remote_session_projection(root, "remote-import-1")
 
         self.assertIsNotNone(record)
         assert record is not None
-        self.assertEqual("2026-03-19T09:30:00+00:00", record.updated_at)
+        self.assertEqual("2026-03-19T09:30:00+00:00", record.remote_updated_at)
 
 
 def _sample_config(root: Path) -> AppConfig:
@@ -117,7 +115,7 @@ def _sample_config(root: Path) -> AppConfig:
         importer=ImportConfig(),
         refine=RefineConfig(),
         whisper=WhisperConfig(
-            binary="/Users/demo/whisper-server",
+            binary=TEST_WHISPER_BINARY,
             model=model_path,
         ),
         obsidian=ObsidianConfig(

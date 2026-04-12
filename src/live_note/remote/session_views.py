@@ -25,7 +25,6 @@ class RemoteSessionViews:
             "supports_tasks": True,
             "server_id": self.server_id,
             "realtime_backend": "funasr" if self.config.funasr.enabled else "whisper_cpp",
-            "remote_enabled": self.config.remote.enabled,
         }
 
     def list_sessions_payload(self) -> list[dict[str, object]]:

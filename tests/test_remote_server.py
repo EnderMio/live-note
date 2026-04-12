@@ -13,16 +13,59 @@ from live_note.config import (
     ImportConfig,
     LlmConfig,
     ObsidianConfig,
+    RemoteConfig,
     RefineConfig,
+    ServeConfig,
     WhisperConfig,
 )
+from live_note.remote import api as remote_api
 from live_note.domain import SessionMetadata
 from live_note.remote.server import serve_remote_app
 from live_note.remote.session_views import RemoteSessionViews
 from live_note.runtime.session_mutations import create_workspace_session
 
+TEST_WHISPER_BINARY = "/test-bin/whisper-server"
+
 
 class RemoteServerTests(unittest.TestCase):
+    def test_remote_session_views_health_payload_exposes_server_capabilities_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            payload = RemoteSessionViews(_build_config(root), server_id="server-1").health_payload()
+
+        self.assertEqual("server-1", payload["server_id"])
+        self.assertEqual("whisper_cpp", payload["realtime_backend"])
+        self.assertNotIn("remote_enabled", payload)
+
+    def test_build_remote_app_uses_serve_api_token_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = _build_config(root)
+            config = AppConfig(
+                audio=config.audio,
+                importer=config.importer,
+                refine=config.refine,
+                whisper=config.whisper,
+                obsidian=config.obsidian,
+                llm=config.llm,
+                root_dir=config.root_dir,
+                remote=RemoteConfig(enabled=True, api_token="client-token"),
+                serve=ServeConfig(api_token="server-token"),
+                funasr=config.funasr,
+                speaker=config.speaker,
+            )
+
+            with (
+                patch.object(remote_api, "RemoteTaskCommands") as commands_factory,
+                patch.object(remote_api, "RemoteSessionViews"),
+                patch.object(remote_api, "RemoteLiveGateway"),
+                patch.object(remote_api, "create_remote_app", return_value=object()) as create_app,
+            ):
+                commands_factory.return_value.server_id = "server-1"
+                remote_api.build_remote_app(config)
+
+        self.assertEqual("server-token", create_app.call_args.kwargs["api_token"])
+
     def test_remote_session_views_artifacts_payload_includes_entries_and_session_audio_flag(
         self,
     ) -> None:
@@ -69,7 +112,7 @@ class RemoteServerTests(unittest.TestCase):
                         "[refine]",
                         "",
                         "[whisper]",
-                        'binary = "/Users/demo/whisper-server"',
+                        f'binary = "{TEST_WHISPER_BINARY}"',
                         'model = "./model.bin"',
                         "",
                         "[obsidian]",

@@ -25,6 +25,21 @@ from live_note.app.gui import (
 from live_note.app.services import DoctorCheck, LiveTaskSnapshot
 from live_note.runtime.domain.task_state import TaskRecord, TaskStatus
 
+TEST_WHISPER_BINARY = "/test-bin/whisper-server"
+TEST_WHISPER_MODEL = "/test-models/model.bin"
+TEST_REMOTE_BASE_URL = "http://example.invalid:8765"
+PROMPT_SELECT_ONE_SESSION = "请先从历史列表中选择一条会话。"
+PROMPT_SELECT_MULTI_SESSION = "请先从历史列表中选择至少 2 条会话。"
+MESSAGE_REFINE_REQUIRES_SESSION_WAV = (
+    "所选会话没有可用的整场录音（session.live.wav），无法执行离线精修并重写。"
+)
+MESSAGE_REMOTE_MERGE_UNSUPPORTED = "远端会话暂不支持在桌面端直接合并，请先分别完成整理或后续在服务端处理。"
+LOG_IMPORT_SUBMITTED_PREFIX = "文件导入 已提交："
+LOG_RUNNING_IMPORT_CANCEL_REQUESTED = "已请求取消当前导入任务。"
+LOG_QUEUED_TASK_CANCELLED = "已取消所选排队任务。"
+LOG_AUTO_STOP_REACHED = "已到自动停止时间，等待当前片段收尾。"
+LOG_LIVE_TASK_SUBMITTED = "实时录音 已提交，等待 runtime 接管。"
+
 
 def build_task_record(
     *,
@@ -87,21 +102,25 @@ def build_live_task_snapshot(
     )
 
 
+def _remote_execution_target_hint(status: str | None) -> str:
+    return _build_execution_target_hint(True, TEST_REMOTE_BASE_URL, status)
+
+
 class GuiLanguageTests(unittest.TestCase):
     def test_execution_target_helper_module_exports_same_hint_logic(self) -> None:
         from live_note.app.gui_execution_target import build_execution_target_hint
 
         self.assertEqual(
-            "当前转写：远端服务（172.21.0.159，已连接）",
-            build_execution_target_hint(True, "http://172.21.0.159:8765", "OK"),
+            _remote_execution_target_hint("OK"),
+            build_execution_target_hint(True, TEST_REMOTE_BASE_URL, "OK"),
         )
 
     def test_execution_target_helper_module_marks_unknown_remote_as_pending(self) -> None:
         from live_note.app.gui_execution_target import build_execution_target_hint
 
         self.assertEqual(
-            "当前转写：远端服务（172.21.0.159，待检测）",
-            build_execution_target_hint(True, "http://172.21.0.159:8765", None),
+            _remote_execution_target_hint(None),
+            build_execution_target_hint(True, TEST_REMOTE_BASE_URL, None),
         )
 
     def test_execution_target_helper_module_normalizes_blank_host(self) -> None:
@@ -141,14 +160,14 @@ class GuiLanguageTests(unittest.TestCase):
 
     def test_build_execution_target_hint_marks_remote_as_connected(self) -> None:
         self.assertEqual(
-            "当前转写：远端服务（172.21.0.159，已连接）",
-            _build_execution_target_hint(True, "http://172.21.0.159:8765", "OK"),
+            "当前转写：远端服务（example.invalid，已连接）",
+            _remote_execution_target_hint("OK"),
         )
 
     def test_build_execution_target_hint_marks_remote_as_unreachable(self) -> None:
         self.assertEqual(
-            "当前转写：远端服务（172.21.0.159，未连通）",
-            _build_execution_target_hint(True, "http://172.21.0.159:8765", "FAIL"),
+            "当前转写：远端服务（example.invalid，未连通）",
+            _remote_execution_target_hint("FAIL"),
         )
 
 
@@ -418,7 +437,7 @@ class GuiHistoryTests(unittest.TestCase):
             summary = gui._selected_summary()
 
         self.assertIsNone(summary)
-        showinfo_mock.assert_called_once_with("请选择会话", "请先从历史列表中选择一条会话。")
+        showinfo_mock.assert_called_once_with("请选择会话", PROMPT_SELECT_ONE_SESSION)
 
     def test_selected_summaries_require_multiple_items_when_requested(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
@@ -429,7 +448,7 @@ class GuiHistoryTests(unittest.TestCase):
             summaries = gui._selected_summaries(min_count=2)
 
         self.assertIsNone(summaries)
-        showinfo_mock.assert_called_once_with("请选择会话", "请先从历史列表中选择至少 2 条会话。")
+        showinfo_mock.assert_called_once_with("请选择会话", PROMPT_SELECT_MULTI_SESSION)
 
     def test_selected_summaries_return_all_selected_rows(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
@@ -795,8 +814,8 @@ class GuiTaskTests(unittest.TestCase):
         gui._load_settings(
             SimpleNamespace(
                 ffmpeg_binary="/opt/homebrew/bin/ffmpeg",
-                whisper_binary="/Users/demo/whisper-server",
-                whisper_model="/Users/demo/model.bin",
+                whisper_binary=TEST_WHISPER_BINARY,
+                whisper_model=TEST_WHISPER_MODEL,
                 whisper_host="127.0.0.1",
                 whisper_port=8178,
                 whisper_threads=4,
@@ -846,8 +865,8 @@ class GuiTaskTests(unittest.TestCase):
     def test_current_settings_reads_visible_speaker_backend_fields(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
         gui.ffmpeg_var = SimpleNamespace(get=lambda: "/opt/homebrew/bin/ffmpeg")
-        gui.whisper_binary_var = SimpleNamespace(get=lambda: "/Users/demo/whisper-server")
-        gui.whisper_model_var = SimpleNamespace(get=lambda: "/Users/demo/model.bin")
+        gui.whisper_binary_var = SimpleNamespace(get=lambda: TEST_WHISPER_BINARY)
+        gui.whisper_model_var = SimpleNamespace(get=lambda: TEST_WHISPER_MODEL)
         gui.whisper_host_var = SimpleNamespace(get=lambda: "127.0.0.1")
         gui.whisper_port_var = SimpleNamespace(get=lambda: "8178")
         gui.whisper_threads_var = SimpleNamespace(get=lambda: "4")
@@ -906,20 +925,18 @@ class GuiTaskTests(unittest.TestCase):
                 DoctorCheck(
                     "remote_health",
                     "OK",
-                    "连通 http://172.21.0.159:8765 | live-note-remote",
+                    "远端服务可用",
                 )
             ]
         )
         gui.doctor_tree = MagicMock()
         gui.remote_enabled_var = SimpleNamespace(get=lambda: True)
-        gui.remote_base_url_var = SimpleNamespace(get=lambda: "http://172.21.0.159:8765")
+        gui.remote_base_url_var = SimpleNamespace(get=lambda: TEST_REMOTE_BASE_URL)
         gui.execution_target_var = SimpleNamespace(set=Mock())
 
         gui._refresh_doctor_checks()
 
-        gui.execution_target_var.set.assert_called_once_with(
-            "当前转写：远端服务（172.21.0.159，已连接）"
-        )
+        gui.execution_target_var.set.assert_called_once_with(_remote_execution_target_hint("OK"))
 
     def test_start_live_session_logs_current_execution_target(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
@@ -940,14 +957,12 @@ class GuiTaskTests(unittest.TestCase):
         gui._arm_live_auto_stop = Mock()
         gui.stop_live_button = MagicMock()
         gui.pause_live_button = MagicMock()
-        gui.execution_target_var = SimpleNamespace(
-            get=lambda: "当前转写：远端服务（172.21.0.159，已连接）"
-        )
+        gui.execution_target_var = SimpleNamespace(get=lambda: _remote_execution_target_hint("OK"))
         gui._append_log = Mock()
 
         gui._start_live_session()
 
-        gui._append_log.assert_called_once_with("当前转写：远端服务（172.21.0.159，已连接）")
+        gui._append_log.assert_called_once_with(_remote_execution_target_hint("OK"))
         gui._arm_live_auto_stop.assert_called_once_with(None)
 
     def test_start_live_session_passes_auto_refine_choice(self) -> None:
@@ -1031,7 +1046,7 @@ class GuiTaskTests(unittest.TestCase):
             language=None,
             speaker_enabled=True,
         )
-        gui._append_log.assert_called_once_with("文件导入 已提交：task-import-1")
+        gui._append_log.assert_called_once_with(f"{LOG_IMPORT_SUBMITTED_PREFIX}task-import-1")
         gui._refresh_queue_tree.assert_called_once_with()
         gui._refresh_remote_tasks.assert_called_once_with()
         gui._update_idle_status.assert_called_once_with()
@@ -1087,7 +1102,7 @@ class GuiTaskTests(unittest.TestCase):
         gui.service.request_live_task_stop.assert_called_once_with("task-1")
         gui._cancel_live_auto_stop.assert_called_once_with()
         gui._refresh_live_runtime_state.assert_called_once_with()
-        gui._append_log.assert_called_once_with("已到自动停止时间，等待当前片段收尾。")
+        gui._append_log.assert_called_once_with(LOG_AUTO_STOP_REACHED)
 
     def test_on_close_uses_stopping_prompt_after_stop_requested(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)
@@ -1140,7 +1155,7 @@ class GuiTaskTests(unittest.TestCase):
             auto_refine_after_live=False,
             speaker_enabled=True,
         )
-        gui._append_log.assert_called_once_with("实时录音 已提交，等待 runtime 接管。")
+        gui._append_log.assert_called_once_with(LOG_LIVE_TASK_SUBMITTED)
         gui._refresh_live_runtime_state.assert_called_once_with()
 
     def test_summary_supports_refine_when_live_segments_can_be_reconstructed(self) -> None:
@@ -1306,12 +1321,12 @@ class GuiTaskTests(unittest.TestCase):
             )
             gui._ensure_ready_for_run = Mock(return_value=True)
 
-            with patch("live_note.app.gui.messagebox.showinfo") as showinfo_mock:
-                gui._retry_refine()
+        with patch("live_note.app.gui.messagebox.showinfo") as showinfo_mock:
+            gui._retry_refine()
 
         showinfo_mock.assert_called_once_with(
             "无法离线精修",
-            "所选会话没有可用的整场录音（session.live.wav），无法执行离线精修并重写。",
+            MESSAGE_REFINE_REQUIRES_SESSION_WAV,
         )
 
     def test_update_history_action_states_disables_refine_button_without_session_audio(
@@ -1388,7 +1403,7 @@ class GuiTaskTests(unittest.TestCase):
         gui._enqueue_queue_task.assert_not_called()
         showinfo_mock.assert_called_once_with(
             "暂不支持",
-            "远端会话暂不支持在桌面端直接合并，请先分别完成整理或后续在服务端处理。",
+            MESSAGE_REMOTE_MERGE_UNSUPPORTED,
         )
 
     def test_set_live_progress_state_uses_lower_frequency_animation(self) -> None:
@@ -1452,7 +1467,7 @@ class GuiTaskTests(unittest.TestCase):
         gui._cancel_selected_queue_task()
 
         gui._request_running_queue_import_cancel.assert_called_once_with("task-0001")
-        gui._append_log.assert_called_once_with("已请求取消当前导入任务。")
+        gui._append_log.assert_called_once_with(LOG_RUNNING_IMPORT_CANCEL_REQUESTED)
         gui._refresh_queue_tree.assert_called_once_with()
 
     def test_cancel_selected_queue_task_marks_queued_runtime_task_cancelled(self) -> None:
@@ -1474,7 +1489,7 @@ class GuiTaskTests(unittest.TestCase):
         gui._cancel_selected_queue_task()
 
         gui.service.cancel_queued_tasks.assert_called_once_with({"task-0002"})
-        gui._append_log.assert_called_once_with("已取消所选排队任务。")
+        gui._append_log.assert_called_once_with(LOG_QUEUED_TASK_CANCELLED)
 
     def test_poll_events_uses_faster_interval_while_busy(self) -> None:
         gui = LiveNoteGui.__new__(LiveNoteGui)

@@ -2,7 +2,7 @@ PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 PYTHONPATH := src
 ARGS ?=
 
-.PHONY: setup setup-speaker setup-speaker-pyannote dev gui serve deploy-remote doctor devices import finalize retranscribe refine merge test lint
+.PHONY: setup setup-speaker setup-speaker-pyannote dev gui serve doctor devices import finalize retranscribe refine merge test lint
 
 setup:
 	$(PYTHON) -m venv .venv
@@ -27,9 +27,6 @@ gui:
 
 serve:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note serve $(ARGS)
-
-deploy-remote:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note remote-deploy $(ARGS)
 
 doctor:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m live_note doctor

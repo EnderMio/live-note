@@ -11,7 +11,10 @@ from live_note.session_workspace import SessionWorkspace, list_sessions
 from live_note.app.services import AppService, SettingsDraft
 from live_note.domain import SessionMetadata
 from live_note.runtime.domain.session_state import SessionStatus
+from live_note.runtime.session_mutations import create_workspace_session
 from live_note.runtime.session_workflows import merge_sessions, refine_session
+
+TEST_WHISPER_BINARY = "/test-bin/whisper-server"
 
 
 def _write_wav(path: Path, sample_rate: int, samples: list[int]) -> None:
@@ -60,8 +63,8 @@ def _create_live_session(
     sample_rate: int = 16000,
 ) -> None:
     session_dir = root / ".live-note" / "sessions" / session_id
-    workspace = SessionWorkspace.create(
-        session_dir,
+    workspace = create_workspace_session(
+        root,
         _build_metadata(
             session_dir,
             session_id=session_id,
@@ -87,7 +90,7 @@ class MergeSessionTests(unittest.TestCase):
             service.save_settings(
                 SettingsDraft(
                     ffmpeg_binary="/opt/homebrew/bin/ffmpeg",
-                    whisper_binary="/Users/demo/whisper-server",
+                    whisper_binary=TEST_WHISPER_BINARY,
                     whisper_model=str(model_path),
                     obsidian_enabled=False,
                     llm_enabled=False,
@@ -95,8 +98,8 @@ class MergeSessionTests(unittest.TestCase):
             )
             session_id = "20260315-210500-课程片段回拼"
             session_dir = root / ".live-note" / "sessions" / session_id
-            workspace = SessionWorkspace.create(
-                session_dir,
+            workspace = create_workspace_session(
+                root,
                 _build_metadata(
                     session_dir,
                     session_id=session_id,
@@ -138,7 +141,7 @@ class MergeSessionTests(unittest.TestCase):
             service.save_settings(
                 SettingsDraft(
                     ffmpeg_binary="/opt/homebrew/bin/ffmpeg",
-                    whisper_binary="/Users/demo/whisper-server",
+                    whisper_binary=TEST_WHISPER_BINARY,
                     whisper_model=str(model_path),
                     obsidian_enabled=False,
                     llm_enabled=False,
@@ -208,7 +211,7 @@ class MergeSessionTests(unittest.TestCase):
             service.save_settings(
                 SettingsDraft(
                     ffmpeg_binary="/opt/homebrew/bin/ffmpeg",
-                    whisper_binary="/Users/demo/whisper-server",
+                    whisper_binary=TEST_WHISPER_BINARY,
                     whisper_model=str(model_path),
                     obsidian_enabled=False,
                     llm_enabled=False,
@@ -267,7 +270,7 @@ class MergeSessionTests(unittest.TestCase):
             service.save_settings(
                 SettingsDraft(
                     ffmpeg_binary="/opt/homebrew/bin/ffmpeg",
-                    whisper_binary="/Users/demo/whisper-server",
+                    whisper_binary=TEST_WHISPER_BINARY,
                     whisper_model=str(model_path),
                     obsidian_enabled=False,
                     llm_enabled=False,

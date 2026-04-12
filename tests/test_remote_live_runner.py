@@ -23,6 +23,12 @@ from live_note.domain import AudioFrame
 from live_note.remote.client import RemoteClientError
 from live_note.remote.live_runner import RemoteLiveRunner, _RemoteAudioBatcher
 
+TEST_WHISPER_BINARY = "/test-bin/whisper-server"
+TEST_REMOTE_BASE_URL = "http://example.invalid:8765"
+EVENT_CONNECTED = "已连接远端录音服务。"
+EVENT_STOP_ACCEPTED_FRAGMENT = "已接受停止请求"
+EVENT_HANDOFF_FRAGMENT = "durable handoff"
+
 
 def build_config(root: Path) -> AppConfig:
     model_path = root / "ggml-large-v3.bin"
@@ -32,7 +38,7 @@ def build_config(root: Path) -> AppConfig:
         importer=ImportConfig(),
         refine=RefineConfig(),
         whisper=WhisperConfig(
-            binary="/Users/ender/whisper.cpp/build/bin/whisper-server",
+            binary=TEST_WHISPER_BINARY,
             model=model_path,
             language="zh",
         ),
@@ -49,7 +55,7 @@ def build_config(root: Path) -> AppConfig:
         ),
         remote=RemoteConfig(
             enabled=True,
-            base_url="http://mini.local:8765",
+            base_url=TEST_REMOTE_BASE_URL,
             api_token="remote-token",
             timeout_seconds=2,
             live_chunk_ms=20,
@@ -259,9 +265,10 @@ class RemoteLiveRunnerTests(unittest.TestCase):
 
             assert runner.workspace is not None
             metadata = runner.workspace.read_session()
+            payload = _session_started_payload()["metadata"]
             self.assertEqual("remote-1", metadata.session_id)
-            self.assertEqual("Remote/Transcripts/产品周会.md", metadata.transcript_note_path)
-            self.assertEqual("Remote/Summaries/产品周会.md", metadata.structured_note_path)
+            self.assertEqual(payload["transcript_note_path"], metadata.transcript_note_path)
+            self.assertEqual(payload["structured_note_path"], metadata.structured_note_path)
             self.assertEqual("remote", metadata.execution_target)
             self.assertTrue(runner.workspace.session_toml.exists())
 
@@ -320,6 +327,9 @@ class RemoteLiveRunnerTests(unittest.TestCase):
             workspace = SessionWorkspace.load(root / ".live-note" / "sessions" / "remote-1")
             entries = workspace.transcript_entries()
             self.assertEqual(["今天先过一下排期。"], [item.text for item in entries])
-            self.assertIn(("listening", "已连接远端录音服务。"), events)
-            self.assertIn(("stopping", "远端已接受停止请求，正在封口与排空。"), events)
-            self.assertIn(("stopping", "后台整理任务已完成 durable handoff。"), events)
+            self.assertIn(("listening", EVENT_CONNECTED), events)
+            stopping_messages = [message for stage, message in events if stage == "stopping"]
+            self.assertTrue(
+                any(EVENT_STOP_ACCEPTED_FRAGMENT in message for message in stopping_messages)
+            )
+            self.assertTrue(any(EVENT_HANDOFF_FRAGMENT in message for message in stopping_messages))

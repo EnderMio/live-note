@@ -31,7 +31,7 @@ def start_remote_live_session(runner):
         name=f"remote-live-{context.metadata.session_id}",
     )
     runner._thread.start()
-    startup_timeout = max(int(runner.config.remote.timeout_seconds), 1)
+    startup_timeout = _remote_backend_startup_timeout_seconds(runner)
     if not runner._backend_ready_event.wait(timeout=startup_timeout):
         runner.request_stop()
         runner.join(timeout=1)
@@ -44,6 +44,12 @@ def start_remote_live_session(runner):
         runner.failure_message = runner._startup_error
         raise RuntimeError(runner._startup_error)
     return require_runtime_session(runner.config.root_dir, context.metadata.session_id)
+
+
+def _remote_backend_startup_timeout_seconds(runner) -> int:
+    if runner.config.funasr.enabled:
+        return 10
+    return max(int(runner.config.whisper.startup_timeout_seconds), 1)
 
 
 def run_remote_live_session(runner) -> int:

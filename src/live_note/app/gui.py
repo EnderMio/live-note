@@ -917,7 +917,7 @@ class LiveNoteGui:
             text=(
                 "这里只保存桌面端的远端配置模板。"
                 "实际生效后端以诊断结果里的 backend=... 为准；"
-                "切换远端实时后端仍需修改 Mac mini 上的 config.remote.toml 并重启服务。"
+                "切换远端实时后端仍需修改远端服务配置并重启服务。"
             ),
             style="Hint.TLabel",
         ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(metrics.field_row_gap, 0))
@@ -971,7 +971,7 @@ class LiveNoteGui:
             self.speaker_cluster_threshold_var,
             (
                 "默认 0.5；已知说话人数时优先在 "
-                "config.toml / config.remote.toml 里填 expected_speakers。"
+                "实际执行端的配置里填 expected_speakers。"
             ),
         )
         _entry_row(
@@ -987,7 +987,7 @@ class LiveNoteGui:
                 "这里配置的是说话人区分的后端、模型与默认开关。"
                 "新建页可按本次任务临时开启或关闭；"
                 "远端模式下，这里主要用于本地模板与诊断展示，"
-                "真正生效的远端后端仍需同步修改 Mac mini 上的 config.remote.toml。"
+                "真正生效的远端配置仍需同步修改远端服务配置。"
             ),
             style="Hint.TLabel",
         ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(metrics.field_row_gap, 0))

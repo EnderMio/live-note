@@ -258,7 +258,7 @@ def build_remote_app(config: AppConfig) -> FastAPI:
     app = create_remote_app(
         views,
         commands,
-        api_token=config.serve.api_token or config.remote.api_token,
+        api_token=config.serve.api_token,
         live_gateway=gateway,
         lifespan=lifespan,
     )

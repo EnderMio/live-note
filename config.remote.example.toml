@@ -9,7 +9,7 @@ queue_size = 256
 save_session_wav = true
 
 [import]
-ffmpeg_binary = "/opt/homebrew/bin/ffmpeg"
+ffmpeg_binary = "ffmpeg"
 chunk_seconds = 45
 keep_normalized_audio = false
 
@@ -18,8 +18,8 @@ enabled = true
 auto_after_live = true
 
 [whisper]
-binary = "/Users/your-user/whisper.cpp/build/bin/whisper-server"
-model = "/Users/your-user/whisper.cpp/models/ggml-large-v3.bin"
+binary = "~/whisper.cpp/build/bin/whisper-server"
+model = "~/whisper.cpp/models/ggml-large-v3.bin"
 host = "127.0.0.1"
 port = 8178
 threads = 4

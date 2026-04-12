@@ -98,34 +98,6 @@ class CliTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         serve_mock.assert_called_once_with(Path("/tmp/live-note.toml"))
 
-    def test_remote_deploy_command_dispatches_to_launcher(self) -> None:
-        with patch("live_note.app.cli.launch_remote_deploy", return_value=0) as deploy_mock:
-            exit_code = main(
-                [
-                    "remote-deploy",
-                    "--host",
-                    "ender@172.21.0.159",
-                    "--speaker",
-                    "--speaker-pyannote",
-                    "--funasr",
-                    "--funasr-port",
-                    "11095",
-                    "--skip-deps",
-                    "--dry-run",
-                ]
-            )
-
-        self.assertEqual(0, exit_code)
-        deploy_mock.assert_called_once()
-        args = deploy_mock.call_args.args[0]
-        self.assertEqual("ender@172.21.0.159", args.host)
-        self.assertTrue(args.speaker)
-        self.assertTrue(args.speaker_pyannote)
-        self.assertTrue(args.funasr)
-        self.assertEqual(11095, args.funasr_port)
-        self.assertTrue(args.skip_deps)
-        self.assertTrue(args.dry_run)
-
     def test_finalize_command_dispatches_via_app_service(self) -> None:
         service = Mock()
         service.finalize.return_value = 0

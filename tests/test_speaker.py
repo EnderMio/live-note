@@ -22,6 +22,9 @@ from live_note.config import (
 )
 from live_note.domain import SessionMetadata, TranscriptEntry
 from live_note.remote import speaker
+from live_note.runtime.session_mutations import create_workspace_session
+
+TEST_WHISPER_BINARY = "/test-bin/whisper-server"
 
 
 class SpeakerDiarizationTests(unittest.TestCase):
@@ -296,7 +299,7 @@ class SpeakerDiarizationTests(unittest.TestCase):
                 remote_session_id="speaker-session",
                 speaker_status="pending",
             )
-            workspace = SessionWorkspace.create(session_root, metadata)
+            workspace = create_workspace_session(root, metadata)
             wav_path = workspace.next_wav_path("seg-00001")
             wav_path.parent.mkdir(parents=True, exist_ok=True)
             wav_path.write_bytes(b"fake")
@@ -500,7 +503,7 @@ def _sample_config(root: Path, *, speaker_backend: str = "sherpa_onnx") -> AppCo
         importer=ImportConfig(),
         refine=RefineConfig(),
         whisper=WhisperConfig(
-            binary="/Users/demo/whisper-server",
+            binary=TEST_WHISPER_BINARY,
             model=model_path,
         ),
         obsidian=ObsidianConfig(
@@ -529,8 +532,8 @@ def _sample_config(root: Path, *, speaker_backend: str = "sherpa_onnx") -> AppCo
 
 def _sample_workspace(root: Path) -> SessionWorkspace:
     session_root = root / ".live-note" / "sessions" / "speaker-session"
-    workspace = SessionWorkspace.create(
-        session_root,
+    workspace = create_workspace_session(
+        root,
         SessionMetadata(
             session_id="speaker-session",
             title="多人讨论",
