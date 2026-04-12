@@ -19,6 +19,7 @@ from live_note.audio.capture import (
 from live_note.config import AppConfig, load_config
 from live_note.obsidian.client import ObsidianClient
 from live_note.runtime import (
+    LOCAL_RECOVERABLE_ACTIONS,
     RuntimeHost,
 )
 from live_note.runtime import (
@@ -149,7 +150,7 @@ class AppService:
             host = RuntimeHost.for_root(
                 self.config_path.parent,
                 cancelled_exceptions=(TaskCancelledError,),
-                recoverable_actions={"postprocess"},
+                recoverable_actions=set(LOCAL_RECOVERABLE_ACTIONS),
             )
             self._runtime_host_instance = host
         return host

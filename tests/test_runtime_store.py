@@ -416,6 +416,75 @@ class ControlDbTests(unittest.TestCase):
         )
         self.assertIn("handoff_committed", [event.kind for event in events])
 
+    def test_runtime_host_fails_orphaned_file_session_left_in_starting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = ControlDb.for_root(root)
+            host = RuntimeHost(
+                db,
+                now=lambda: "2026-04-09T00:10:00+00:00",
+                recoverable_actions={"import"},
+            )
+            metadata = replace(
+                _sample_metadata(root),
+                input_mode="file",
+                source_label="demo.wav",
+                source_ref="/tmp/demo.wav",
+                status="starting",
+            )
+            host.session_supervisor.create_or_load(metadata)
+
+            report = host.start()
+            recovered_session = host.sessions.get(metadata.session_id)
+
+        self.assertEqual((metadata.session_id,), report.recovered_session_ids)
+        self.assertEqual((), report.failed_session_ids)
+        assert recovered_session is not None
+        self.assertEqual(SessionStatus.FAILED.value, recovered_session.runtime_status)
+        self.assertEqual(SessionStatus.FAILED.value, recovered_session.display_status)
+
+    def test_runtime_host_abandons_starting_file_session_after_cancelled_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = ControlDb.for_root(root)
+            host = RuntimeHost(
+                db,
+                now=lambda: "2026-04-09T00:10:00+00:00",
+                recoverable_actions={"import"},
+            )
+            metadata = replace(
+                _sample_metadata(root),
+                input_mode="file",
+                source_label="demo.wav",
+                source_ref="/tmp/demo.wav",
+                status="starting",
+            )
+            host.session_supervisor.create_or_load(metadata)
+            host.tasks.upsert(
+                TaskRecord(
+                    task_id="task-import-1",
+                    session_id=metadata.session_id,
+                    action="import",
+                    label="文件导入",
+                    status=TaskStatus.CANCELLED.value,
+                    stage="cancelled",
+                    created_at="2026-04-09T00:00:00+00:00",
+                    updated_at="2026-04-09T00:05:00+00:00",
+                    completed_at="2026-04-09T00:05:00+00:00",
+                    error="cancelled",
+                    message="导入任务已取消。",
+                )
+            )
+
+            report = host.start()
+            recovered_session = host.sessions.get(metadata.session_id)
+
+        self.assertEqual((metadata.session_id,), report.recovered_session_ids)
+        self.assertEqual((), report.failed_session_ids)
+        assert recovered_session is not None
+        self.assertEqual(SessionStatus.ABANDONED.value, recovered_session.runtime_status)
+        self.assertEqual(SessionStatus.ABANDONED.value, recovered_session.display_status)
+
     def test_task_supervisor_run_task_marks_success_and_logs_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

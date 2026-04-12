@@ -18,6 +18,7 @@ from live_note.runtime.live_control import (
     append_live_control_command,
     get_live_control_state,
 )
+from live_note.runtime.recovery_actions import LOCAL_RECOVERABLE_ACTIONS
 from live_note.runtime.remote_projection_sync import sync_remote_task_projections
 from live_note.runtime.task_execution import RuntimeQueueExecutor
 from live_note.runtime.store import LogRepo
@@ -54,7 +55,7 @@ class RuntimeDaemon:
         self.runtime = RuntimeHost.for_root(
             self.config_path.parent,
             cancelled_exceptions=(TaskCancelledError,),
-            recoverable_actions={"postprocess"},
+            recoverable_actions=set(LOCAL_RECOVERABLE_ACTIONS),
         )
         self.logs = LogRepo(self.runtime.db)
         self._runner_factory = TaskRunnerFactory(

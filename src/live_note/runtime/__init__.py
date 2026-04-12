@@ -5,6 +5,7 @@ from .ingest import (
     read_audio_frames,
     write_spool_to_wav,
 )
+from .recovery_actions import LOCAL_RECOVERABLE_ACTIONS, REMOTE_RECOVERABLE_ACTIONS
 from .server_identity import load_or_create_server_id
 from .store import (
     ControlDb,
@@ -30,7 +31,9 @@ from .task_runners import TaskRunnerFactory
 __all__ = [
     "ControlDb",
     "LogRepo",
+    "LOCAL_RECOVERABLE_ACTIONS",
     "RemoteSessionProjectionRepo",
+    "REMOTE_RECOVERABLE_ACTIONS",
     "RemoteTaskProjectionRepo",
     "RecoveryReport",
     "RecoverySupervisor",

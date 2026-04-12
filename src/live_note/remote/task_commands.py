@@ -4,7 +4,7 @@ import threading
 from pathlib import Path
 
 from live_note.config import AppConfig
-from live_note.runtime import RuntimeHost
+from live_note.runtime import REMOTE_RECOVERABLE_ACTIONS, RuntimeHost
 from live_note.runtime.domain.task_state import TERMINAL_TASK_STATUSES, TaskRecord, TaskStatus
 from live_note.runtime.server_identity import load_or_create_server_id
 from live_note.runtime.task_execution import RuntimeQueueExecutor
@@ -13,11 +13,6 @@ from live_note.task_errors import TaskCancelledError
 
 from .import_uploads import RemoteImportUploads
 from .task_builders import RemoteTaskRunnerFactory
-
-REMOTE_RECOVERABLE_ACTIONS = frozenset(
-    {"import", "postprocess", "refine", "retranscribe", "republish", "finalize"}
-)
-
 
 class RemoteTaskCommands:
     def __init__(self, config: AppConfig):
